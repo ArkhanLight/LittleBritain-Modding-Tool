@@ -1,0 +1,15 @@
+[package]
+name = "little_britain_mod_tool"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+eframe = "0.34"
+egui = "0.34"
+rfd = "0.17"
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.27"
+egui-wgpu = "0.34"
+image_dds = { version = "0.7", default-features = false, features = ["ddsfile", "image"] }
+rodio = { version = "0.22.2", features = ["playback", "vorbis"] }
