@@ -1137,23 +1137,6 @@ fn make_view_proj(
     proj * view
 }
 
-fn viewer_min_distance(geo: &GeoFile, yaw: f32, pitch: f32) -> f32 {
-    let (center, radius) = geo_bounds(geo);
-    let mut min_rotated_z = f32::INFINITY;
-
-    for vertex in &geo.verts {
-        let centered = sub3(to_view_space(*vertex), center);
-        let rotated = rotate_camera_vector(centered, yaw, pitch);
-        min_rotated_z = min_rotated_z.min(rotated[2]);
-    }
-
-    let safe_front = (NEAR_PLANE + 1.6).max(radius * 0.20).max(1.5);
-    (safe_front - min_rotated_z)
-        .max(NEAR_PLANE + 1.6)
-        .max(radius * 0.35)
-        .max(3.0)
-}
-
 fn texture_state_hash(textures: &[Option<DdsPreview>]) -> u64 {
     let mut hash = 1469598103934665603u64;
     for tex in textures {
@@ -1229,20 +1212,6 @@ fn geo_bounds(geo: &GeoFile) -> ([f32; 3], f32) {
 
 fn to_view_space(v: [f32; 3]) -> [f32; 3] {
     [v[0], v[2], -v[1]]
-}
-
-fn rotate_x(v: [f32; 3], angle: f32) -> [f32; 3] {
-    let (s, c) = angle.sin_cos();
-    [v[0], v[1] * c - v[2] * s, v[1] * s + v[2] * c]
-}
-
-fn rotate_y(v: [f32; 3], angle: f32) -> [f32; 3] {
-    let (s, c) = angle.sin_cos();
-    [v[0] * c + v[2] * s, v[1], -v[0] * s + v[2] * c]
-}
-
-fn rotate_camera_vector(v: [f32; 3], yaw: f32, pitch: f32) -> [f32; 3] {
-    rotate_x(rotate_y(v, yaw), pitch)
 }
 
 fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {

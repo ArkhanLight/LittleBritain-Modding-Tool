@@ -22,6 +22,7 @@ pub struct GeoInfluence {
     pub weight: f32,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct GeoSkeleton {
     pub skeleton_ptr: u32,
@@ -69,6 +70,7 @@ impl GeoAssetType {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct GeoFile {
     pub path: PathBuf,

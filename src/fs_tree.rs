@@ -61,21 +61,7 @@ pub fn category_name(category: AssetCategory) -> &'static str {
     }
 }
 
-pub fn category_tag(category: AssetCategory) -> &'static str {
-    match category {
-        AssetCategory::Texture => "[TEX]",
-        AssetCategory::Model => "[MOD]",
-        AssetCategory::Animation => "[ANM]",
-        AssetCategory::Particle => "[PRT]",
-        AssetCategory::AudioStream => "[AUD]",
-        AssetCategory::AudioBank => "[BNK]",
-        AssetCategory::Lighting => "[LGT]",
-        AssetCategory::Scene => "[SCN]",
-        AssetCategory::Log => "[LOG]",
-        AssetCategory::Unknown => "[???]",
-    }
-}
-
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct FileNode {
     pub name: String,

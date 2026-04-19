@@ -172,36 +172,6 @@ impl ModToolApp {
         }
     }
 
-    fn category_folder_name(category: AssetCategory) -> &'static str {
-        match category {
-            AssetCategory::Texture => "Textures",
-            AssetCategory::Model => "Models",
-            AssetCategory::Animation => "Animations",
-            AssetCategory::Particle => "Particles",
-            AssetCategory::AudioStream => "Audio",
-            AssetCategory::AudioBank => "Audio Banks",
-            AssetCategory::Lighting => "Lighting",
-            AssetCategory::Scene => "Scenes",
-            AssetCategory::Log => "Logs",
-            AssetCategory::Unknown => "Other",
-        }
-    }
-
-    fn category_order() -> [AssetCategory; 10] {
-        [
-            AssetCategory::Animation,
-            AssetCategory::Model,
-            AssetCategory::Texture,
-            AssetCategory::Particle,
-            AssetCategory::AudioStream,
-            AssetCategory::AudioBank,
-            AssetCategory::Lighting,
-            AssetCategory::Scene,
-            AssetCategory::Log,
-            AssetCategory::Unknown,
-        ]
-    }
-
     fn ui_file_row(ui: &mut egui::Ui, node: &FileNode, selected_file: &mut Option<PathBuf>) {
         let is_selected = selected_file.as_ref() == Some(&node.path);
         if ui.selectable_label(is_selected, &node.name).clicked() {
