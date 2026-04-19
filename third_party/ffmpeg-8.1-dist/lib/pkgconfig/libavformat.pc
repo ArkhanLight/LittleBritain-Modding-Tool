@@ -1,0 +1,14 @@
+prefix=/e/ffmpeg-build/ffmpeg-8.1-dist
+exec_prefix=${prefix}
+libdir=/e/ffmpeg-build/ffmpeg-8.1-dist/lib
+includedir=/e/ffmpeg-build/ffmpeg-8.1-dist/include
+
+Name: libavformat
+Description: FFmpeg container format library
+Version: 62.12.100
+Requires: libavcodec >= 62.28.100, libswresample >= 6.3.100, libavutil >= 60.26.100
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavformat secur32.lib ncrypt.lib crypt32.lib ws2_32.lib
+Libs.private: 
+Cflags: -I${includedir}

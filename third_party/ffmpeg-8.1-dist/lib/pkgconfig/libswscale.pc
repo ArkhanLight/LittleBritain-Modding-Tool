@@ -1,0 +1,14 @@
+prefix=/e/ffmpeg-build/ffmpeg-8.1-dist
+exec_prefix=${prefix}
+libdir=/e/ffmpeg-build/ffmpeg-8.1-dist/lib
+includedir=/e/ffmpeg-build/ffmpeg-8.1-dist/include
+
+Name: libswscale
+Description: FFmpeg image rescaling library
+Version: 9.5.100
+Requires: libavutil >= 60.26.100
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lswscale 
+Libs.private: 
+Cflags: -I${includedir}

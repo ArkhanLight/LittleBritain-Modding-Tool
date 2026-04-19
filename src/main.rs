@@ -1,5 +1,6 @@
 mod app;
 mod audio_player;
+mod bik_preview;
 mod bnk;
 mod dds_preview;
 mod fs_tree;
@@ -13,7 +14,7 @@ fn main() {
             .with_min_inner_size([1000.0, 700.0]),
         ..Default::default()
     };
-    
+
     let result = eframe::run_native(
         "Little Britain Mod Tool",
         options,

@@ -1,5 +1,6 @@
 use crate::{
     audio_player::AudioPlayer,
+    bik_preview::{load_bik_preview, BikPreview},
     bnk::{format_name, load_bnk, BnkFile},
     dds_preview::{load_dds_preview, DdsPreview},
     fs_tree::{category_name, classify_path, scan_game_data, AssetCategory, FileNode, NodeKind},
@@ -59,6 +60,11 @@ pub struct ModToolApp {
     geo_viewer_path: Option<PathBuf>,
     geo_view_height: f32,
 
+    bik_preview: Option<BikPreview>,
+    bik_preview_path: Option<PathBuf>,
+    bik_error: Option<String>,
+    bik_zoom: f32,
+    bik_view_height: f32,
 }
 
 impl ModToolApp {
@@ -98,6 +104,12 @@ impl ModToolApp {
             geo_viewer: GeoViewerState::default(),
             geo_viewer_path: None,
             geo_view_height: 520.0,
+
+            bik_preview: None,
+            bik_preview_path: None,
+            bik_error: None,
+            bik_zoom: 1.0,
+            bik_view_height: 420.0,
         }
     }
 
@@ -126,6 +138,11 @@ impl ModToolApp {
                     self.geo_material_previews.clear();
                     self.geo_materials_loaded_path = None;
                     self.geo_material_error = None;
+                    self.bik_preview = None;
+                    self.bik_preview_path = None;
+                    self.bik_error = None;
+                    self.bik_zoom = 1.0;
+                    self.bik_view_height = 420.0;
                     self.status = "Loaded Data folder.".to_owned();
                 }
                 Err(err) => {
@@ -165,6 +182,12 @@ impl ModToolApp {
                     self.geo_material_previews.clear();
                     self.geo_materials_loaded_path = None;
                     self.geo_material_error = None;
+
+                    self.bik_preview = None;
+                    self.bik_preview_path = None;
+                    self.bik_error = None;
+                    self.bik_zoom = 1.0;
+                    self.bik_view_height = 420.0;
 
                     self.status = "Rescanned Data folder.".to_owned();
                 }
@@ -220,6 +243,7 @@ impl ModToolApp {
                         let mut lighting: Vec<&FileNode> = Vec::new();
                         let mut scenes: Vec<&FileNode> = Vec::new();
                         let mut logs: Vec<&FileNode> = Vec::new();
+                        let mut videos: Vec<&FileNode> = Vec::new();
                         let mut other: Vec<&FileNode> = Vec::new();
 
                         for child in &node.children {
@@ -235,6 +259,7 @@ impl ModToolApp {
                                     AssetCategory::Lighting => lighting.push(child),
                                     AssetCategory::Scene => scenes.push(child),
                                     AssetCategory::Log => logs.push(child),
+                                    AssetCategory::Video => videos.push(child),
                                     AssetCategory::Unknown => other.push(child),
                                 },
                             }
@@ -253,6 +278,7 @@ impl ModToolApp {
                         Self::ui_category_group(ui, "Lighting", &lighting, selected_file);
                         Self::ui_category_group(ui, "Scenes", &scenes, selected_file);
                         Self::ui_category_group(ui, "Logs", &logs, selected_file);
+                        Self::ui_category_group(ui, "Videos", &videos, selected_file);
                         Self::ui_category_group(ui, "Other", &other, selected_file);
                     });
             }
@@ -291,6 +317,42 @@ impl ModToolApp {
             }
             Err(err) => {
                 self.dds_error = Some(err.to_string());
+            }
+        }
+    }    
+
+    fn ensure_bik_preview_loaded(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.selected_file.clone() else {
+            self.bik_preview = None;
+            self.bik_preview_path = None;
+            self.bik_error = None;
+            return;
+        };
+
+        if self.bik_preview_path.as_ref() == Some(&path) {
+            return;
+        }
+
+        self.bik_preview = None;
+        self.bik_error = None;
+        self.bik_preview_path = Some(path.clone());
+        self.bik_zoom = 1.0;
+
+        let is_bik = path
+            .extension()
+            .map(|ext| ext.to_string_lossy().eq_ignore_ascii_case("bik"))
+            .unwrap_or(false);
+
+        if !is_bik {
+            return;
+        }
+
+        match load_bik_preview(ctx, &path) {
+            Ok(preview) => {
+                self.bik_preview = Some(preview);
+            }
+            Err(err) => {
+                self.bik_error = Some(err.to_string());
             }
         }
     }
@@ -768,6 +830,7 @@ impl eframe::App for ModToolApp {
 
         self.ensure_bnk_loaded();
         self.ensure_dds_preview_loaded(ui.ctx());
+        self.ensure_bik_preview_loaded(ui.ctx());
         self.ensure_geo_loaded();
         self.ensure_geo_materials_loaded(ui.ctx());
 
@@ -891,24 +954,49 @@ impl eframe::App for ModToolApp {
                             );
                         }
                     }
+                    if ext == "bik" {
+                        if let Some(preview) = &self.bik_preview {
+                            ui.label(format!("Width: {}", preview.width));
+                            ui.label(format!("Height: {}", preview.height));
 
-                if ext == "geo" {
-                    if let Some(geo) = &self.geo_file {
-                        ui.label(format!("Vertices: {}", geo.vertex_count));
-                        ui.label(format!("Indices: {}", geo.index_count));
-                        ui.label(format!("Faces: {}", geo.faces.len()));
-                        ui.label(format!("Textures: {}", geo.texture_names.len()));
-                        ui.label(format!("Subsets: {}", geo.subsets.len()));
-                        ui.label(format!("Asset type: {}", geo.asset_type.as_str()));
+                            if let Some(fps) = preview.fps {
+                                ui.label(format!("FPS: {:.3}", fps));
+                            } else {
+                                ui.label("FPS: unknown");
+                            }
 
-                        if let Some(skeleton) = &geo.skeleton {
-                            ui.separator();
-                            ui.label(format!("Bones: {}", skeleton.bone_count));
-                            ui.label(format!("Skeleton ptr: 0x{:08X}", skeleton.skeleton_ptr));
-                            ui.label(format!("aux_a_off: 0x{:08X}", skeleton.aux_a_off));
-                            ui.label(format!("aux_b_off: 0x{:08X}", skeleton.aux_b_off));
-                            ui.label(format!("name_table_off: 0x{:08X}", skeleton.name_table_off));
+                            if let Some(duration) = preview.duration_seconds {
+                                ui.label(format!("Duration: {:.2} sec", duration));
+                            } else {
+                                ui.label("Duration: unknown");
+                            }
                         }
+
+                        if let Some(err) = &self.bik_error {
+                            ui.colored_label(
+                                egui::Color32::RED,
+                                format!("BIK preview error: {}", err),
+                            );
+                        }
+                    }    
+
+                    if ext == "geo" {
+                        if let Some(geo) = &self.geo_file {
+                            ui.label(format!("Vertices: {}", geo.vertex_count));
+                            ui.label(format!("Indices: {}", geo.index_count));
+                            ui.label(format!("Faces: {}", geo.faces.len()));
+                            ui.label(format!("Textures: {}", geo.texture_names.len()));
+                            ui.label(format!("Subsets: {}", geo.subsets.len()));
+                            ui.label(format!("Asset type: {}", geo.asset_type.as_str()));
+
+                            if let Some(skeleton) = &geo.skeleton {
+                                ui.separator();
+                                ui.label(format!("Bones: {}", skeleton.bone_count));
+                                ui.label(format!("Skeleton ptr: 0x{:08X}", skeleton.skeleton_ptr));
+                                ui.label(format!("aux_a_off: 0x{:08X}", skeleton.aux_a_off));
+                                ui.label(format!("aux_b_off: 0x{:08X}", skeleton.aux_b_off));
+                                ui.label(format!("name_table_off: 0x{:08X}", skeleton.name_table_off));
+                            }
 
                         if geo.weight_profile.has_weights {
                             ui.separator();
@@ -970,6 +1058,9 @@ impl eframe::App for ModToolApp {
                         }
                         "geo" => {
                             ui.label("GEO reader loaded.");
+                        }
+                        "bik" => {
+                            ui.label("BIK preview loaded.");
                         }
                         _ => {
                             ui.label("No viewer yet. Raw/hex viewer later.");
@@ -1109,6 +1200,86 @@ impl eframe::App for ModToolApp {
                             } else {
                                 ui.label("(not used by any scanned GEO)");
                             }
+                        }
+                    }
+
+                    Some("bik") => {
+                        if let Some(preview) = &self.bik_preview {
+                            ui.horizontal(|ui| {
+                                ui.label("Zoom");
+                                ui.add(
+                                    egui::Slider::new(&mut self.bik_zoom, 0.25..=8.0)
+                                        .logarithmic(true)
+                                        .text("x"),
+                                );
+
+                                if ui.button("Reset").clicked() {
+                                    self.bik_zoom = 1.0;
+                                }
+                            });
+
+                            ui.separator();
+
+                            let preview_height = self.bik_view_height.clamp(180.0, 900.0);
+
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(ui.available_width(), preview_height),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    let tex_size = preview.texture.size_vec2();
+                                    let available = ui.available_size();
+
+                                    let fit_scale =
+                                        (available.x / tex_size.x).min(available.y / tex_size.y).min(1.0);
+
+                                    let desired_size = tex_size * fit_scale.max(0.1) * self.bik_zoom;
+
+                                    egui::ScrollArea::both()
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            ui.image((preview.texture.id(), desired_size));
+                                        });
+                                },
+                            );
+
+                            let (resize_rect, resize_response) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 12.0),
+                                egui::Sense::drag(),
+                            );
+
+                            let resize_response =
+                                resize_response.on_hover_cursor(egui::CursorIcon::ResizeVertical);
+
+                            ui.painter().hline(
+                                resize_rect.x_range(),
+                                resize_rect.center().y,
+                                egui::Stroke::new(1.5, egui::Color32::GRAY),
+                            );
+
+                            if resize_response.dragged() {
+                                let delta = ui.ctx().input(|i| i.pointer.delta()).y;
+                                self.bik_view_height = (self.bik_view_height + delta).clamp(180.0, 900.0);
+                                ui.ctx().request_repaint();
+                            }
+
+                            ui.separator();
+                            ui.heading("Video");
+                            ui.separator();
+
+                            let label = preview
+                                .path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| preview.path.display().to_string());
+
+                            ui.label(label);
+                        } else if let Some(err) = &self.bik_error {
+                            ui.colored_label(
+                                egui::Color32::RED,
+                                format!("Could not decode BIK: {}", err),
+                            );
+                        } else {
+                            ui.label("BIK selected, but no preview is loaded.");
                         }
                     }
 

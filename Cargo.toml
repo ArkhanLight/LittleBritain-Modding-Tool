@@ -2,6 +2,7 @@
 name = "little_britain_mod_tool"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [dependencies]
 anyhow = "1"
@@ -13,3 +14,4 @@ glam = "0.27"
 egui-wgpu = "0.34"
 image_dds = { version = "0.7", default-features = false, features = ["ddsfile", "image"] }
 rodio = { version = "0.22.2", features = ["playback", "vorbis"] }
+ffmpeg-next = { version = "8.1.0", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling", "static"] }

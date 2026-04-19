@@ -1,0 +1,14 @@
+prefix=/e/ffmpeg-build/ffmpeg-8.1-dist
+exec_prefix=${prefix}
+libdir=/e/ffmpeg-build/ffmpeg-8.1-dist/lib
+includedir=/e/ffmpeg-build/ffmpeg-8.1-dist/include
+
+Name: libavutil
+Description: FFmpeg utility library
+Version: 60.26.100
+Requires: 
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavutil user32.lib bcrypt.lib
+Libs.private: 
+Cflags: -I${includedir}

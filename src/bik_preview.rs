@@ -1,0 +1,177 @@
+use anyhow::{anyhow, bail, Context, Result};
+use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
+use ffmpeg_next as ffmpeg;
+use ffmpeg::{
+    codec, format, frame, media,
+    software::scaling::{context::Context as Scaler, flag::Flags},
+    util::format::pixel::Pixel,
+};
+use std::{
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
+
+static FFMPEG_INIT: OnceLock<Result<(), String>> = OnceLock::new();
+
+fn ensure_ffmpeg_init() -> Result<()> {
+    let init = FFMPEG_INIT.get_or_init(|| {
+        ffmpeg::init()
+            .map_err(|e| format!("FFmpeg init failed: {e:?}"))
+            .map(|_| ())
+    });
+
+    match init {
+        Ok(()) => Ok(()),
+        Err(err) => Err(anyhow!(err.clone())),
+    }
+}
+
+#[derive(Clone)]
+pub struct BikPreview {
+    pub path: PathBuf,
+    pub width: u32,
+    pub height: u32,
+    pub fps: Option<f32>,
+    pub duration_seconds: Option<f32>,
+    pub texture: TextureHandle,
+}
+
+fn rational_to_f32(r: ffmpeg::Rational) -> Option<f32> {
+    let num = r.numerator();
+    let den = r.denominator();
+    if den == 0 {
+        None
+    } else {
+        Some(num as f32 / den as f32)
+    }
+}
+
+fn frame_to_color_image(frame: &frame::Video) -> Result<ColorImage> {
+    let width = frame.width() as usize;
+    let height = frame.height() as usize;
+    let stride = frame.stride(0);
+    let data = frame.data(0);
+
+    if data.is_empty() || width == 0 || height == 0 {
+        bail!("Decoded frame is empty");
+    }
+
+    let mut rgba = Vec::with_capacity(width * height * 4);
+
+    for y in 0..height {
+        let row_start = y * stride;
+        let row_end = row_start + width * 4;
+
+        if row_end > data.len() {
+            bail!("Decoded frame buffer is smaller than expected");
+        }
+
+        rgba.extend_from_slice(&data[row_start..row_end]);
+    }
+
+    Ok(ColorImage::from_rgba_unmultiplied([width, height], &rgba))
+}
+
+pub fn load_bik_preview(ctx: &egui::Context, path: &Path) -> Result<BikPreview> {
+    ensure_ffmpeg_init()?;
+
+    let mut input = format::input(path)
+        .with_context(|| format!("Failed to open BIK file {}", path.display()))?;
+
+    let stream = input
+        .streams()
+        .best(media::Type::Video)
+        .ok_or_else(|| anyhow!("No video stream found in {}", path.display()))?;
+
+    let stream_index = stream.index();
+    let fps = rational_to_f32(stream.rate());
+
+    let duration_seconds = {
+        let dur = input.duration();
+        if dur > 0 {
+            Some(dur as f32 / ffmpeg::ffi::AV_TIME_BASE as f32)
+        } else {
+            None
+        }
+    };
+
+    let context = codec::context::Context::from_parameters(stream.parameters())
+        .context("Failed to create codec context from stream parameters")?;
+
+    let mut decoder = context
+        .decoder()
+        .video()
+        .context("Failed to open video decoder")?;
+
+    let src_width = decoder.width();
+    let src_height = decoder.height();
+
+    let mut scaler = Scaler::get(
+        decoder.format(),
+        src_width,
+        src_height,
+        Pixel::RGBA,
+        src_width,
+        src_height,
+        Flags::BILINEAR,
+    )
+    .context("Failed to create FFmpeg scaler")?;
+
+    let mut decoded = frame::Video::empty();
+    let mut rgba = frame::Video::empty();
+    let mut got_frame = false;
+
+    for (packet_stream, packet) in input.packets() {
+        if packet_stream.index() != stream_index {
+            continue;
+        }
+
+        decoder
+            .send_packet(&packet)
+            .context("Failed to send packet to decoder")?;
+
+        while decoder.receive_frame(&mut decoded).is_ok() {
+            scaler
+                .run(&decoded, &mut rgba)
+                .context("Failed to convert frame to RGBA")?;
+            got_frame = true;
+            break;
+        }
+
+        if got_frame {
+            break;
+        }
+    }
+
+    if !got_frame {
+        decoder.send_eof().ok();
+
+        while decoder.receive_frame(&mut decoded).is_ok() {
+            scaler
+                .run(&decoded, &mut rgba)
+                .context("Failed to convert frame to RGBA")?;
+            got_frame = true;
+            break;
+        }
+    }
+
+    if !got_frame {
+        bail!("Could not decode a preview frame from {}", path.display());
+    }
+
+    let image = frame_to_color_image(&rgba)?;
+    let texture = ctx.load_texture(
+        format!("bik_preview:{}", path.display()),
+        image,
+        TextureOptions::LINEAR,
+    );
+
+    Ok(BikPreview {
+        path: path.to_path_buf(),
+        width: src_width,
+        height: src_height,
+        fps,
+        duration_seconds,
+        texture,
+    })
+}
