@@ -1,6 +1,6 @@
 use crate::{
     audio_player::AudioPlayer,
-    bik_preview::{load_bik_preview, BikPreview},
+    bik_preview::{load_bik_preview, spawn_bik_decoder, BikPreview, BikWorkerEvent},
     bnk::{format_name, load_bnk, BnkFile},
     dds_preview::{load_dds_preview, DdsPreview},
     fs_tree::{category_name, classify_path, scan_game_data, AssetCategory, FileNode, NodeKind},
@@ -9,8 +9,9 @@ use crate::{
 };
 use eframe::egui;
 use std::{
+    collections::VecDeque,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Debug)]
@@ -62,9 +63,19 @@ pub struct ModToolApp {
 
     bik_preview: Option<BikPreview>,
     bik_preview_path: Option<PathBuf>,
+    bik_texture: Option<egui::TextureHandle>,
     bik_error: Option<String>,
     bik_zoom: f32,
     bik_view_height: f32,
+    bik_current_frame: usize,
+    bik_current_time_seconds: f32,
+    bik_is_playing: bool,
+    bik_loop: bool,
+    bik_decoder_rx: Option<std::sync::mpsc::Receiver<BikWorkerEvent>>,
+    bik_frame_queue: VecDeque<(usize, f32, egui::ColorImage)>,
+    bik_clock_started_at: Option<Instant>,
+    bik_clock_start_secs: f32,
+    bik_decoder_finished: bool,
 }
 
 impl ModToolApp {
@@ -107,9 +118,19 @@ impl ModToolApp {
 
             bik_preview: None,
             bik_preview_path: None,
+            bik_texture: None,
             bik_error: None,
             bik_zoom: 1.0,
             bik_view_height: 420.0,
+            bik_current_frame: 0,
+            bik_current_time_seconds: 0.0,
+            bik_is_playing: false,
+            bik_loop: true,
+            bik_decoder_rx: None,
+            bik_frame_queue: VecDeque::new(),
+            bik_clock_started_at: None,
+            bik_clock_start_secs: 0.0,
+            bik_decoder_finished: false,
         }
     }
 
@@ -138,11 +159,7 @@ impl ModToolApp {
                     self.geo_material_previews.clear();
                     self.geo_materials_loaded_path = None;
                     self.geo_material_error = None;
-                    self.bik_preview = None;
-                    self.bik_preview_path = None;
-                    self.bik_error = None;
-                    self.bik_zoom = 1.0;
-                    self.bik_view_height = 420.0;
+                    self.reset_bik_state();
                     self.status = "Loaded Data folder.".to_owned();
                 }
                 Err(err) => {
@@ -183,11 +200,7 @@ impl ModToolApp {
                     self.geo_materials_loaded_path = None;
                     self.geo_material_error = None;
 
-                    self.bik_preview = None;
-                    self.bik_preview_path = None;
-                    self.bik_error = None;
-                    self.bik_zoom = 1.0;
-                    self.bik_view_height = 420.0;
+                    self.reset_bik_state();
 
                     self.status = "Rescanned Data folder.".to_owned();
                 }
@@ -285,6 +298,249 @@ impl ModToolApp {
         }
     }
 
+    fn reset_bik_state(&mut self) {
+        self.bik_preview = None;
+        self.bik_preview_path = None;
+        self.bik_texture = None;
+        self.bik_error = None;
+        self.bik_zoom = 1.0;
+        self.bik_view_height = 420.0;
+        self.bik_current_frame = 0;
+        self.bik_current_time_seconds = 0.0;
+        self.bik_is_playing = false;
+        self.bik_loop = true;
+        self.bik_decoder_rx = None;
+        self.bik_frame_queue.clear();
+        self.bik_clock_started_at = None;
+        self.bik_clock_start_secs = 0.0;
+        self.bik_decoder_finished = false;
+    }
+
+    fn set_bik_texture_from_image(&mut self, ctx: &egui::Context, image: egui::ColorImage) {
+        if let Some(texture) = self.bik_texture.as_mut() {
+            texture.set(image, egui::TextureOptions::LINEAR);
+        } else {
+            let name = self
+                .bik_preview
+                .as_ref()
+                .map(|p| format!("bik_video:{}", p.path.display()))
+                .unwrap_or_else(|| "bik_video".to_owned());
+
+            self.bik_texture =
+                Some(ctx.load_texture(name, image, egui::TextureOptions::LINEAR));
+        }
+    }
+
+    fn ensure_bik_preview_loaded(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.selected_file.clone() else {
+            self.reset_bik_state();
+            return;
+        };
+
+        let is_bik = path
+            .extension()
+            .map(|ext| ext.to_string_lossy().eq_ignore_ascii_case("bik"))
+            .unwrap_or(false);
+
+        if !is_bik {
+            self.reset_bik_state();
+            return;
+        }
+
+        if self.bik_preview_path.as_ref() == Some(&path) {
+            return;
+        }
+
+        self.reset_bik_state();
+        self.bik_preview_path = Some(path.clone());
+
+        match load_bik_preview(&path) {
+            Ok(preview) => {
+                let first_frame = preview.first_frame.clone();
+                self.bik_preview = Some(preview);
+                self.set_bik_texture_from_image(ctx, first_frame);
+                self.bik_current_frame = 0;
+                self.bik_current_time_seconds = 0.0;
+                self.bik_error = None;
+                ctx.request_repaint();
+            }
+            Err(err) => {
+                self.bik_error = Some(err.to_string());
+            }
+        }
+    }
+
+    fn start_bik_playback(&mut self, ctx: &egui::Context) {
+        let Some((preview_path, estimated_total, first_frame)) = self
+            .bik_preview
+            .as_ref()
+            .map(|preview| {
+                (
+                    preview.path.clone(),
+                    preview.estimated_frame_count(),
+                    preview.first_frame.clone(),
+                )
+            })
+        else {
+            return;
+        };
+
+        let mut start_frame = self.bik_current_frame;
+
+        if estimated_total > 0 && start_frame >= estimated_total {
+            start_frame = 0;
+            self.bik_current_frame = 0;
+            self.bik_current_time_seconds = 0.0;
+            self.set_bik_texture_from_image(ctx, first_frame);
+        }
+
+        self.bik_decoder_rx = Some(spawn_bik_decoder(preview_path, start_frame));
+        self.bik_frame_queue.clear();
+        self.bik_clock_started_at = Some(Instant::now());
+        self.bik_clock_start_secs = self.bik_current_time_seconds;
+        self.bik_decoder_finished = false;
+        self.bik_is_playing = true;
+        self.bik_error = None;
+        ctx.request_repaint();
+    }
+
+    fn pause_bik_playback(&mut self) {
+        self.bik_is_playing = false;
+        self.bik_decoder_rx = None;
+        self.bik_frame_queue.clear();
+        self.bik_clock_started_at = None;
+        self.bik_decoder_finished = false;
+    }
+
+    fn stop_bik_playback(&mut self, ctx: &egui::Context) {
+        self.bik_is_playing = false;
+        self.bik_decoder_rx = None;
+        self.bik_frame_queue.clear();
+        self.bik_clock_started_at = None;
+        self.bik_clock_start_secs = 0.0;
+        self.bik_current_frame = 0;
+        self.bik_current_time_seconds = 0.0;
+        self.bik_decoder_finished = false;
+
+        let first_frame = self
+            .bik_preview
+            .as_ref()
+            .map(|preview| preview.first_frame.clone());
+
+        if let Some(first_frame) = first_frame {
+            self.set_bik_texture_from_image(ctx, first_frame);
+        }
+    }
+
+    fn seek_bik_to_time(&mut self, seconds: f32, ctx: &egui::Context) {
+        let Some(preview) = self.bik_preview.as_ref() else {
+            return;
+        };
+
+        let total = preview.total_duration_seconds();
+        let target = seconds.clamp(0.0, total.max(0.0));
+
+        self.bik_is_playing = false;
+        self.bik_decoder_rx = None;
+        self.bik_frame_queue.clear();
+        self.bik_clock_started_at = None;
+        self.bik_clock_start_secs = target;
+        self.bik_decoder_finished = false;
+
+        let fps = preview.fps.max(0.001);
+        self.bik_current_time_seconds = target;
+        self.bik_current_frame = (target * fps).floor() as usize;
+
+        if target <= 0.0 {
+            let first_frame = preview.first_frame.clone();
+            self.set_bik_texture_from_image(ctx, first_frame);
+        }
+    }    
+
+    fn poll_bik_decoder(&mut self, _ctx: &egui::Context) {
+        let Some(rx) = self.bik_decoder_rx.as_ref() else {
+            return;
+        };
+
+        let mut finished = false;
+        let mut error: Option<String> = None;
+
+        for event in rx.try_iter() {
+            match event {
+                BikWorkerEvent::Frame {
+                    frame_index,
+                    time_seconds,
+                    image,
+                } => {
+                    self.bik_frame_queue
+                        .push_back((frame_index, time_seconds, image));
+                }
+                BikWorkerEvent::Finished => {
+                    finished = true;
+                }
+                BikWorkerEvent::Error(err) => {
+                    error = Some(err);
+                }
+            }
+        }
+
+        if let Some(err) = error {
+            self.bik_is_playing = false;
+            self.bik_decoder_rx = None;
+            self.bik_frame_queue.clear();
+            self.bik_decoder_finished = false;
+            self.bik_error = Some(err);
+            return;
+        }
+
+        if finished {
+            self.bik_decoder_rx = None;
+            self.bik_decoder_finished = true;
+        }
+    }
+
+    fn update_bik_playback_clock(&mut self, ctx: &egui::Context) {
+        if !self.bik_is_playing {
+            return;
+        }
+
+        let Some(started_at) = self.bik_clock_started_at else {
+            self.bik_clock_started_at = Some(Instant::now());
+            ctx.request_repaint_after(Duration::from_secs_f32(1.0 / 60.0));
+            return;
+        };
+
+        let target_time =
+            self.bik_clock_start_secs + Instant::now().duration_since(started_at).as_secs_f32();
+
+        while let Some((_, time_seconds, _)) = self.bik_frame_queue.front() {
+            if *time_seconds <= target_time {
+                let (frame_index, time_seconds, image) =
+                    self.bik_frame_queue.pop_front().unwrap();
+                self.bik_current_frame = frame_index;
+                self.bik_current_time_seconds = time_seconds;
+                self.set_bik_texture_from_image(ctx, image);
+            } else {
+                break;
+            }
+        }
+
+        if self.bik_decoder_finished && self.bik_frame_queue.is_empty() {
+            self.bik_decoder_finished = false;
+
+            if self.bik_loop {
+                self.stop_bik_playback(ctx);
+                self.start_bik_playback(ctx);
+            } else {
+                self.bik_is_playing = false;
+            }
+
+            return;
+        }
+
+        ctx.request_repaint_after(Duration::from_secs_f32(1.0 / 60.0));
+    }
+
     fn ensure_dds_preview_loaded(&mut self, ctx: &egui::Context) {
         let Some(path) = self.selected_file.clone() else {
             self.dds_preview = None;
@@ -320,42 +576,6 @@ impl ModToolApp {
             }
         }
     }    
-
-    fn ensure_bik_preview_loaded(&mut self, ctx: &egui::Context) {
-        let Some(path) = self.selected_file.clone() else {
-            self.bik_preview = None;
-            self.bik_preview_path = None;
-            self.bik_error = None;
-            return;
-        };
-
-        if self.bik_preview_path.as_ref() == Some(&path) {
-            return;
-        }
-
-        self.bik_preview = None;
-        self.bik_error = None;
-        self.bik_preview_path = Some(path.clone());
-        self.bik_zoom = 1.0;
-
-        let is_bik = path
-            .extension()
-            .map(|ext| ext.to_string_lossy().eq_ignore_ascii_case("bik"))
-            .unwrap_or(false);
-
-        if !is_bik {
-            return;
-        }
-
-        match load_bik_preview(ctx, &path) {
-            Ok(preview) => {
-                self.bik_preview = Some(preview);
-            }
-            Err(err) => {
-                self.bik_error = Some(err.to_string());
-            }
-        }
-    }
 
     fn ensure_geo_loaded(&mut self) {
         let Some(path) = self.selected_file.clone() else {
@@ -398,10 +618,10 @@ impl ModToolApp {
     }
 
     fn find_file_case_insensitive(folder: &Path, filename: &str) -> Option<PathBuf> {
-    let direct = folder.join(filename);
-    if direct.exists() {
-        return Some(direct);
-    }
+        let direct = folder.join(filename);
+        if direct.exists() {
+            return Some(direct);
+        }
 
     let target = filename.to_ascii_lowercase();
     let entries = std::fs::read_dir(folder).ok()?;
@@ -831,6 +1051,8 @@ impl eframe::App for ModToolApp {
         self.ensure_bnk_loaded();
         self.ensure_dds_preview_loaded(ui.ctx());
         self.ensure_bik_preview_loaded(ui.ctx());
+        self.poll_bik_decoder(ui.ctx());
+        self.update_bik_playback_clock(ui.ctx());
         self.ensure_geo_loaded();
         self.ensure_geo_materials_loaded(ui.ctx());
 
@@ -958,12 +1180,19 @@ impl eframe::App for ModToolApp {
                         if let Some(preview) = &self.bik_preview {
                             ui.label(format!("Width: {}", preview.width));
                             ui.label(format!("Height: {}", preview.height));
-
-                            if let Some(fps) = preview.fps {
-                                ui.label(format!("FPS: {:.3}", fps));
-                            } else {
-                                ui.label("FPS: unknown");
-                            }
+                            ui.label(format!("FPS: {:.3}", preview.fps));
+                            ui.label(format!(
+                                "Estimated frames: {}",
+                                preview.estimated_frame_count()
+                            ));
+                            ui.label(format!(
+                                "Current frame: {}",
+                                self.bik_current_frame.saturating_add(1)
+                            ));
+                            ui.label(format!(
+                                "Current time: {:.2} sec",
+                                self.bik_current_time_seconds
+                            ));
 
                             if let Some(duration) = preview.duration_seconds {
                                 ui.label(format!("Duration: {:.2} sec", duration));
@@ -975,10 +1204,10 @@ impl eframe::App for ModToolApp {
                         if let Some(err) = &self.bik_error {
                             ui.colored_label(
                                 egui::Color32::RED,
-                                format!("BIK preview error: {}", err),
+                                format!("BIK playback error: {}", err),
                             );
                         }
-                    }    
+                    }
 
                     if ext == "geo" {
                         if let Some(geo) = &self.geo_file {
@@ -1060,7 +1289,7 @@ impl eframe::App for ModToolApp {
                             ui.label("GEO reader loaded.");
                         }
                         "bik" => {
-                            ui.label("BIK preview loaded.");
+                            ui.label("BIK player loaded.");
                         }
                         _ => {
                             ui.label("No viewer yet. Raw/hex viewer later.");
@@ -1205,6 +1434,15 @@ impl eframe::App for ModToolApp {
 
                     Some("bik") => {
                         if let Some(preview) = &self.bik_preview {
+                            let total_duration = preview.total_duration_seconds();
+                            let preview_fps = preview.fps;
+                            let estimated_frames = preview.estimated_frame_count();
+                            let file_label = preview
+                                .path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| preview.path.display().to_string());
+
                             ui.horizontal(|ui| {
                                 ui.label("Zoom");
                                 ui.add(
@@ -1218,6 +1456,66 @@ impl eframe::App for ModToolApp {
                                 }
                             });
 
+                            ui.horizontal(|ui| {
+                                let play_label = if self.bik_is_playing { "Pause" } else { "Play" };
+
+                                if ui.button(play_label).clicked() {
+                                    if self.bik_is_playing {
+                                        self.pause_bik_playback();
+                                    } else {
+                                        self.start_bik_playback(ui.ctx());
+                                    }
+                                }
+
+                                if ui.button("Stop").clicked() {
+                                    self.stop_bik_playback(ui.ctx());
+                                }
+
+                                if ui.button("Restart").clicked() {
+                                    self.stop_bik_playback(ui.ctx());
+                                    self.start_bik_playback(ui.ctx());
+                                }
+
+                                ui.separator();
+                                ui.checkbox(&mut self.bik_loop, "Loop");
+                            });
+
+                            let mut timeline_secs =
+                                self.bik_current_time_seconds.clamp(0.0, total_duration.max(0.0));
+
+                            let timeline_response = ui.add_sized(
+                                [ui.available_width(), 18.0],
+                                egui::Slider::new(&mut timeline_secs, 0.0..=total_duration.max(0.01))
+                                    .show_value(false),
+                            );
+
+                            if timeline_response.changed() {
+                                self.seek_bik_to_time(timeline_secs, ui.ctx());
+                            }
+
+                            ui.horizontal(|ui| {
+                                ui.label(format!(
+                                    "Frame {}",
+                                    self.bik_current_frame.saturating_add(1)
+                                ));
+
+                                ui.separator();
+
+                                ui.label(format!(
+                                    "{:.2} / {:.2} sec",
+                                    self.bik_current_time_seconds,
+                                    total_duration
+                                ));
+
+                                ui.separator();
+
+                                ui.label(format!(
+                                    "~{} frames @ {:.3} fps",
+                                    estimated_frames,
+                                    preview_fps
+                                ));
+                            });
+
                             ui.separator();
 
                             let preview_height = self.bik_view_height.clamp(180.0, 900.0);
@@ -1226,19 +1524,35 @@ impl eframe::App for ModToolApp {
                                 egui::vec2(ui.available_width(), preview_height),
                                 egui::Layout::top_down(egui::Align::Min),
                                 |ui| {
-                                    let tex_size = preview.texture.size_vec2();
-                                    let available = ui.available_size();
+                                    let preview_hovered = ui.rect_contains_pointer(ui.max_rect());
 
-                                    let fit_scale =
-                                        (available.x / tex_size.x).min(available.y / tex_size.y).min(1.0);
+                                    if preview_hovered {
+                                        let scroll_y = ui.ctx().input(|i| i.smooth_scroll_delta.y);
 
-                                    let desired_size = tex_size * fit_scale.max(0.1) * self.bik_zoom;
+                                        if scroll_y.abs() > 0.0 {
+                                            let zoom_factor = (1.0 + scroll_y * 0.001).clamp(0.5, 1.5);
+                                            self.bik_zoom = (self.bik_zoom * zoom_factor).clamp(0.25, 8.0);
+                                            ui.ctx().request_repaint();
+                                        }
+                                    }
 
-                                    egui::ScrollArea::both()
-                                        .auto_shrink([false, false])
-                                        .show(ui, |ui| {
-                                            ui.image((preview.texture.id(), desired_size));
-                                        });
+                                    if let Some(texture) = self.bik_texture.as_ref() {
+                                        let tex_size = texture.size_vec2();
+                                        let available = ui.available_size();
+
+                                        let fit_scale =
+                                            (available.x / tex_size.x).min(available.y / tex_size.y).min(1.0);
+
+                                        let desired_size = tex_size * fit_scale.max(0.1) * self.bik_zoom;
+
+                                        egui::ScrollArea::both()
+                                            .auto_shrink([false, false])
+                                            .show(ui, |ui| {
+                                                ui.image((texture.id(), desired_size));
+                                            });
+                                    } else {
+                                        ui.label("No decoded frame available.");
+                                    }
                                 },
                             );
 
@@ -1258,28 +1572,22 @@ impl eframe::App for ModToolApp {
 
                             if resize_response.dragged() {
                                 let delta = ui.ctx().input(|i| i.pointer.delta()).y;
-                                self.bik_view_height = (self.bik_view_height + delta).clamp(180.0, 900.0);
+                                self.bik_view_height =
+                                    (self.bik_view_height + delta).clamp(180.0, 900.0);
                                 ui.ctx().request_repaint();
                             }
 
                             ui.separator();
                             ui.heading("Video");
                             ui.separator();
-
-                            let label = preview
-                                .path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_else(|| preview.path.display().to_string());
-
-                            ui.label(label);
+                            ui.label(file_label);
                         } else if let Some(err) = &self.bik_error {
                             ui.colored_label(
                                 egui::Color32::RED,
                                 format!("Could not decode BIK: {}", err),
                             );
                         } else {
-                            ui.label("BIK selected, but no preview is loaded.");
+                            ui.label("BIK selected, but preview is still loading.");
                         }
                     }
 
