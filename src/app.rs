@@ -29,6 +29,7 @@ pub struct ModToolApp {
     tree: Vec<FileNode>,
     selected_file: Option<PathBuf>,
     status: String,
+    dark_mode: bool,
 
     dds_preview: Option<DdsPreview>,
     dds_preview_path: Option<PathBuf>,
@@ -61,12 +62,14 @@ pub struct ModToolApp {
 }
 
 impl ModToolApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        cc.egui_ctx.set_visuals(egui::Visuals::dark());
         Self {
             game_root: None,
             tree: Vec::new(),
             selected_file: None,
             status: "Choose your Little Britain install folder.".to_owned(),
+            dark_mode: true,
 
             dds_preview: None,
             dds_preview_path: None,
@@ -208,7 +211,6 @@ impl ModToolApp {
                     .default_open(false)
                     .show(ui, |ui| {
                         let mut real_folders: Vec<&FileNode> = Vec::new();
-
                         let mut animations: Vec<&FileNode> = Vec::new();
                         let mut models: Vec<&FileNode> = Vec::new();
                         let mut textures: Vec<&FileNode> = Vec::new();
@@ -758,6 +760,12 @@ impl ModToolApp {
 
 impl eframe::App for ModToolApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.dark_mode {
+            ui.ctx().set_visuals(egui::Visuals::dark());
+        } else {
+            ui.ctx().set_visuals(egui::Visuals::light());
+        }
+
         self.ensure_bnk_loaded();
         self.ensure_dds_preview_loaded(ui.ctx());
         self.ensure_geo_loaded();
@@ -781,6 +789,12 @@ impl eframe::App for ModToolApp {
                     .clicked()
                 {
                     self.rescan();
+                }
+
+                let theme_label = if self.dark_mode { "Light mode" } else { "Dark mode" };
+
+                if ui.button(theme_label).clicked() {
+                    self.dark_mode = !self.dark_mode;
                 }
 
                 ui.separator();

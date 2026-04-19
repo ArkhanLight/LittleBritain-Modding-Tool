@@ -1288,7 +1288,7 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
     let shade = (0.45 + 0.55 * ndotl) * globals.render_opts.y;
 
     let textured = globals.render_opts.x;
-    let flat_gray = vec3<f32>(0.68, 0.68, 0.68);
+    let flat_gray = vec3<f32>(0.50, 0.50, 0.50);
     let base_rgb = mix(flat_gray, texel.rgb, textured);
     let lit_rgb = min(base_rgb * shade, vec3<f32>(1.0, 1.0, 1.0));
 
