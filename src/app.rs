@@ -541,11 +541,22 @@ impl ModToolApp {
     }
 
     fn seek_bik_to_time(&mut self, seconds: f32, ctx: &egui::Context) {
-        let Some(preview) = self.bik_preview.as_ref() else {
+        let was_playing = self.bik_is_playing;
+
+        let Some((total, fps, first_frame)) = self
+            .bik_preview
+            .as_ref()
+            .map(|preview| {
+                (
+                    preview.total_duration_seconds(),
+                    preview.fps.max(0.001),
+                    preview.first_frame.clone(),
+                )
+            })
+        else {
             return;
         };
 
-        let total = preview.total_duration_seconds();
         let target = seconds.clamp(0.0, total.max(0.0));
 
         self.bik_is_playing = false;
@@ -562,15 +573,17 @@ impl ModToolApp {
             }
         }
 
-        let fps = preview.fps.max(0.001);
         self.bik_current_time_seconds = target;
         self.bik_current_frame = (target * fps).floor() as usize;
 
         if target <= 0.0 {
-            let first_frame = preview.first_frame.clone();
             self.set_bik_texture_from_image(ctx, first_frame);
         }
-    }  
+
+        if was_playing {
+            self.start_bik_playback(ctx);
+        }
+    }
 
     fn poll_bik_decoder(&mut self, _ctx: &egui::Context) {
         let Some(rx) = self.bik_decoder_rx.as_ref() else {
@@ -1607,7 +1620,7 @@ impl eframe::App for ModToolApp {
                                     self.stop_bik_playback(ui.ctx());
                                     self.start_bik_playback(ui.ctx());
                                 }
-                                
+
                                 ui.separator();
                                 ui.checkbox(&mut self.bik_loop, "Loop");
 
@@ -1617,6 +1630,23 @@ impl eframe::App for ModToolApp {
                                 } else {
                                     "No audio track detected"
                                 });
+
+                                ui.separator();
+
+                                let mut bik_volume = self
+                                    .audio_player
+                                    .as_ref()
+                                    .map(|player| player.volume())
+                                    .unwrap_or(1.0);
+
+                                if ui
+                                    .add(egui::Slider::new(&mut bik_volume, 0.0..=2.0).text("Volume"))
+                                    .changed()
+                                {
+                                    if let Some(player) = self.audio_player.as_ref() {
+                                        player.set_volume(bik_volume);
+                                    }
+                                }
                             });
 
                             if let Some(err) = &self.bik_audio_error {
