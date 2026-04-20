@@ -1,6 +1,6 @@
 use crate::{
     audio_player::AudioPlayer,
-    bik_preview::{load_bik_preview, spawn_bik_decoder, BikPreview, BikWorkerEvent},
+    bik_preview::{extract_bik_audio_wav, load_bik_preview, spawn_bik_decoder, BikPreview, BikWorkerEvent},
     bnk::{format_name, load_bnk, BnkFile},
     dds_preview::{load_dds_preview, DdsPreview},
     fs_tree::{category_name, classify_path, scan_game_data, AssetCategory, FileNode, NodeKind},
@@ -65,6 +65,10 @@ pub struct ModToolApp {
     bik_preview_path: Option<PathBuf>,
     bik_texture: Option<egui::TextureHandle>,
     bik_error: Option<String>,
+    bik_audio_error: Option<String>,
+    bik_audio_wav: Option<Vec<u8>>,
+    bik_audio_path: Option<PathBuf>,
+    bik_audio_active: bool,
     bik_zoom: f32,
     bik_view_height: f32,
     bik_current_frame: usize,
@@ -120,6 +124,10 @@ impl ModToolApp {
             bik_preview_path: None,
             bik_texture: None,
             bik_error: None,
+            bik_audio_error: None,
+            bik_audio_wav: None,
+            bik_audio_path: None,
+            bik_audio_active: false,
             bik_zoom: 1.0,
             bik_view_height: 420.0,
             bik_current_frame: 0,
@@ -298,11 +306,102 @@ impl ModToolApp {
         }
     }
 
+    fn stop_bik_audio(&mut self) {
+        if self.bik_audio_active {
+            if let Some(player) = self.audio_player.as_ref() {
+                player.stop();
+            }
+        }
+
+        self.bik_audio_active = false;
+    }
+
+    fn ensure_bik_audio_loaded(&mut self) -> bool {
+        let Some(preview) = self.bik_preview.as_ref() else {
+            return false;
+        };
+
+        if !preview.has_audio {
+            return false;
+        }
+
+        let path = preview.path.clone();
+
+        if self.bik_audio_path.as_ref() == Some(&path) {
+            return self.bik_audio_wav.is_some();
+        }
+
+        self.bik_audio_path = Some(path.clone());
+        self.bik_audio_wav = None;
+        self.bik_audio_error = None;
+
+        match extract_bik_audio_wav(&path) {
+            Ok(Some(wav_bytes)) => {
+                self.bik_audio_wav = Some(wav_bytes);
+                true
+            }
+            Ok(None) => false,
+            Err(err) => {
+                self.bik_audio_error = Some(err.to_string());
+                false
+            }
+        }
+    }
+
+    fn start_bik_audio(&mut self, start_seconds: f32) {
+        if !self.ensure_bik_audio_loaded() {
+            self.bik_audio_active = false;
+            return;
+        }
+
+        if !self.ensure_audio_player() {
+            self.bik_audio_active = false;
+            self.bik_audio_error = self.audio_error.clone();
+            return;
+        }
+
+        let Some(wav_bytes) = self.bik_audio_wav.clone() else {
+            self.bik_audio_active = false;
+            return;
+        };
+
+        let label = self
+            .bik_preview
+            .as_ref()
+            .map(|preview| {
+                preview
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| preview.path.display().to_string())
+            })
+            .unwrap_or_else(|| "BIK audio".to_owned());
+
+        if let Some(player) = self.audio_player.as_mut() {
+            match player.play_data(label.clone(), wav_bytes) {
+                Ok(()) => {
+                    player.seek(Duration::from_secs_f32(start_seconds.max(0.0)));
+                    self.bik_audio_error = None;
+                    self.bik_audio_active = true;
+                    self.status = format!("Playing {label}");
+                }
+                Err(err) => {
+                    self.bik_audio_error = Some(err.to_string());
+                    self.bik_audio_active = false;
+                }
+            }
+        }
+    }  
+
     fn reset_bik_state(&mut self) {
+        self.stop_bik_audio();
         self.bik_preview = None;
         self.bik_preview_path = None;
         self.bik_texture = None;
         self.bik_error = None;
+        self.bik_audio_error = None;
+        self.bik_audio_wav = None;
+        self.bik_audio_path = None;
         self.bik_zoom = 1.0;
         self.bik_view_height = 420.0;
         self.bik_current_frame = 0;
@@ -362,6 +461,7 @@ impl ModToolApp {
                 self.bik_current_frame = 0;
                 self.bik_current_time_seconds = 0.0;
                 self.bik_error = None;
+                self.bik_audio_error = None;
                 ctx.request_repaint();
             }
             Err(err) => {
@@ -401,6 +501,7 @@ impl ModToolApp {
         self.bik_decoder_finished = false;
         self.bik_is_playing = true;
         self.bik_error = None;
+        self.start_bik_audio(self.bik_current_time_seconds);
         ctx.request_repaint();
     }
 
@@ -410,6 +511,12 @@ impl ModToolApp {
         self.bik_frame_queue.clear();
         self.bik_clock_started_at = None;
         self.bik_decoder_finished = false;
+
+        if self.bik_audio_active {
+            if let Some(player) = self.audio_player.as_ref() {
+                player.pause();
+            }
+        }
     }
 
     fn stop_bik_playback(&mut self, ctx: &egui::Context) {
@@ -421,6 +528,7 @@ impl ModToolApp {
         self.bik_current_frame = 0;
         self.bik_current_time_seconds = 0.0;
         self.bik_decoder_finished = false;
+        self.stop_bik_audio();
 
         let first_frame = self
             .bik_preview
@@ -447,6 +555,13 @@ impl ModToolApp {
         self.bik_clock_start_secs = target;
         self.bik_decoder_finished = false;
 
+        if self.bik_audio_active {
+            if let Some(player) = self.audio_player.as_ref() {
+                player.pause();
+                player.seek(Duration::from_secs_f32(target));
+            }
+        }
+
         let fps = preview.fps.max(0.001);
         self.bik_current_time_seconds = target;
         self.bik_current_frame = (target * fps).floor() as usize;
@@ -455,7 +570,7 @@ impl ModToolApp {
             let first_frame = preview.first_frame.clone();
             self.set_bik_texture_from_image(ctx, first_frame);
         }
-    }    
+    }  
 
     fn poll_bik_decoder(&mut self, _ctx: &egui::Context) {
         let Some(rx) = self.bik_decoder_rx.as_ref() else {
@@ -489,6 +604,7 @@ impl ModToolApp {
             self.bik_decoder_rx = None;
             self.bik_frame_queue.clear();
             self.bik_decoder_finished = false;
+            self.stop_bik_audio();
             self.bik_error = Some(err);
             return;
         }
@@ -510,8 +626,19 @@ impl ModToolApp {
             return;
         };
 
-        let target_time =
-            self.bik_clock_start_secs + Instant::now().duration_since(started_at).as_secs_f32();
+        let target_time = if self.bik_audio_active {
+            self.audio_player
+                .as_ref()
+                .filter(|player| !player.is_empty())
+                .map(|player| player.position().as_secs_f32())
+                .unwrap_or_else(|| {
+                    self.bik_clock_start_secs
+                        + Instant::now().duration_since(started_at).as_secs_f32()
+                })
+        } else {
+            self.bik_clock_start_secs
+                + Instant::now().duration_since(started_at).as_secs_f32()
+        };
 
         while let Some((_, time_seconds, _)) = self.bik_frame_queue.front() {
             if *time_seconds <= target_time {
@@ -533,6 +660,7 @@ impl ModToolApp {
                 self.start_bik_playback(ctx);
             } else {
                 self.bik_is_playing = false;
+                self.stop_bik_audio();
             }
 
             return;
@@ -773,6 +901,7 @@ impl ModToolApp {
             match player.play_file(&path) {
                 Ok(()) => {
                     self.audio_error = None;
+                    self.bik_audio_active = false;
                     self.status = format!("Playing {}", path.display());
                 }
                 Err(err) => {
@@ -819,6 +948,7 @@ impl ModToolApp {
             match player.play_data(label.clone(), wav_bytes) {
                 Ok(()) => {
                     self.audio_error = None;
+                    self.bik_audio_active = false;
                     self.status = format!("Playing {label}");
                 }
                 Err(err) => {
@@ -841,6 +971,7 @@ impl ModToolApp {
     fn stop_audio(&mut self) {
         if let Some(player) = self.audio_player.as_ref() {
             player.stop();
+            self.bik_audio_active = false;
             self.status = "Stopped audio.".to_owned();
         }
     }
@@ -1437,7 +1568,8 @@ impl eframe::App for ModToolApp {
                             let total_duration = preview.total_duration_seconds();
                             let preview_fps = preview.fps;
                             let estimated_frames = preview.estimated_frame_count();
-                            let file_label = preview
+                            let has_audio = preview.has_audio;
+                            let file_label = preview             
                                 .path
                                 .file_name()
                                 .map(|n| n.to_string_lossy().to_string())
@@ -1475,10 +1607,24 @@ impl eframe::App for ModToolApp {
                                     self.stop_bik_playback(ui.ctx());
                                     self.start_bik_playback(ui.ctx());
                                 }
-
+                                
                                 ui.separator();
                                 ui.checkbox(&mut self.bik_loop, "Loop");
+
+                                ui.separator();
+                                ui.small(if has_audio {
+                                    "Audio track detected"
+                                } else {
+                                    "No audio track detected"
+                                });
                             });
+
+                            if let Some(err) = &self.bik_audio_error {
+                                ui.colored_label(
+                                    egui::Color32::RED,
+                                    format!("BIK audio error: {}", err),
+                                );
+                            }
 
                             let mut timeline_secs =
                                 self.bik_current_time_seconds.clamp(0.0, total_duration.max(0.0));

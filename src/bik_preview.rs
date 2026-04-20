@@ -3,8 +3,15 @@ use eframe::egui::ColorImage;
 use ffmpeg_next as ffmpeg;
 use ffmpeg::{
     codec, format, frame, media,
-    software::scaling::{context::Context as Scaler, flag::Flags},
-    util::format::pixel::Pixel,
+    software::{
+        resampling::context::Context as Resampler,
+        scaling::{context::Context as Scaler, flag::Flags},
+    },
+    util::format::{
+        pixel::Pixel,
+        sample::{Sample, Type as SampleType},
+    },
+    ChannelLayout,
 };
 use std::{
     path::{Path, PathBuf},
@@ -37,6 +44,7 @@ pub struct BikPreview {
     pub height: u32,
     pub fps: f32,
     pub duration_seconds: Option<f32>,
+    pub has_audio: bool,
     pub first_frame: ColorImage,
 }
 
@@ -100,6 +108,152 @@ fn frame_to_color_image(frame: &frame::Video) -> Result<ColorImage> {
     Ok(ColorImage::from_rgba_unmultiplied([width, height], &rgba))
 }
 
+fn append_resampled_pcm16_frame(frame: &frame::Audio, pcm_data: &mut Vec<u8>) -> Result<()> {
+    if frame.format() != Sample::I16(SampleType::Packed) {
+        bail!("Resampled audio frame is not packed 16-bit PCM");
+    }
+
+    match frame.channels() {
+        1 => {
+            for sample in frame.plane::<i16>(0) {
+                pcm_data.extend_from_slice(&sample.to_le_bytes());
+            }
+        }
+        2 => {
+            for (left, right) in frame.plane::<(i16, i16)>(0) {
+                pcm_data.extend_from_slice(&left.to_le_bytes());
+                pcm_data.extend_from_slice(&right.to_le_bytes());
+            }
+        }
+        channels => {
+            bail!("Unsupported resampled channel count: {channels}");
+        }
+    }
+
+    Ok(())
+}
+
+fn build_wav_bytes_pcm16(sample_rate: u32, channels: u16, pcm_data: &[u8]) -> Vec<u8> {
+    let bits_per_sample = 16u16;
+    let block_align = channels * (bits_per_sample / 8);
+    let byte_rate = sample_rate * u32::from(block_align);
+    let riff_size = 36u32 + pcm_data.len() as u32;
+
+    let mut out = Vec::with_capacity(44 + pcm_data.len());
+
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&riff_size.to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&channels.to_le_bytes());
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&block_align.to_le_bytes());
+    out.extend_from_slice(&bits_per_sample.to_le_bytes());
+
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&(pcm_data.len() as u32).to_le_bytes());
+    out.extend_from_slice(pcm_data);
+
+    out
+}
+
+pub fn extract_bik_audio_wav(path: &Path) -> Result<Option<Vec<u8>>> {
+    ensure_ffmpeg_init()?;
+
+    let mut input = format::input(path)
+        .with_context(|| format!("Failed to open BIK file {}", path.display()))?;
+
+    let stream = match input.streams().best(media::Type::Audio) {
+        Some(stream) => stream,
+        None => return Ok(None),
+    };
+
+    let stream_index = stream.index();
+
+    let context = codec::context::Context::from_parameters(stream.parameters())
+        .context("Failed to create audio codec context from stream parameters")?;
+
+    let mut decoder = context
+        .decoder()
+        .audio()
+        .context("Failed to open audio decoder")?;
+
+    let src_rate = decoder.rate().max(1);
+    let src_layout = if decoder.channel_layout().is_empty() {
+        ChannelLayout::default(decoder.channels().into())
+    } else {
+        decoder.channel_layout()
+    };
+
+    let dst_rate = src_rate;
+    let dst_format = Sample::I16(SampleType::Packed);
+    let dst_layout = ChannelLayout::STEREO;
+
+    let mut resampler = Resampler::get(
+        decoder.format(),
+        src_layout,
+        src_rate,
+        dst_format,
+        dst_layout,
+        dst_rate,
+    )
+    .context("Failed to create FFmpeg audio resampler")?;
+
+    let mut decoded = frame::Audio::empty();
+    let mut pcm_data = Vec::new();
+
+    let mut process_decoded_frames = |decoder: &mut ffmpeg::decoder::Audio| -> Result<()> {
+        while decoder.receive_frame(&mut decoded).is_ok() {
+            let mut resampled = frame::Audio::empty();
+            resampler
+                .run(&decoded, &mut resampled)
+                .context("Failed to resample audio frame")?;
+
+            append_resampled_pcm16_frame(&resampled, &mut pcm_data)?;
+        }
+
+        Ok(())
+    };
+
+    for (packet_stream, packet) in input.packets() {
+        if packet_stream.index() != stream_index {
+            continue;
+        }
+
+        decoder
+            .send_packet(&packet)
+            .context("Failed to send audio packet to decoder")?;
+
+        process_decoded_frames(&mut decoder)?;
+    }
+
+    decoder.send_eof().ok();
+    process_decoded_frames(&mut decoder)?;
+
+    loop {
+        let mut flushed = frame::Audio::empty();
+        match resampler.flush(&mut flushed) {
+            Ok(Some(_)) => append_resampled_pcm16_frame(&flushed, &mut pcm_data)?,
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+
+    if pcm_data.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(build_wav_bytes_pcm16(
+        dst_rate,
+        dst_layout.channels() as u16,
+        &pcm_data,
+    )))
+}
+
 pub fn load_bik_preview(path: &Path) -> Result<BikPreview> {
     ensure_ffmpeg_init()?;
 
@@ -110,6 +264,8 @@ pub fn load_bik_preview(path: &Path) -> Result<BikPreview> {
         .streams()
         .best(media::Type::Video)
         .ok_or_else(|| anyhow!("No video stream found in {}", path.display()))?;
+
+    let has_audio = input.streams().best(media::Type::Audio).is_some();
 
     let stream_index = stream.index();
     let fps = rational_to_f32(stream.rate())
@@ -195,6 +351,7 @@ pub fn load_bik_preview(path: &Path) -> Result<BikPreview> {
         height: src_height,
         fps,
         duration_seconds,
+        has_audio,
         first_frame: frame_to_color_image(&rgba)?,
     })
 }
