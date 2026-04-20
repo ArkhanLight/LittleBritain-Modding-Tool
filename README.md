@@ -1,5 +1,4 @@
-# LittleBritain-Modding-Tool
-A universal modding tool for the LittleBritain PC Game.
+# LittleBritain Universal Modding Tool
 
 V0.2
 - Cross reference: models -> textures, textures -> models with clickable buttons
