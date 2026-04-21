@@ -1,6 +1,7 @@
 use crate::{
     dds_preview::DdsPreview,
     geo::{GeoFile, GeoSkeleton},
+    scn::{ScnFile, ScnMeshChunk},
 };
 use bytemuck::{Pod, Zeroable};
 use eframe::{
@@ -10,6 +11,7 @@ use eframe::{
 use glam::{Mat4, Vec3};
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 use wgpu::util::DeviceExt;
@@ -27,6 +29,7 @@ pub struct GeoViewerState {
     pub show_textures: bool,
     pub show_wireframe: bool,
     pub show_bones: bool,
+    pub show_helpers: bool,
     pub cull_backfaces: bool,
 
     scene_key: Option<String>,
@@ -44,11 +47,20 @@ impl Default for GeoViewerState {
             show_textures: true,
             show_wireframe: false,
             show_bones: true,
+            show_helpers: true,
             cull_backfaces: false,
             scene_key: None,
             cpu_scene: None,
         }
     }
+}
+
+#[derive(Clone)]
+pub struct SceneGeoModel {
+    pub archetype: String,
+    pub path: PathBuf,
+    pub geo: GeoFile,
+    pub textures: Vec<Option<DdsPreview>>,
 }
 
 #[repr(C)]
@@ -81,9 +93,16 @@ struct CpuTexture {
     rgba: Vec<u8>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PartClass {
+    Solid,
+    Helper,
+}
+
 struct CpuPart {
     indices: Vec<u32>,
     texture: Option<CpuTexture>,
+    class: PartClass,
 }
 
 struct CpuScene {
@@ -92,6 +111,7 @@ struct CpuScene {
     parts: Vec<CpuPart>,
     ground_lines: Vec<LineVertex>,
     wire_lines: Vec<LineVertex>,
+    helper_wire_lines: Vec<LineVertex>,
     bone_lines: Vec<LineVertex>,
     center: [f32; 3],
     radius: f32,
@@ -101,6 +121,7 @@ struct GpuPart {
     index_buffer: wgpu::Buffer,
     index_count: u32,
     bind_group: wgpu::BindGroup,
+    class: PartClass,
     _texture_keepalive: wgpu::Texture,
 }
 
@@ -116,6 +137,7 @@ struct GpuScene {
     parts: Vec<GpuPart>,
     ground_lines: Option<GpuLines>,
     wire_lines: Option<GpuLines>,
+    helper_wire_lines: Option<GpuLines>,
     bone_lines: Option<GpuLines>,
 }
 
@@ -154,6 +176,7 @@ struct GeoGpuCallback {
     show_textures: bool,
     show_wireframe: bool,
     show_bones: bool,
+    show_helpers: bool,
     cull_backfaces: bool,
     frame_targets: Arc<Mutex<Option<FrameTargets>>>,
 }
@@ -252,6 +275,133 @@ pub fn draw_geo_viewer(
             show_textures: state.show_textures,
             show_wireframe: state.show_wireframe,
             show_bones: state.show_bones,
+            show_helpers: true,
+            cull_backfaces: state.cull_backfaces,
+            frame_targets: Arc::new(Mutex::new(None)),
+        },
+    );
+
+    painter.add(callback);
+}
+
+pub fn reset_scene_viewer(state: &mut GeoViewerState, scn: &ScnFile) {
+    let (_center, radius) = scn_bounds(scn);
+    state.yaw = std::f32::consts::PI + 0.35;
+    state.pitch = -0.55;
+    state.distance = (radius * 2.2).max(250.0);
+    state.pan = Vec2::ZERO;
+    state.show_faces = true;
+    state.show_textures = true;
+    state.show_wireframe = false;
+    state.show_bones = false; // markers off by default
+    state.show_helpers = true; // helpers on by default
+    state.cull_backfaces = false;
+    state.scene_key = None;
+    state.cpu_scene = None;
+}
+
+pub fn draw_scene_viewer(
+    ui: &mut egui::Ui,
+    scn: &ScnFile,
+    models: &[SceneGeoModel],
+    embedded_textures: &HashMap<String, DdsPreview>,
+    state: &mut GeoViewerState,
+    viewer_height: f32,
+) {
+    ui.horizontal(|ui| {
+        if ui.button("Reset view").clicked() {
+            reset_scene_viewer(state, scn);
+        }
+
+        ui.checkbox(&mut state.show_faces, "Faces");
+        ui.checkbox(&mut state.show_textures, "Textures");
+        ui.checkbox(&mut state.show_wireframe, "Wireframe");
+        ui.checkbox(&mut state.show_bones, "Markers");
+        ui.checkbox(&mut state.show_helpers, "Helpers");
+        ui.checkbox(&mut state.cull_backfaces, "Cull");
+
+        ui.separator();
+        ui.small("SCN 3D: embedded SCN mesh + placed GEO props");
+    });
+
+    let desired_height = viewer_height.clamp(260.0, 900.0);
+    let desired_size = egui::vec2(ui.available_width().max(200.0), desired_height);
+    let (response, painter) = ui.allocate_painter(desired_size, Sense::click_and_drag());
+    let rect = response.rect;
+
+    painter.rect_filled(rect, 0.0, Color32::from_rgb(30, 30, 34));
+
+    if response.dragged_by(egui::PointerButton::Primary) {
+        let delta = ui.input(|i| i.pointer.delta());
+        state.yaw -= delta.x * 0.01;
+        state.pitch = (state.pitch - delta.y * 0.01).clamp(-1.10, 1.10);
+        ui.ctx().request_repaint();
+    }
+
+    if response.dragged_by(egui::PointerButton::Secondary)
+        || response.dragged_by(egui::PointerButton::Middle)
+    {
+        let delta = ui.input(|i| i.pointer.delta());
+        state.pan += delta;
+        ui.ctx().request_repaint();
+    }
+
+    let min_distance = 5.0;
+    let max_distance = (scn_bounds(scn).1 * 8.0).max(600.0);
+
+    if response.hovered() {
+        let scroll_y = ui.ctx().input(|i| i.smooth_scroll_delta.y);
+        if scroll_y.abs() > 0.0 {
+            let zoom_factor = 0.9985_f32.powf(scroll_y);
+            state.distance = (state.distance * zoom_factor).clamp(min_distance, max_distance);
+            ui.ctx().request_repaint();
+        }
+    }
+
+    state.distance = state.distance.clamp(min_distance, max_distance);
+
+    let model_texture_state: usize = models
+        .iter()
+        .map(|m| m.textures.iter().filter(|t| t.is_some()).count())
+        .sum();
+
+    let scene_key = format!(
+        "scn:{}#nodes:{}#models:{}#embtex:{}#mdltex:{}",
+        scn.path.display(),
+        scn.nodes.len(),
+        models.len(),
+        embedded_textures.len(),
+        model_texture_state,
+    );
+
+    if state.scene_key.as_deref() != Some(scene_key.as_str()) {
+        state.cpu_scene = Some(build_cpu_scene_from_scn(
+            scn,
+            models,
+            embedded_textures,
+            scene_key.clone(),
+        ));
+        state.scene_key = Some(scene_key);
+    }
+
+    let Some(scene) = state.cpu_scene.clone() else {
+        return;
+    };
+
+    let callback = egui_wgpu::Callback::new_paint_callback(
+        rect,
+        GeoGpuCallback {
+            rect,
+            scene,
+            yaw: state.yaw,
+            pitch: state.pitch,
+            distance: state.distance,
+            pan: state.pan,
+            show_faces: state.show_faces,
+            show_textures: state.show_textures,
+            show_wireframe: state.show_wireframe,
+            show_bones: state.show_bones,
+            show_helpers: state.show_helpers,
             cull_backfaces: state.cull_backfaces,
             frame_targets: Arc::new(Mutex::new(None)),
         },
@@ -358,7 +508,7 @@ impl egui_wgpu::CallbackTrait for GeoGpuCallback {
                 multiview_mask: None,
             });
 
-            if self.show_faces {
+            if self.show_faces && !gpu_scene.parts.is_empty() {
                 let pipeline = if self.cull_backfaces {
                     &shared.face_pipeline_cull
                 } else {
@@ -367,18 +517,16 @@ impl egui_wgpu::CallbackTrait for GeoGpuCallback {
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, &gpu_scene.globals_bind_group, &[]);
                 pass.set_vertex_buffer(0, gpu_scene.vertex_buffer.slice(..));
+
                 for part in &gpu_scene.parts {
+                    if !self.show_helpers && matches!(part.class, PartClass::Helper) {
+                        continue;
+                    }
+
                     pass.set_bind_group(1, &part.bind_group, &[]);
                     pass.set_index_buffer(part.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..part.index_count, 0, 0..1);
                 }
-            }
-
-            if let Some(ground) = &gpu_scene.ground_lines {
-                pass.set_pipeline(&shared.line_pipeline_overlay);
-                pass.set_bind_group(0, &gpu_scene.globals_bind_group, &[]);
-                pass.set_vertex_buffer(0, ground.buffer.slice(..));
-                pass.draw(0..ground.vertex_count, 0..1);
             }
 
             if self.show_wireframe {
@@ -387,6 +535,15 @@ impl egui_wgpu::CallbackTrait for GeoGpuCallback {
                     pass.set_bind_group(0, &gpu_scene.globals_bind_group, &[]);
                     pass.set_vertex_buffer(0, wire.buffer.slice(..));
                     pass.draw(0..wire.vertex_count, 0..1);
+                }
+
+                if self.show_helpers {
+                    if let Some(wire) = &gpu_scene.helper_wire_lines {
+                        pass.set_pipeline(&shared.line_pipeline_overlay);
+                        pass.set_bind_group(0, &gpu_scene.globals_bind_group, &[]);
+                        pass.set_vertex_buffer(0, wire.buffer.slice(..));
+                        pass.draw(0..wire.vertex_count, 0..1);
+                    }
                 }
             }
 
@@ -397,6 +554,13 @@ impl egui_wgpu::CallbackTrait for GeoGpuCallback {
                     pass.set_vertex_buffer(0, bones.buffer.slice(..));
                     pass.draw(0..bones.vertex_count, 0..1);
                 }
+            }
+
+            if let Some(ground) = &gpu_scene.ground_lines {
+                pass.set_pipeline(&shared.line_pipeline_overlay);
+                pass.set_bind_group(0, &gpu_scene.globals_bind_group, &[]);
+                pass.set_vertex_buffer(0, ground.buffer.slice(..));
+                pass.draw(0..ground.vertex_count, 0..1);
             }
         }
 
@@ -823,6 +987,10 @@ fn upload_scene(
 
     let mut parts = Vec::new();
     for part in &scene.parts {
+        if part.indices.is_empty() {
+            continue;
+        }
+
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("geo_part_indices"),
             contents: bytemuck::cast_slice(&part.indices),
@@ -910,6 +1078,7 @@ fn upload_scene(
             index_buffer,
             index_count: part.indices.len() as u32,
             bind_group,
+            class: part.class,
             _texture_keepalive: texture,
         });
     }
@@ -921,6 +1090,7 @@ fn upload_scene(
         parts,
         ground_lines: upload_lines(device, &scene.ground_lines, "geo_ground_lines"),
         wire_lines: upload_lines(device, &scene.wire_lines, "geo_wire_lines"),
+        helper_wire_lines: upload_lines(device, &scene.helper_wire_lines, "geo_helper_wire_lines"),
         bone_lines: upload_lines(device, &scene.bone_lines, "geo_bone_lines"),
     }
 }
@@ -973,6 +1143,7 @@ fn build_cpu_scene(geo: &GeoFile, textures: &[Option<DdsPreview>], key: String) 
         parts.push(CpuPart {
             indices,
             texture: None,
+            class: PartClass::Solid,
         });
     } else {
         for subset in &geo.subsets {
@@ -996,12 +1167,17 @@ fn build_cpu_scene(geo: &GeoFile, textures: &[Option<DdsPreview>], key: String) 
                     rgba: dds.rgba_pixels.clone(),
                 });
 
-            parts.push(CpuPart { indices, texture });
+            parts.push(CpuPart {
+                indices,
+                texture,
+                class: PartClass::Solid,
+            });
         }
     }
 
     let ground_lines = build_ground_lines(geo, center, radius);
     let wire_lines = build_wire_lines(geo);
+    let helper_wire_lines = Vec::new();
     let bone_lines = geo
         .skeleton
         .as_ref()
@@ -1014,10 +1190,518 @@ fn build_cpu_scene(geo: &GeoFile, textures: &[Option<DdsPreview>], key: String) 
         parts,
         ground_lines,
         wire_lines,
+        helper_wire_lines,
         bone_lines,
         center,
         radius,
     })
+}
+
+fn cpu_texture_from_dds(dds: &DdsPreview) -> CpuTexture {
+    CpuTexture {
+        width: dds.width as u32,
+        height: dds.height as u32,
+        rgba: dds.rgba_pixels.clone(),
+    }
+}
+
+fn build_cpu_scene_from_scn(
+    scn: &ScnFile,
+    models: &[SceneGeoModel],
+    embedded_textures: &HashMap<String, DdsPreview>,
+    key: String,
+) -> Arc<CpuScene> {
+    let geo_by_archetype: HashMap<String, &SceneGeoModel> = models
+        .iter()
+        .map(|m| (m.archetype.to_ascii_lowercase(), m))
+        .collect();
+
+    let mut vertices = Vec::new();
+    let mut parts = Vec::new();
+    let mut wire_lines = Vec::new();
+    let mut helper_wire_lines = Vec::new();
+    let mut marker_lines = Vec::new();
+
+    let mut have_bounds = false;
+    let mut min = [0.0f32; 3];
+    let mut max = [0.0f32; 3];
+
+    let mut update_bounds = |p: [f32; 3]| {
+        if !have_bounds {
+            min = p;
+            max = p;
+            have_bounds = true;
+        } else {
+            min[0] = min[0].min(p[0]);
+            min[1] = min[1].min(p[1]);
+            min[2] = min[2].min(p[2]);
+            max[0] = max[0].max(p[0]);
+            max[1] = max[1].max(p[1]);
+            max[2] = max[2].max(p[2]);
+        }
+    };
+
+    for chunk in &scn.mesh_chunks {
+        append_scn_chunk_mesh(
+            chunk,
+            embedded_textures,
+            &mut vertices,
+            &mut parts,
+            &mut wire_lines,
+            &mut helper_wire_lines,
+            &mut update_bounds,
+        );
+    }
+
+    for node in &scn.nodes {
+        let marker_pos = to_view_space(node.translation);
+        update_bounds(marker_pos);
+
+        if node.is_marker() {
+            append_scene_marker_lines(&mut marker_lines, marker_pos, 75.0);
+            continue;
+        }
+
+        let archetype_key = node.archetype.trim().to_ascii_lowercase();
+        let Some(model) = geo_by_archetype.get(&archetype_key) else {
+            continue;
+        };
+
+        let geo = &model.geo;
+        let model_is_helper = is_shadow_like_name(&archetype_key);
+
+        let base_vertex = vertices.len() as u32;
+        let mut instance_positions = Vec::with_capacity(geo.verts.len());
+
+        for (i, &pos) in geo.verts.iter().enumerate() {
+            let world_pos = apply_transform_point(&node.transform, pos);
+            let view_pos = to_view_space(world_pos);
+
+            let raw_normal = geo.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
+            let world_normal = apply_transform_direction(&node.transform, raw_normal);
+            let view_normal = normalize3(to_view_space(world_normal));
+
+            let uv = geo.uvs.get(i).copied().unwrap_or([0.0, 0.0]);
+
+            vertices.push(MeshVertex {
+                position: view_pos,
+                normal: view_normal,
+                uv,
+            });
+
+            instance_positions.push(view_pos);
+            update_bounds(view_pos);
+        }
+
+        if geo.subsets.is_empty() {
+            let part_class = if model_is_helper
+                || geo.texture_names.iter().any(|name| is_shadow_like_name(name))
+            {
+                PartClass::Helper
+            } else {
+                PartClass::Solid
+            };
+
+            let line_color = if matches!(part_class, PartClass::Helper) {
+                [1.0, 0.55, 0.15, 1.0]
+            } else {
+                [120.0 / 255.0, 220.0 / 255.0, 1.0, 1.0]
+            };
+
+            let line_target = if matches!(part_class, PartClass::Helper) {
+                &mut helper_wire_lines
+            } else {
+                &mut wire_lines
+            };
+
+            let mut part_indices = Vec::with_capacity(geo.faces.len() * 3);
+
+            for face in &geo.faces {
+                part_indices.push(base_vertex + face[0] as u32);
+                part_indices.push(base_vertex + face[1] as u32);
+                part_indices.push(base_vertex + face[2] as u32);
+
+                let ia = face[0] as usize;
+                let ib = face[1] as usize;
+                let ic = face[2] as usize;
+
+                let Some(&a) = instance_positions.get(ia) else { continue; };
+                let Some(&b) = instance_positions.get(ib) else { continue; };
+                let Some(&c) = instance_positions.get(ic) else { continue; };
+
+                line_target.push(LineVertex { position: a, color: line_color });
+                line_target.push(LineVertex { position: b, color: line_color });
+                line_target.push(LineVertex { position: b, color: line_color });
+                line_target.push(LineVertex { position: c, color: line_color });
+                line_target.push(LineVertex { position: c, color: line_color });
+                line_target.push(LineVertex { position: a, color: line_color });
+            }
+
+            parts.push(CpuPart {
+                indices: part_indices,
+                texture: None,
+                class: part_class,
+            });
+        } else {
+            for subset in &geo.subsets {
+                let texture_name = geo
+                    .texture_names
+                    .get(subset.material)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+
+                let part_class = if model_is_helper || is_shadow_like_name(texture_name) {
+                    PartClass::Helper
+                } else {
+                    PartClass::Solid
+                };
+
+                let line_color = if matches!(part_class, PartClass::Helper) {
+                    [1.0, 0.55, 0.15, 1.0]
+                } else {
+                    [120.0 / 255.0, 220.0 / 255.0, 1.0, 1.0]
+                };
+
+                let line_target = if matches!(part_class, PartClass::Helper) {
+                    &mut helper_wire_lines
+                } else {
+                    &mut wire_lines
+                };
+
+                let start = (subset.start / 3) as usize;
+                let count = (subset.count / 3) as usize;
+                let end = (start + count).min(geo.faces.len());
+
+                let mut part_indices = Vec::with_capacity((end - start) * 3);
+
+                for face in &geo.faces[start..end] {
+                    part_indices.push(base_vertex + face[0] as u32);
+                    part_indices.push(base_vertex + face[1] as u32);
+                    part_indices.push(base_vertex + face[2] as u32);
+
+                    let ia = face[0] as usize;
+                    let ib = face[1] as usize;
+                    let ic = face[2] as usize;
+
+                    let Some(&a) = instance_positions.get(ia) else { continue; };
+                    let Some(&b) = instance_positions.get(ib) else { continue; };
+                    let Some(&c) = instance_positions.get(ic) else { continue; };
+
+                    line_target.push(LineVertex { position: a, color: line_color });
+                    line_target.push(LineVertex { position: b, color: line_color });
+                    line_target.push(LineVertex { position: b, color: line_color });
+                    line_target.push(LineVertex { position: c, color: line_color });
+                    line_target.push(LineVertex { position: c, color: line_color });
+                    line_target.push(LineVertex { position: a, color: line_color });
+                }
+
+                let texture = model
+                    .textures
+                    .get(subset.material)
+                    .and_then(|t| t.as_ref())
+                    .map(cpu_texture_from_dds);
+
+                parts.push(CpuPart {
+                    indices: part_indices,
+                    texture,
+                    class: part_class,
+                });
+            }
+        }
+    }
+
+    if !have_bounds {
+        min = [-1.0, -1.0, -1.0];
+        max = [1.0, 1.0, 1.0];
+    }
+
+    let center = [
+        (min[0] + max[0]) * 0.5,
+        (min[1] + max[1]) * 0.5,
+        (min[2] + max[2]) * 0.5,
+    ];
+
+    let mut radius: f32 = 1.0;
+    for v in &vertices {
+        radius = radius.max(length3(sub3(v.position, center)));
+    }
+    for chunk in marker_lines.chunks(2) {
+        for line in chunk {
+            radius = radius.max(length3(sub3(line.position, center)));
+        }
+    }
+    radius = radius.max(100.0);
+
+    let ground_y = min[1] - 0.02;
+    let ground_lines = build_ground_lines_for_bounds(center, radius, ground_y);
+
+    Arc::new(CpuScene {
+        key,
+        vertices,
+        parts,
+        ground_lines,
+        wire_lines,
+        helper_wire_lines,
+        bone_lines: marker_lines,
+        center,
+        radius,
+    })
+}
+
+fn append_scn_chunk_mesh<F: FnMut([f32; 3])>(
+    chunk: &ScnMeshChunk,
+    embedded_textures: &HashMap<String, DdsPreview>,
+    vertices: &mut Vec<MeshVertex>,
+    parts: &mut Vec<CpuPart>,
+    wire_lines: &mut Vec<LineVertex>,
+    helper_wire_lines: &mut Vec<LineVertex>,
+    update_bounds: &mut F,
+) {
+    let part_class = if chunk
+        .texture_name
+        .as_deref()
+        .map(is_shadow_like_name)
+        .unwrap_or(false)
+    {
+        PartClass::Helper
+    } else {
+        PartClass::Solid
+    };
+
+    let line_color = if matches!(part_class, PartClass::Helper) {
+        [1.0, 0.55, 0.15, 1.0]
+    } else {
+        [185.0 / 255.0, 185.0 / 255.0, 195.0 / 255.0, 1.0]
+    };
+
+    let line_target = if matches!(part_class, PartClass::Helper) {
+        helper_wire_lines
+    } else {
+        wire_lines
+    };
+
+    let base_vertex = vertices.len() as u32;
+    let mut chunk_positions = Vec::with_capacity(chunk.vertices.len());
+
+    for vertex in &chunk.vertices {
+        let world_pos = if let Some(transform) = &chunk.transform {
+            apply_transform_point(transform, vertex.position)
+        } else {
+            vertex.position
+        };
+
+        let world_normal = if let Some(transform) = &chunk.transform {
+            apply_transform_direction(transform, vertex.normal)
+        } else {
+            vertex.normal
+        };
+
+        let view_pos = to_view_space(world_pos);
+        let view_normal = normalize3(to_view_space(world_normal));
+
+        vertices.push(MeshVertex {
+            position: view_pos,
+            normal: view_normal,
+            uv: vertex.uv,
+        });
+
+        chunk_positions.push(view_pos);
+        update_bounds(view_pos);
+    }
+
+    let mut part_indices = Vec::with_capacity(chunk.indices.len());
+
+    for tri in chunk.indices.chunks_exact(3) {
+        let ia = tri[0] as usize;
+        let ib = tri[1] as usize;
+        let ic = tri[2] as usize;
+
+        part_indices.push(base_vertex + tri[0]);
+        part_indices.push(base_vertex + tri[1]);
+        part_indices.push(base_vertex + tri[2]);
+
+        let Some(&a) = chunk_positions.get(ia) else { continue; };
+        let Some(&b) = chunk_positions.get(ib) else { continue; };
+        let Some(&c) = chunk_positions.get(ic) else { continue; };
+
+        line_target.push(LineVertex { position: a, color: line_color });
+        line_target.push(LineVertex { position: b, color: line_color });
+        line_target.push(LineVertex { position: b, color: line_color });
+        line_target.push(LineVertex { position: c, color: line_color });
+        line_target.push(LineVertex { position: c, color: line_color });
+        line_target.push(LineVertex { position: a, color: line_color });
+    }
+
+    if !part_indices.is_empty() {
+        let texture = chunk
+            .texture_name
+            .as_ref()
+            .and_then(|name| embedded_textures.get(&name.to_ascii_lowercase()))
+            .map(cpu_texture_from_dds);
+
+        parts.push(CpuPart {
+            indices: part_indices,
+            texture,
+            class: part_class,
+        });
+    }
+}
+
+fn scn_bounds(scn: &ScnFile) -> ([f32; 3], f32) {
+    let mut have_bounds = false;
+    let mut min = [0.0f32; 3];
+    let mut max = [0.0f32; 3];
+
+    let mut include = |p: [f32; 3]| {
+        if !have_bounds {
+            min = p;
+            max = p;
+            have_bounds = true;
+        } else {
+            min[0] = min[0].min(p[0]);
+            min[1] = min[1].min(p[1]);
+            min[2] = min[2].min(p[2]);
+            max[0] = max[0].max(p[0]);
+            max[1] = max[1].max(p[1]);
+            max[2] = max[2].max(p[2]);
+        }
+    };
+
+    for node in &scn.nodes {
+        include(to_view_space(node.translation));
+    }
+
+    for chunk in &scn.mesh_chunks {
+        for vertex in &chunk.vertices {
+            let world_pos = if let Some(transform) = &chunk.transform {
+                apply_transform_point(transform, vertex.position)
+            } else {
+                vertex.position
+            };
+
+            include(to_view_space(world_pos));
+        }
+    }
+
+    if !have_bounds {
+        return ([0.0, 0.0, 0.0], 100.0);
+    }
+
+    let center = [
+        (min[0] + max[0]) * 0.5,
+        (min[1] + max[1]) * 0.5,
+        (min[2] + max[2]) * 0.5,
+    ];
+
+    let mut radius: f32 = 1.0;
+
+    for node in &scn.nodes {
+        let p = to_view_space(node.translation);
+        radius = radius.max(length3(sub3(p, center)));
+    }
+
+    for chunk in &scn.mesh_chunks {
+        for vertex in &chunk.vertices {
+            let world_pos = if let Some(transform) = &chunk.transform {
+                apply_transform_point(transform, vertex.position)
+            } else {
+                vertex.position
+            };
+
+            let p = to_view_space(world_pos);
+            radius = radius.max(length3(sub3(p, center)));
+        }
+    }
+
+    (center, radius.max(100.0))
+}
+
+fn append_scene_marker_lines(out: &mut Vec<LineVertex>, pos: [f32; 3], half: f32) {
+    let color = [1.0, 0.92, 0.35, 1.0];
+
+    out.push(LineVertex {
+        position: [pos[0] - half, pos[1], pos[2]],
+        color,
+    });
+    out.push(LineVertex {
+        position: [pos[0] + half, pos[1], pos[2]],
+        color,
+    });
+
+    out.push(LineVertex {
+        position: [pos[0], pos[1] - half, pos[2]],
+        color,
+    });
+    out.push(LineVertex {
+        position: [pos[0], pos[1] + half, pos[2]],
+        color,
+    });
+
+    out.push(LineVertex {
+        position: [pos[0], pos[1], pos[2] - half],
+        color,
+    });
+    out.push(LineVertex {
+        position: [pos[0], pos[1], pos[2] + half],
+        color,
+    });
+}
+
+fn build_ground_lines_for_bounds(center: [f32; 3], radius: f32, ground_y: f32) -> Vec<LineVertex> {
+    let mut out = Vec::new();
+
+    let half = (radius * 1.5).max(500.0);
+    let step = (half / 16.0).max(50.0);
+
+    let center_x = center[0];
+    let center_z = center[2];
+
+    let major = [0.42, 0.42, 0.42, 0.95];
+    let minor = [0.26, 0.26, 0.26, 0.75];
+
+    let mut x = -half;
+    while x <= half + 0.5 * step {
+        let color = if x.abs() < step * 0.5 { major } else { minor };
+
+        let a = [center_x + x, ground_y, center_z - half];
+        let b = [center_x + x, ground_y, center_z + half];
+
+        out.push(LineVertex { position: a, color });
+        out.push(LineVertex { position: b, color });
+
+        x += step;
+    }
+
+    let mut z = -half;
+    while z <= half + 0.5 * step {
+        let color = if z.abs() < step * 0.5 { major } else { minor };
+
+        let a = [center_x - half, ground_y, center_z + z];
+        let b = [center_x + half, ground_y, center_z + z];
+
+        out.push(LineVertex { position: a, color });
+        out.push(LineVertex { position: b, color });
+
+        z += step;
+    }
+
+    out
+}
+
+fn apply_transform_point(m: &[f32; 16], p: [f32; 3]) -> [f32; 3] {
+    [
+        m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12],
+        m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13],
+        m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14],
+    ]
+}
+
+fn apply_transform_direction(m: &[f32; 16], v: [f32; 3]) -> [f32; 3] {
+    [
+        m[0] * v[0] + m[4] * v[1] + m[8] * v[2],
+        m[1] * v[0] + m[5] * v[1] + m[9] * v[2],
+        m[2] * v[0] + m[6] * v[1] + m[10] * v[2],
+    ]
 }
 
 fn build_wire_lines(geo: &GeoFile) -> Vec<LineVertex> {
@@ -1237,6 +1921,14 @@ fn normalize3(v: [f32; 3]) -> [f32; 3] {
     } else {
         scale3(v, 1.0 / len)
     }
+}
+
+fn is_shadow_like_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+
+    n.contains("shadow")
+        || n.contains("blob")
+        || n.contains("decal")
 }
 
 const FACE_SHADER: &str = r#"

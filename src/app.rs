@@ -1,11 +1,17 @@
 use crate::{
     audio_player::AudioPlayer,
-    bik_preview::{extract_bik_audio_wav, load_bik_preview, spawn_bik_decoder, BikPreview, BikWorkerEvent},
+    bik_preview::{
+        extract_bik_audio_wav, load_bik_preview, spawn_bik_decoder, BikPreview, BikWorkerEvent,
+    },
     bnk::{format_name, load_bnk, BnkFile},
     dds_preview::{load_dds_preview, DdsPreview},
     fs_tree::{category_name, classify_path, scan_game_data, AssetCategory, FileNode, NodeKind},
     geo::{load_geo, GeoFile},
-    geo_viewer::{draw_geo_viewer, reset_geo_viewer, GeoViewerState},
+    geo_viewer::{
+        draw_geo_viewer, draw_scene_viewer, reset_geo_viewer, reset_scene_viewer, GeoViewerState,
+        SceneGeoModel,
+    },
+    scn::{load_scn, ScnFile},
 };
 use eframe::egui;
 use std::{
@@ -50,6 +56,18 @@ pub struct ModToolApp {
     geo_file: Option<GeoFile>,
     geo_loaded_path: Option<PathBuf>,
     geo_error: Option<String>,
+
+    scn_file: Option<ScnFile>,
+    scn_loaded_path: Option<PathBuf>,
+    scn_error: Option<String>,
+
+    scn_scene_models: Vec<SceneGeoModel>,
+    scn_scene_models_path: Option<PathBuf>,
+    scn_scene_unresolved: Vec<String>,
+    scn_scene_error: Option<String>,
+    scn_viewer: GeoViewerState,
+    scn_view_height: f32,
+    scn_embedded_texture_previews: std::collections::HashMap<String, DdsPreview>,
 
     geo_material_previews: Vec<Option<DdsPreview>>,
     geo_materials_loaded_path: Option<PathBuf>,
@@ -110,6 +128,10 @@ impl ModToolApp {
             geo_loaded_path: None,
             geo_error: None,
 
+            scn_file: None,
+            scn_loaded_path: None,
+            scn_error: None,
+
             geo_material_previews: Vec::new(),
             geo_materials_loaded_path: None,
             geo_material_error: None,
@@ -119,6 +141,14 @@ impl ModToolApp {
             geo_viewer: GeoViewerState::default(),
             geo_viewer_path: None,
             geo_view_height: 520.0,
+
+            scn_scene_models: Vec::new(),
+            scn_scene_models_path: None,
+            scn_scene_unresolved: Vec::new(),
+            scn_scene_error: None,
+            scn_viewer: GeoViewerState::default(),
+            scn_view_height: 520.0,
+            scn_embedded_texture_previews: std::collections::HashMap::new(),
 
             bik_preview: None,
             bik_preview_path: None,
@@ -167,6 +197,16 @@ impl ModToolApp {
                     self.geo_material_previews.clear();
                     self.geo_materials_loaded_path = None;
                     self.geo_material_error = None;
+                    self.scn_file = None;
+                    self.scn_loaded_path = None;
+                    self.scn_error = None;   
+                    self.scn_scene_models.clear();
+                    self.scn_scene_models_path = None;
+                    self.scn_scene_unresolved.clear();
+                    self.scn_scene_error = None;
+                    self.scn_viewer = GeoViewerState::default();
+                    self.scn_view_height = 520.0;  
+                    self.scn_embedded_texture_previews.clear();               
                     self.reset_bik_state();
                     self.status = "Loaded Data folder.".to_owned();
                 }
@@ -208,6 +248,18 @@ impl ModToolApp {
                     self.geo_materials_loaded_path = None;
                     self.geo_material_error = None;
 
+                    self.scn_file = None;
+                    self.scn_loaded_path = None;
+                    self.scn_error = None;
+
+                    self.scn_scene_models.clear();
+                    self.scn_scene_models_path = None;
+                    self.scn_scene_unresolved.clear();
+                    self.scn_scene_error = None;
+                    self.scn_viewer = GeoViewerState::default();
+                    self.scn_view_height = 520.0;
+                    self.scn_embedded_texture_previews.clear();                    
+                    
                     self.reset_bik_state();
 
                     self.status = "Rescanned Data folder.".to_owned();
@@ -758,25 +810,228 @@ impl ModToolApp {
         }
     }
 
+    fn ensure_scn_loaded(&mut self) {
+        let Some(path) = self.selected_file.clone() else {
+            self.scn_file = None;
+            self.scn_loaded_path = None;
+            self.scn_error = None;
+            return;
+        };
+
+        if self.scn_loaded_path.as_ref() == Some(&path) {
+            return;
+        }
+
+        self.scn_file = None;
+        self.scn_error = None;
+        self.scn_loaded_path = Some(path.clone());
+
+        let is_scn = path
+            .extension()
+            .map(|ext| ext.to_string_lossy().eq_ignore_ascii_case("scn"))
+            .unwrap_or(false);
+
+        if !is_scn {
+            return;
+        }
+
+        match load_scn(&path) {
+            Ok(scn) => {
+                self.scn_file = Some(scn);
+            }
+            Err(err) => {
+                self.scn_error = Some(err.to_string());
+            }
+        }
+    }
+
+    fn reset_scn_scene_state(&mut self) {
+        self.scn_scene_models.clear();
+        self.scn_scene_models_path = None;
+        self.scn_scene_unresolved.clear();
+        self.scn_scene_error = None;
+        self.scn_viewer = GeoViewerState::default();
+        self.scn_view_height = 520.0;
+        self.scn_embedded_texture_previews.clear();
+    }
+
+    fn ensure_scn_scene_loaded(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.selected_file.clone() else {
+            self.reset_scn_scene_state();
+            return;
+        };
+
+        let is_scn = path
+            .extension()
+            .map(|ext| ext.to_string_lossy().eq_ignore_ascii_case("scn"))
+            .unwrap_or(false);
+
+        if !is_scn {
+            self.reset_scn_scene_state();
+            return;
+        }
+
+        if self.scn_scene_models_path.as_ref() == Some(&path) {
+            return;
+        }
+
+        self.reset_scn_scene_state();
+        self.scn_scene_models_path = Some(path);
+
+        let Some(scn) = self.scn_file.clone() else {
+            return;
+        };
+
+        let mut texture_nodes = Vec::new();
+        let mut model_nodes = Vec::new();
+
+        Self::collect_files_by_category(&self.tree, AssetCategory::Texture, &mut texture_nodes);
+        Self::collect_files_by_category(&self.tree, AssetCategory::Model, &mut model_nodes);
+
+        let mut textures_by_name = std::collections::HashMap::<String, PathBuf>::new();
+        for node in texture_nodes {
+            if let Some(name) = node.path.file_name().and_then(|s| s.to_str()) {
+                textures_by_name
+                    .entry(name.to_ascii_lowercase())
+                    .or_insert_with(|| node.path.clone());
+            }
+        }
+
+        let mut geo_by_stem = std::collections::HashMap::<String, PathBuf>::new();
+        for node in model_nodes {
+            if let Some(stem) = node.path.file_stem().and_then(|s| s.to_str()) {
+                geo_by_stem
+                    .entry(stem.to_ascii_lowercase())
+                    .or_insert_with(|| node.path.clone());
+            }
+        }
+
+        let mut archetypes = std::collections::BTreeSet::<String>::new();
+        for node in &scn.nodes {
+            let archetype = node.archetype.trim();
+            if !archetype.is_empty() {
+                archetypes.insert(archetype.to_ascii_lowercase());
+            }
+        }
+
+        let mut loaded = Vec::new();
+        let mut unresolved = Vec::new();
+        let mut failed = Vec::new();
+
+        for archetype in archetypes {
+            match geo_by_stem.get(&archetype) {
+                Some(model_path) => match load_geo(model_path) {
+                    Ok(geo) => {
+                        let mut textures = Vec::new();
+
+                        for texture_name in &geo.texture_names {
+                            let resolved = Self::guess_geo_texture_path(model_path, texture_name)
+                                .or_else(|| {
+                                    textures_by_name
+                                        .get(&texture_name.to_ascii_lowercase())
+                                        .cloned()
+                                });
+
+                            let preview = match resolved {
+                                Some(tex_path) => match load_dds_preview(ctx, &tex_path) {
+                                    Ok(preview) => Some(preview),
+                                    Err(err) => {
+                                        failed.push(format!(
+                                            "{archetype} texture {}: {}",
+                                            tex_path.display(),
+                                            err
+                                        ));
+                                        None
+                                    }
+                                },
+                                None => None,
+                            };
+
+                            textures.push(preview);
+                        }
+
+                        loaded.push(SceneGeoModel {
+                            archetype: archetype.clone(),
+                            path: model_path.clone(),
+                            geo,
+                            textures,
+                        });
+                    }
+                    Err(err) => {
+                        failed.push(format!("{archetype}: {err}"));
+                    }
+                },
+                None => unresolved.push(archetype),
+            }
+        }
+
+        let mut embedded_texture_previews = std::collections::HashMap::new();
+
+        for chunk in &scn.mesh_chunks {
+            let Some(name) = chunk.texture_name.as_ref() else {
+                continue;
+            };
+
+            let key = name.to_ascii_lowercase();
+            if embedded_texture_previews.contains_key(&key) {
+                continue;
+            }
+
+            let Some(tex_path) = textures_by_name.get(&key).cloned() else {
+                continue;
+            };
+
+            match load_dds_preview(ctx, &tex_path) {
+                Ok(preview) => {
+                    embedded_texture_previews.insert(key, preview);
+                }
+                Err(err) => {
+                    failed.push(format!(
+                        "SCN texture {}: {}",
+                        tex_path.display(),
+                        err
+                    ));
+                }
+            }
+        }
+
+        self.scn_embedded_texture_previews = embedded_texture_previews;
+
+        loaded.sort_by_key(|m| m.archetype.clone());
+
+        self.scn_scene_models = loaded;
+        self.scn_scene_unresolved = unresolved;
+
+        if !failed.is_empty() {
+            self.scn_scene_error = Some(format!(
+                "Failed to load {} GEO files: {}",
+                failed.len(),
+                failed.join(" | ")
+            ));
+        }
+
+        reset_scene_viewer(&mut self.scn_viewer, &scn);
+    }    
+
     fn find_file_case_insensitive(folder: &Path, filename: &str) -> Option<PathBuf> {
         let direct = folder.join(filename);
         if direct.exists() {
             return Some(direct);
         }
 
-    let target = filename.to_ascii_lowercase();
-    let entries = std::fs::read_dir(folder).ok()?;
+        let target = filename.to_ascii_lowercase();
+        let entries = std::fs::read_dir(folder).ok()?;
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = path.file_name()?.to_string_lossy().to_string();
-        if name.to_ascii_lowercase() == target {
-            return Some(path);
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name()?.to_string_lossy().to_string();
+            if name.to_ascii_lowercase() == target {
+                return Some(path);
+            }
         }
-    }
 
-    None
-}
+        None
+    }
 
     fn guess_geo_texture_path(geo_path: &Path, texture_name: &str) -> Option<PathBuf> {
         let folder = geo_path.parent()?;
@@ -1198,6 +1453,8 @@ impl eframe::App for ModToolApp {
         self.poll_bik_decoder(ui.ctx());
         self.update_bik_playback_clock(ui.ctx());
         self.ensure_geo_loaded();
+        self.ensure_scn_loaded();
+        self.ensure_scn_scene_loaded(ui.ctx());
         self.ensure_geo_materials_loaded(ui.ctx());
 
         let mut pending_jump: Option<PathBuf> = None;
@@ -1353,6 +1610,53 @@ impl eframe::App for ModToolApp {
                         }
                     }
 
+                    if ext == "scn" {
+                        if let Some(scn) = &self.scn_file {
+                            ui.label(format!("Nodes: {}", scn.nodes.len()));
+                            ui.label(format!("Renderable nodes: {}", scn.renderable_count()));
+                            ui.label(format!("Marker nodes: {}", scn.marker_count()));
+                            ui.label(format!(
+                                "Secondary transforms: {}",
+                                scn.secondary_transforms.len()
+                            ));
+                            ui.label(format!("Remap pairs: {}", scn.remap_pairs.len()));
+
+                            ui.separator();
+                            ui.label(format!(
+                                "record_table_off: 0x{:08X}",
+                                scn.header.record_table_offset
+                            ));
+                            ui.label(format!("node_count: {}", scn.header.node_count));
+                            ui.label(format!(
+                                "names_off: 0x{:08X}",
+                                scn.header.names_offset
+                            ));
+                            ui.label(format!(
+                                "xforms_off: 0x{:08X}",
+                                scn.header.transforms_offset
+                            ));
+                            ui.label(format!(
+                                "archetypes_off: 0x{:08X}",
+                                scn.header.archetypes_offset
+                            ));
+                            ui.label(format!(
+                                "flags_off: 0x{:08X}",
+                                scn.header.flags_offset
+                            ));
+                            ui.label(format!(
+                                "secondary_xforms_off: 0x{:08X}",
+                                scn.header.secondary_transform_offset
+                            ));
+                        }
+
+                        if let Some(err) = &self.scn_error {
+                            ui.colored_label(
+                                egui::Color32::RED,
+                                format!("SCN read error: {}", err),
+                            );
+                        }
+                    }                    
+
                     if ext == "geo" {
                         if let Some(geo) = &self.geo_file {
                             ui.label(format!("Vertices: {}", geo.vertex_count));
@@ -1434,6 +1738,9 @@ impl eframe::App for ModToolApp {
                         }
                         "bik" => {
                             ui.label("BIK player loaded.");
+                        }
+                        "scn" => {
+                            ui.label("SCN inspector loaded.");
                         }
                         _ => {
                             ui.label("No viewer yet. Raw/hex viewer later.");
@@ -1814,6 +2121,162 @@ impl eframe::App for ModToolApp {
                             ui.label("BNK selected, but no bank info is loaded.");
                         }
                     }
+                     
+                    Some("scn") => {
+                        if let Some(scn) = &self.scn_file {
+                            draw_scene_viewer(
+                                ui,
+                                scn,
+                                &self.scn_scene_models,
+                                &self.scn_embedded_texture_previews,
+                                &mut self.scn_viewer,
+                                self.scn_view_height,
+                            );
+                            let (resize_rect, resize_response) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 12.0),
+                                egui::Sense::drag(),
+                            );
+
+                            let resize_response =
+                                resize_response.on_hover_cursor(egui::CursorIcon::ResizeVertical);
+
+                            ui.painter().hline(
+                                resize_rect.x_range(),
+                                resize_rect.center().y,
+                                egui::Stroke::new(1.5, egui::Color32::GRAY),
+                            );
+
+                            if resize_response.dragged() {
+                                let delta = ui.ctx().input(|i| i.pointer.delta()).y;
+                                self.scn_view_height =
+                                    (self.scn_view_height + delta).clamp(260.0, 900.0);
+                                ui.ctx().request_repaint();
+                            }
+
+                            ui.separator();
+
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(format!("Nodes: {}", scn.nodes.len()));
+                                ui.separator();
+                                ui.label(format!("Renderable: {}", scn.renderable_count()));
+                                ui.separator();
+                                ui.label(format!("Markers: {}", scn.marker_count()));
+                                ui.separator();
+                                ui.label(format!(
+                                    "Embedded chunks: {}",
+                                    scn.embedded_mesh_chunk_count()
+                                ));
+                                ui.separator();
+                                ui.label(format!(
+                                    "Embedded tris: {}",
+                                    scn.embedded_triangle_count()
+                                ));
+                                ui.separator();
+                                ui.label(format!("Resolved GEOs: {}", self.scn_scene_models.len()));
+                                ui.separator();
+                                ui.label(format!(
+                                    "Missing archetypes: {}",
+                                    self.scn_scene_unresolved.len()
+                                ));
+                            });
+
+                            ui.small(
+                                "This 3D view now draws embedded SCN static mesh plus any placed GEO props resolved from archetype names.",
+                            );
+
+                            if let Some(err) = &self.scn_scene_error {
+                                ui.colored_label(
+                                    egui::Color32::RED,
+                                    format!("SCN scene load error: {}", err),
+                                );
+                            }
+
+                            if !self.scn_scene_unresolved.is_empty() {
+                                egui::CollapsingHeader::new("Missing archetypes")
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        for name in &self.scn_scene_unresolved {
+                                            ui.monospace(name);
+                                        }
+                                    });
+                            }
+
+                            ui.separator();
+
+                            egui::CollapsingHeader::new("Scene nodes")
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    egui::ScrollArea::vertical().show(ui, |ui| {
+                                        for node in &scn.nodes {
+                                            ui.monospace(format!(
+                                                "#{:04}  {:<22}  {:<12}  pos=({:>9.2}, {:>9.2}, {:>9.2})  rec=0x{:08X}  flag=0x{:04X}",
+                                                node.index,
+                                                node.name,
+                                                node.archetype_label(),
+                                                node.translation[0],
+                                                node.translation[1],
+                                                node.translation[2],
+                                                node.record_offset,
+                                                node.flags,
+                                            ));
+                                        }
+                                    });
+                                });
+
+                            ui.separator();
+
+                            ui.columns(2, |columns| {
+                                let (left_cols, right_cols) = columns.split_at_mut(1);
+                                let left = &mut left_cols[0];
+                                let right = &mut right_cols[0];
+
+                                left.heading("Top archetypes");
+                                left.separator();
+
+                                for (name, count) in scn.top_archetypes(16) {
+                                    left.label(format!("{name}: {count}"));
+                                }
+
+                                right.heading("Header");
+                                right.separator();
+                                right.monospace(format!("version: {}", scn.header.version));
+                                right.monospace(format!("unk_04: {}", scn.header.unk_04));
+                                right.monospace(format!("remap_count: {}", scn.header.remap_count));
+                                right.monospace(format!(
+                                    "record_table_off: 0x{:08X}",
+                                    scn.header.record_table_offset
+                                ));
+                                right.monospace(format!("node_count: {}", scn.header.node_count));
+                                right.monospace(format!(
+                                    "names_off: 0x{:08X}",
+                                    scn.header.names_offset
+                                ));
+                                right.monospace(format!(
+                                    "xforms_off: 0x{:08X}",
+                                    scn.header.transforms_offset
+                                ));
+                                right.monospace(format!(
+                                    "archetypes_off: 0x{:08X}",
+                                    scn.header.archetypes_offset
+                                ));
+                                right.monospace(format!(
+                                    "flags_off: 0x{:08X}",
+                                    scn.header.flags_offset
+                                ));
+                                right.monospace(format!(
+                                    "secondary_xforms_off: 0x{:08X}",
+                                    scn.header.secondary_transform_offset
+                                ));
+                            });
+                        } else if let Some(err) = &self.scn_error {
+                            ui.colored_label(
+                                egui::Color32::RED,
+                                format!("Could not read SCN: {}", err),
+                            );
+                        } else {
+                            ui.label("SCN selected, but no scene info is loaded.");
+                        }
+                    }                
 
                     Some("geo") => {
                         if let Some(geo) = &self.geo_file {

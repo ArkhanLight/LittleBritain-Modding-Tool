@@ -6,6 +6,7 @@ mod dds_preview;
 mod fs_tree;
 mod geo;
 mod geo_viewer;
+mod scn;
 
 fn main() {
     let options = eframe::NativeOptions {
