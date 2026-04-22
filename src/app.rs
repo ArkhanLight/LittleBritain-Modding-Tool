@@ -8,8 +8,8 @@ use crate::{
     fs_tree::{category_name, classify_path, scan_game_data, AssetCategory, FileNode, NodeKind},
     geo::{load_geo, GeoFile},
     geo_viewer::{
-        draw_geo_viewer, draw_scene_viewer, reset_geo_viewer, reset_scene_viewer, GeoViewerState,
-        SceneGeoModel,
+        draw_geo_viewer, draw_scene_viewer, focus_scene_viewer_on_point, reset_geo_viewer,
+        reset_scene_viewer, GeoViewerState, SceneGeoModel,
     },
     scn::{load_scn, ScnFile},
 };
@@ -65,6 +65,7 @@ pub struct ModToolApp {
     scn_scene_models_path: Option<PathBuf>,
     scn_scene_unresolved: Vec<String>,
     scn_scene_error: Option<String>,
+    selected_scn_node: Option<usize>,
     scn_viewer: GeoViewerState,
     scn_view_height: f32,
     scn_embedded_texture_previews: std::collections::HashMap<String, DdsPreview>,
@@ -146,6 +147,7 @@ impl ModToolApp {
             scn_scene_models_path: None,
             scn_scene_unresolved: Vec::new(),
             scn_scene_error: None,
+            selected_scn_node: None,
             scn_viewer: GeoViewerState::default(),
             scn_view_height: 520.0,
             scn_embedded_texture_previews: std::collections::HashMap::new(),
@@ -204,6 +206,7 @@ impl ModToolApp {
                     self.scn_scene_models_path = None;
                     self.scn_scene_unresolved.clear();
                     self.scn_scene_error = None;
+                    self.selected_scn_node = None;
                     self.scn_viewer = GeoViewerState::default();
                     self.scn_view_height = 520.0;  
                     self.scn_embedded_texture_previews.clear();               
@@ -349,7 +352,7 @@ impl ModToolApp {
                         Self::ui_category_group(ui, "Audio", &audio, selected_file);
                         Self::ui_category_group(ui, "Audio Banks", &audio_banks, selected_file);
                         Self::ui_category_group(ui, "Lighting", &lighting, selected_file);
-                        Self::ui_category_group(ui, "Scenes", &scenes, selected_file);
+                        Self::ui_category_group(ui, "Levels", &scenes, selected_file);
                         Self::ui_category_group(ui, "Logs", &logs, selected_file);
                         Self::ui_category_group(ui, "Videos", &videos, selected_file);
                         Self::ui_category_group(ui, "Other", &other, selected_file);
@@ -815,6 +818,7 @@ impl ModToolApp {
             self.scn_file = None;
             self.scn_loaded_path = None;
             self.scn_error = None;
+            self.selected_scn_node = None;
             return;
         };
 
@@ -832,9 +836,12 @@ impl ModToolApp {
             .unwrap_or(false);
 
         if !is_scn {
+            self.selected_scn_node = None;
             return;
         }
-
+        
+        self.selected_scn_node = None;
+        
         match load_scn(&path) {
             Ok(scn) => {
                 self.scn_file = Some(scn);
@@ -968,29 +975,27 @@ impl ModToolApp {
         let mut embedded_texture_previews = std::collections::HashMap::new();
 
         for chunk in &scn.mesh_chunks {
-            let Some(name) = chunk.texture_name.as_ref() else {
-                continue;
-            };
-
-            let key = name.to_ascii_lowercase();
-            if embedded_texture_previews.contains_key(&key) {
-                continue;
-            }
-
-            let Some(tex_path) = textures_by_name.get(&key).cloned() else {
-                continue;
-            };
-
-            match load_dds_preview(ctx, &tex_path) {
-                Ok(preview) => {
-                    embedded_texture_previews.insert(key, preview);
+            for name in &chunk.texture_names {
+                let key = name.to_ascii_lowercase();
+                if embedded_texture_previews.contains_key(&key) {
+                    continue;
                 }
-                Err(err) => {
-                    failed.push(format!(
-                        "SCN texture {}: {}",
-                        tex_path.display(),
-                        err
-                    ));
+
+                let Some(tex_path) = textures_by_name.get(&key).cloned() else {
+                    continue;
+                };
+
+                match load_dds_preview(ctx, &tex_path) {
+                    Ok(preview) => {
+                        embedded_texture_previews.insert(key, preview);
+                    }
+                    Err(err) => {
+                        failed.push(format!(
+                            "SCN texture {}: {}",
+                            tex_path.display(),
+                            err
+                        ));
+                    }
                 }
             }
         }
@@ -1361,6 +1366,24 @@ impl ModToolApp {
         }
     }
 
+    fn scn_node_group_name(name: &str) -> String {
+        let trimmed = name.trim();
+
+        if trimmed.is_empty() {
+            return "(unnamed)".to_owned();
+        }
+
+        let without_digits = trimmed.trim_end_matches(|c: char| c.is_ascii_digit());
+        let without_separators =
+            without_digits.trim_end_matches(|c: char| c == '_' || c == '-' || c == ' ');
+
+        if without_separators.is_empty() {
+            trimmed.to_owned()
+        } else {
+            without_separators.to_owned()
+        }
+    }    
+
     fn build_asset_links(&self) -> AssetLinks {
         let mut links = AssetLinks::default();
 
@@ -1616,12 +1639,42 @@ impl eframe::App for ModToolApp {
                             ui.label(format!("Renderable nodes: {}", scn.renderable_count()));
                             ui.label(format!("Marker nodes: {}", scn.marker_count()));
                             ui.label(format!(
+                                "Embedded chunks: {}",
+                                scn.embedded_mesh_chunk_count()
+                            ));
+                            ui.label(format!(
+                                "Embedded tris: {}",
+                                scn.embedded_triangle_count()
+                            ));
+
+                            ui.label(format!(
+                                "Embedded textures: {}",
+                                scn.embedded_texture_name_count()
+                            ));
+
+                            ui.label(format!(
+                                "Texture spans: {}",
+                                scn.texture_span_count()
+                            ));
+                            
+                            ui.label(format!(
                                 "Secondary transforms: {}",
                                 scn.secondary_transforms.len()
                             ));
                             ui.label(format!("Remap pairs: {}", scn.remap_pairs.len()));
+                            ui.label(format!("Resolved GEOs: {}", self.scn_scene_models.len()));
+                            ui.label(format!(
+                                "Missing archetypes: {}",
+                                self.scn_scene_unresolved.len()
+                            ));
 
                             ui.separator();
+                            ui.heading("Header");
+                            ui.separator();
+
+                            ui.label(format!("version: {}", scn.header.version));
+                            ui.label(format!("unk_04: {}", scn.header.unk_04));
+                            ui.label(format!("remap_count: {}", scn.header.remap_count));
                             ui.label(format!(
                                 "record_table_off: 0x{:08X}",
                                 scn.header.record_table_offset
@@ -1647,6 +1700,22 @@ impl eframe::App for ModToolApp {
                                 "secondary_xforms_off: 0x{:08X}",
                                 scn.header.secondary_transform_offset
                             ));
+
+                            ui.separator();
+                            ui.heading("Span modes");
+                            ui.separator();
+
+                            for (mode, count) in scn.texture_span_mode_counts() {
+                                ui.label(format!("mode {}: {}", mode, count));
+                            }
+
+                            ui.separator();
+                            ui.heading("Top archetypes");
+                            ui.separator();
+
+                            for (name, count) in scn.top_archetypes(24) {
+                                ui.label(format!("{name}: {count}"));
+                            }
                         }
 
                         if let Some(err) = &self.scn_error {
@@ -1655,7 +1724,7 @@ impl eframe::App for ModToolApp {
                                 format!("SCN read error: {}", err),
                             );
                         }
-                    }                    
+                    }                  
 
                     if ext == "geo" {
                         if let Some(geo) = &self.geo_file {
@@ -2203,71 +2272,75 @@ impl eframe::App for ModToolApp {
 
                             ui.separator();
 
+                            let mut grouped_scene_nodes: std::collections::BTreeMap<
+                                String,
+                                Vec<(usize, String, String, [f32; 3], u32, u16)>,
+                            > = std::collections::BTreeMap::new();
+
+                            for node in &scn.nodes {
+                                let group_name = Self::scn_node_group_name(&node.name);
+
+                                grouped_scene_nodes
+                                    .entry(group_name)
+                                    .or_default()
+                                    .push((
+                                        node.index,
+                                        node.name.clone(),
+                                        node.archetype_label().to_owned(),
+                                        node.translation,
+                                        node.record_offset,
+                                        node.flags,
+                                    ));
+                            }
+
                             egui::CollapsingHeader::new("Scene nodes")
-                                .default_open(false)
+                                .id_salt(format!("scene_nodes:{}", scn.path.display()))
+                                .default_open(true)
                                 .show(ui, |ui| {
-                                    egui::ScrollArea::vertical().show(ui, |ui| {
-                                        for node in &scn.nodes {
-                                            ui.monospace(format!(
-                                                "#{:04}  {:<22}  {:<12}  pos=({:>9.2}, {:>9.2}, {:>9.2})  rec=0x{:08X}  flag=0x{:04X}",
-                                                node.index,
-                                                node.name,
-                                                node.archetype_label(),
-                                                node.translation[0],
-                                                node.translation[1],
-                                                node.translation[2],
-                                                node.record_offset,
-                                                node.flags,
-                                            ));
-                                        }
-                                    });
+                                    let scene_nodes_height = ui.available_height().clamp(180.0, 420.0);
+
+                                    egui::ScrollArea::vertical()
+                                        .id_salt(format!("scene_nodes_scroll:{}", scn.path.display()))
+                                        .max_height(scene_nodes_height)
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            for (group_name, nodes) in &grouped_scene_nodes {
+                                                egui::CollapsingHeader::new(format!(
+                                                    "{} ({})",
+                                                    group_name,
+                                                    nodes.len()
+                                                ))
+                                                .default_open(false)
+                                                .show(ui, |ui| {
+                                                    for (index, name, archetype, translation, record_offset, flags) in nodes {
+                                                        let label = format!(
+                                                            "#{:04}  {:<22}  {:<12}  pos=({:>9.2}, {:>9.2}, {:>9.2})  rec=0x{:08X}  flag=0x{:04X}",
+                                                            index,
+                                                            name,
+                                                            archetype,
+                                                            translation[0],
+                                                            translation[1],
+                                                            translation[2],
+                                                            record_offset,
+                                                            flags,
+                                                        );
+
+                                                        let is_selected =
+                                                            self.selected_scn_node == Some(*index);
+
+                                                        if ui.selectable_label(is_selected, label).clicked() {
+                                                            self.selected_scn_node = Some(*index);
+                                                            focus_scene_viewer_on_point(
+                                                                &mut self.scn_viewer,
+                                                                *translation,
+                                                            );
+                                                            ui.ctx().request_repaint();
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        });
                                 });
-
-                            ui.separator();
-
-                            ui.columns(2, |columns| {
-                                let (left_cols, right_cols) = columns.split_at_mut(1);
-                                let left = &mut left_cols[0];
-                                let right = &mut right_cols[0];
-
-                                left.heading("Top archetypes");
-                                left.separator();
-
-                                for (name, count) in scn.top_archetypes(16) {
-                                    left.label(format!("{name}: {count}"));
-                                }
-
-                                right.heading("Header");
-                                right.separator();
-                                right.monospace(format!("version: {}", scn.header.version));
-                                right.monospace(format!("unk_04: {}", scn.header.unk_04));
-                                right.monospace(format!("remap_count: {}", scn.header.remap_count));
-                                right.monospace(format!(
-                                    "record_table_off: 0x{:08X}",
-                                    scn.header.record_table_offset
-                                ));
-                                right.monospace(format!("node_count: {}", scn.header.node_count));
-                                right.monospace(format!(
-                                    "names_off: 0x{:08X}",
-                                    scn.header.names_offset
-                                ));
-                                right.monospace(format!(
-                                    "xforms_off: 0x{:08X}",
-                                    scn.header.transforms_offset
-                                ));
-                                right.monospace(format!(
-                                    "archetypes_off: 0x{:08X}",
-                                    scn.header.archetypes_offset
-                                ));
-                                right.monospace(format!(
-                                    "flags_off: 0x{:08X}",
-                                    scn.header.flags_offset
-                                ));
-                                right.monospace(format!(
-                                    "secondary_xforms_off: 0x{:08X}",
-                                    scn.header.secondary_transform_offset
-                                ));
-                            });
                         } else if let Some(err) = &self.scn_error {
                             ui.colored_label(
                                 egui::Color32::RED,

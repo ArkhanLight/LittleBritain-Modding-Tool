@@ -58,7 +58,7 @@ pub fn category_name(category: AssetCategory) -> &'static str {
         AssetCategory::AudioBank => "Audio Bank",
         AssetCategory::Video => "Video",
         AssetCategory::Lighting => "Lighting",
-        AssetCategory::Scene => "Scene",
+        AssetCategory::Scene => "Level",
         AssetCategory::Log => "Log",
         AssetCategory::Unknown => "Unknown",
     }

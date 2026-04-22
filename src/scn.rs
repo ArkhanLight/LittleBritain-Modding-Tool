@@ -10,6 +10,7 @@ const SCN_VERTEX_STRIDE: usize = 36;
 const SCN_RECORD_STRIDE: usize = 0x68;
 const TRAILER_STRIDE: usize = 12;
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct ScnHeader {
     pub version: u32,
@@ -58,24 +59,37 @@ impl ScnNode {
 pub struct ScnMeshVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
+    pub color: [u8; 4],
     pub uv: [f32; 2],
 }
 
 #[derive(Clone, Debug)]
+pub struct ScnTextureSpan {
+    pub texture_slot: usize,
+    pub mode: u32,
+    pub index_start: usize,
+    pub index_count: usize,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
 pub struct ScnMeshChunk {
     pub entry_index: usize,
     pub entry_offset: u32,
+    pub record_kind: u32,
     pub vertex_offset: u32,
     pub index_offset: u32,
     pub vertex_count: usize,
     pub index_count: usize,
     pub transform_index: Option<usize>,
     pub transform: Option<[f32; 16]>,
-    pub texture_name: Option<String>,
+    pub texture_names: Vec<String>,
+    pub texture_spans: Vec<ScnTextureSpan>,
     pub vertices: Vec<ScnMeshVertex>,
     pub indices: Vec<u32>,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct ScnFile {
     pub path: PathBuf,
@@ -121,6 +135,37 @@ impl ScnFile {
         pairs.truncate(limit);
         pairs
     }
+
+    pub fn embedded_texture_name_count(&self) -> usize {
+        let mut names = std::collections::BTreeSet::new();
+
+        for chunk in &self.mesh_chunks {
+            for name in &chunk.texture_names {
+                names.insert(name.to_ascii_lowercase());
+            }
+        }
+
+        names.len()
+    }
+
+    pub fn texture_span_mode_counts(&self) -> Vec<(u32, usize)> {
+        let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
+
+        for chunk in &self.mesh_chunks {
+            for span in &chunk.texture_spans {
+                *counts.entry(span.mode).or_default() += 1;
+            }
+        }
+
+        counts.into_iter().collect()
+    }
+
+    pub fn texture_span_count(&self) -> usize {
+        self.mesh_chunks
+            .iter()
+            .map(|chunk| chunk.texture_spans.len())
+            .sum()
+    }
 }
 
 pub fn load_scn(path: &Path) -> Result<ScnFile> {
@@ -156,11 +201,11 @@ pub fn load_scn(path: &Path) -> Result<ScnFile> {
         );
     }
 
-    if !(record_table_offset < names_offset
-        && names_offset < transforms_offset
-        && transforms_offset < archetypes_offset
-        && archetypes_offset < flags_offset
-        && flags_offset < secondary_transform_offset)
+    if !(record_table_offset <= names_offset
+        && names_offset <= transforms_offset
+        && transforms_offset <= archetypes_offset
+        && archetypes_offset <= flags_offset
+        && flags_offset <= secondary_transform_offset)
     {
         bail!("SCN header offsets are not in the expected ascending order");
     }
@@ -181,10 +226,6 @@ pub fn load_scn(path: &Path) -> Result<ScnFile> {
     }
 
     let node_count = primary_transform_span / MATRIX_STRIDE;
-
-    if node_count == 0 {
-        bail!("SCN appears to contain zero scene nodes");
-    }
 
     let header = ScnHeader {
         version,
@@ -356,7 +397,10 @@ fn parse_scn_mesh_chunks(
             continue;
         }
 
-        if read_u32(data, entry_offset)? != 0 || read_u32(data, entry_offset + 4)? != 1 {
+        let record_group = read_u32(data, entry_offset)?;
+        let record_kind = read_u32(data, entry_offset + 4)?;
+
+        if record_group != 0 || record_kind == 0 {
             continue;
         }
 
@@ -365,7 +409,8 @@ fn parse_scn_mesh_chunks(
         let vertex_count = read_u32(data, entry_offset + 0x3C)? as usize;
         let index_count = read_u32(data, entry_offset + 0x64)? as usize;
         let material_ptr = read_u32(data, entry_offset + 0x0C)? as usize;
-        let texture_name = parse_scn_texture_name(data, material_ptr);
+        let texture_names = parse_scn_texture_names(data, material_ptr);
+        let texture_span_ptr = read_u32(data, entry_offset + 0x44)? as usize;
 
         if vertex_count == 0 || index_count < 3 || index_count % 3 != 0 {
             continue;
@@ -400,6 +445,12 @@ fn parse_scn_mesh_chunks(
                     read_f32(data, off + 16)?,
                     read_f32(data, off + 20)?,
                 ],
+                color: [
+                    data.get(off + 24).copied().unwrap_or(255),
+                    data.get(off + 25).copied().unwrap_or(255),
+                    data.get(off + 26).copied().unwrap_or(255),
+                    data.get(off + 27).copied().unwrap_or(255),
+                ],
                 uv: [read_f32(data, off + 28)?, read_f32(data, off + 32)?],
             });
         }
@@ -420,19 +471,28 @@ fn parse_scn_mesh_chunks(
             continue;
         }
 
+        let texture_spans = parse_scn_texture_spans(
+            data,
+            texture_span_ptr,
+            record_kind as usize,
+            index_count,
+        );
+
         let transform_index = entry_to_transform.get(&entry_index).copied();
         let transform = transform_index.and_then(|i| secondary_transforms.get(i).copied());
 
         out.push(ScnMeshChunk {
             entry_index,
             entry_offset: entry_offset_u32,
+            record_kind,
             vertex_offset: vertex_offset as u32,
             index_offset: index_offset as u32,
             vertex_count,
             index_count,
             transform_index,
             transform,
-            texture_name,
+            texture_names,
+            texture_spans,
             vertices,
             indices,
         });
@@ -449,6 +509,10 @@ fn parse_exact_string_table(
 ) -> Result<Vec<String>> {
     if start > end || end > data.len() {
         bail!("Invalid SCN string table range");
+    }
+
+    if count == 0 {
+        return Ok(Vec::new());
     }
 
     let mut out = Vec::with_capacity(count);
@@ -474,24 +538,120 @@ fn parse_exact_string_table(
     );
 }
 
-fn parse_scn_texture_name(data: &[u8], material_ptr: usize) -> Option<String> {
-    if material_ptr + 4 > data.len() {
-        return None;
+fn parse_scn_texture_names(data: &[u8], material_ptr: usize) -> Vec<String> {
+    let mut out = Vec::new();
+
+    if material_ptr >= data.len() {
+        return out;
     }
 
-    let name_ptr = read_u32(data, material_ptr).ok()? as usize;
-    let name = read_ascii_cstring(data, name_ptr, 128).ok()?;
-    let trimmed = name.trim();
+    for i in 0..16 {
+        let ptr_off = material_ptr + i * 4;
+        if ptr_off + 4 > data.len() {
+            break;
+        }
 
-    if trimmed.is_empty() {
-        return None;
+        let name_ptr = match read_u32(data, ptr_off) {
+            Ok(v) => v as usize,
+            Err(_) => break,
+        };
+
+        if name_ptr == 0 || name_ptr >= data.len() {
+            break;
+        }
+
+        let Some(name) = read_ascii_cstring(data, name_ptr, 128).ok() else {
+            break;
+        };
+
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+
+        if !trimmed.to_ascii_lowercase().ends_with(".dds") {
+            break;
+        }
+
+        if !out.iter().any(|existing: &String| existing.eq_ignore_ascii_case(trimmed)) {
+            out.push(trimmed.to_string());
+        }
     }
 
-    if !trimmed.to_ascii_lowercase().ends_with(".dds") {
-        return None;
+    out
+}
+
+fn parse_scn_texture_spans(
+    data: &[u8],
+    table_ptr: usize,
+    span_count: usize,
+    total_index_count: usize,
+) -> Vec<ScnTextureSpan> {
+    let mut out = Vec::new();
+
+    if table_ptr >= data.len() || span_count == 0 {
+        out.push(ScnTextureSpan {
+            texture_slot: 0,
+            mode: 0,
+            index_start: 0,
+            index_count: total_index_count,
+        });
+        return out;
     }
 
-    Some(trimmed.to_string())
+    for i in 0..span_count {
+        let off = table_ptr + i * 16;
+        if off + 16 > data.len() {
+            break;
+        }
+
+        let texture_slot = match read_u32(data, off) {
+            Ok(v) => v as usize,
+            Err(_) => break,
+        };
+        let mode = match read_u32(data, off + 4) {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        let index_start = match read_u32(data, off + 8) {
+            Ok(v) => v as usize,
+            Err(_) => break,
+        };
+        let index_count = match read_u32(data, off + 12) {
+            Ok(v) => v as usize,
+            Err(_) => break,
+        };
+
+        if index_count == 0 {
+            continue;
+        }
+
+        if index_start >= total_index_count {
+            continue;
+        }
+
+        if index_start + index_count > total_index_count {
+            continue;
+        }
+
+        out.push(ScnTextureSpan {
+            texture_slot,
+            mode,
+            index_start,
+            index_count,
+        });
+    }
+
+    if out.is_empty() {
+        out.push(ScnTextureSpan {
+            texture_slot: 0,
+            mode: 0,
+            index_start: 0,
+            index_count: total_index_count,
+        });
+    }
+
+    out
 }
 
 fn read_ascii_cstring(data: &[u8], off: usize, max_len: usize) -> Result<String> {
