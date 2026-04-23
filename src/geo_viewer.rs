@@ -1,6 +1,7 @@
 use crate::{
+    anm::{RigidAnimClip, RigidAnimStream},
     dds_preview::DdsPreview,
-    geo::{GeoFile, GeoSkeleton},
+    geo::{GeoAssetType, GeoFile, GeoSkeleton},
     scn::{ScnFile, ScnMeshChunk},
 };
 use bytemuck::{Pod, Zeroable};
@@ -8,7 +9,7 @@ use eframe::{
     egui::{self, Color32, Rect, Sense, Vec2},
     egui_wgpu::{self, wgpu},
 };
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Quat, Vec3};
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -212,6 +213,9 @@ pub fn draw_geo_viewer(
     ui: &mut egui::Ui,
     geo: &GeoFile,
     textures: &[Option<DdsPreview>],
+    rigid_clip: Option<&RigidAnimClip>,
+    rigid_time_seconds: f32,
+    rigid_anim_tag: Option<&str>,
     state: &mut GeoViewerState,
     viewer_height: f32,
 ) {
@@ -262,10 +266,27 @@ pub fn draw_geo_viewer(
         max_distance,
         Some(scene_center),
     );
+
     let texture_state = texture_state_hash(textures);
-    let scene_key = format!("{}#{}", geo.path.display(), texture_state);
+    let rigid_frame = rigid_clip
+        .map(|clip| rigid_frame_index(clip, rigid_time_seconds))
+        .unwrap_or(0);
+    let scene_key = format!(
+        "{}#{}#{}#{}",
+        geo.path.display(),
+        texture_state,
+        rigid_anim_tag.unwrap_or("-"),
+        rigid_frame
+    );
+
     if state.scene_key.as_deref() != Some(scene_key.as_str()) {
-        state.cpu_scene = Some(build_cpu_scene(geo, textures, scene_key.clone()));
+        state.cpu_scene = Some(build_cpu_scene(
+            geo,
+            textures,
+            scene_key.clone(),
+            rigid_clip,
+            rigid_time_seconds,
+        ));
         state.scene_key = Some(scene_key);
     }
 
@@ -291,7 +312,7 @@ pub fn draw_geo_viewer(
         },
     );
 
-    painter.add(callback);
+    ui.painter().add(callback);
 }
 
 pub fn reset_scene_viewer(state: &mut GeoViewerState, scn: &ScnFile) {
@@ -1155,17 +1176,28 @@ fn upload_lines(device: &wgpu::Device, vertices: &[LineVertex], label: &str) -> 
     })
 }
 
-fn build_cpu_scene(geo: &GeoFile, textures: &[Option<DdsPreview>], key: String) -> Arc<CpuScene> {
+fn build_cpu_scene(
+    geo: &GeoFile,
+    textures: &[Option<DdsPreview>],
+    key: String,
+    rigid_clip: Option<&RigidAnimClip>,
+    rigid_time_seconds: f32,
+) -> Arc<CpuScene> {
     let (center, radius) = geo_bounds(geo);
 
-    let vertices: Vec<MeshVertex> = geo
-        .verts
+    let sampled_pose = rigid_clip.and_then(|clip| sample_rigid_pose(geo, clip, rigid_time_seconds));
+    let (positions, normals) = if let Some(pose) = &sampled_pose {
+        build_animated_mesh_vertices(geo, &pose.skin_matrices)
+    } else {
+        (geo.verts.clone(), geo.normals.clone())
+    };
+
+    let vertices: Vec<MeshVertex> = positions
         .iter()
         .enumerate()
         .map(|(i, &p)| MeshVertex {
             position: to_view_space(p),
-            normal: geo
-                .normals
+            normal: normals
                 .get(i)
                 .copied()
                 .map(to_view_space)
@@ -1224,13 +1256,16 @@ fn build_cpu_scene(geo: &GeoFile, textures: &[Option<DdsPreview>], key: String) 
     }
 
     let ground_lines = build_ground_lines(geo, center, radius);
-    let wire_lines = build_wire_lines(geo);
+    let wire_lines = build_wire_lines_from_positions(&positions, &geo.faces);
     let helper_wire_lines = Vec::new();
-    let bone_lines = geo
-        .skeleton
-        .as_ref()
-        .map(build_bone_lines)
-        .unwrap_or_default();
+    let bone_lines = if let (Some(skeleton), Some(pose)) = (geo.skeleton.as_ref(), sampled_pose.as_ref()) {
+        build_animated_bone_lines(skeleton, &pose.world_matrices)
+    } else {
+        geo.skeleton
+            .as_ref()
+            .map(build_bone_lines)
+            .unwrap_or_default()
+    };
 
     Arc::new(CpuScene {
         key,
@@ -1243,6 +1278,413 @@ fn build_cpu_scene(geo: &GeoFile, textures: &[Option<DdsPreview>], key: String) 
         center,
         radius,
     })
+}
+
+struct SampledRigidPose {
+    world_matrices: Vec<Mat4>,
+    skin_matrices: Vec<Mat4>,
+}
+
+fn rigid_frame_index(clip: &RigidAnimClip, time_seconds: f32) -> usize {
+    if clip.frame_times.is_empty() {
+        let frame_count = clip
+            .streams
+            .iter()
+            .map(|stream| stream.rotations_xyzw.len())
+            .min()
+            .unwrap_or(0);
+
+        if frame_count <= 1 {
+            return 0;
+        }
+
+        let duration = clip.duration_seconds.max(1.0 / clip.sample_rate.max(1.0));
+        let clamped = time_seconds.clamp(0.0, duration);
+        return ((clamped * clip.sample_rate).round() as usize).min(frame_count - 1);
+    }
+
+    let clamped = time_seconds.clamp(0.0, *clip.frame_times.last().unwrap_or(&0.0));
+
+    let mut best_index = 0usize;
+    let mut best_dist = f32::MAX;
+
+    for (i, &frame_time) in clip.frame_times.iter().enumerate() {
+        let dist = (frame_time - clamped).abs();
+        if dist < best_dist {
+            best_dist = dist;
+            best_index = i;
+        }
+    }
+
+    best_index
+}
+
+fn sample_rigid_pose(
+    geo: &GeoFile,
+    clip: &RigidAnimClip,
+    time_seconds: f32,
+) -> Option<SampledRigidPose> {
+    let skeleton = geo.skeleton.as_ref()?;
+    if skeleton.bone_count == 0 {
+        return None;
+    }
+
+    let frame_index = rigid_frame_index(clip, time_seconds);
+
+    let bind_world: Vec<Mat4> = skeleton
+        .bind_matrices
+        .iter()
+        .copied()
+        .map(mat4_from_arr)
+        .collect();
+
+    let inverse_bind: Vec<Mat4> = skeleton
+        .inverse_bind_matrices
+        .iter()
+        .copied()
+        .map(mat4_from_arr)
+        .collect();
+
+    let use_non_root_offset = should_offset_stream_indices_by_one(skeleton, clip);
+
+    let mut sampled_rotations: Vec<Option<Quat>> = vec![None; skeleton.bone_count];
+
+    for stream in &clip.streams {
+        let Some(target_bone_index) =
+            target_bone_index_for_stream(skeleton, stream, use_non_root_offset)
+        else {
+            continue;
+        };
+
+        if target_bone_index == 0 && skeleton.bone_count >= 20 {
+            continue;
+        }
+
+        let samples =
+            normalized_stream_rotations_for_pose(skeleton, clip, stream, target_bone_index);
+
+        if samples.is_empty() {
+            continue;
+        }
+
+        let q = samples[frame_index.min(samples.len().saturating_sub(1))];
+        sampled_rotations[target_bone_index] =
+            Some(Quat::from_xyzw(q[0], q[1], q[2], q[3]).normalize());
+    }
+
+    let mut local_matrices = vec![Mat4::IDENTITY; skeleton.bone_count];
+
+    for bone_index in 0..skeleton.bone_count {
+        let bind_local = if let Some(parent_index) =
+            skeleton.parent.get(bone_index).and_then(|p| *p)
+        {
+            bind_world[parent_index].inverse() * bind_world[bone_index]
+        } else {
+            bind_world[bone_index]
+        };
+
+        let (scale, bind_rotation, translation) =
+            bind_local.to_scale_rotation_translation();
+
+        let final_rotation = sampled_rotations[bone_index]
+            .map(|sampled| bind_rotation * sampled)
+            .unwrap_or(bind_rotation);
+
+        local_matrices[bone_index] =
+            Mat4::from_scale_rotation_translation(scale, final_rotation, translation);
+    }
+
+    let mut world_matrices = vec![Mat4::IDENTITY; skeleton.bone_count];
+    for bone_index in 0..skeleton.bone_count {
+        if let Some(parent_index) = skeleton.parent.get(bone_index).and_then(|p| *p) {
+            world_matrices[bone_index] =
+                world_matrices[parent_index] * local_matrices[bone_index];
+        } else {
+            world_matrices[bone_index] = local_matrices[bone_index];
+        }
+    }
+
+    let skin_matrices = world_matrices
+        .iter()
+        .zip(inverse_bind.iter())
+        .map(|(world, inv_bind)| *world * *inv_bind)
+        .collect();
+
+    Some(SampledRigidPose {
+        world_matrices,
+        skin_matrices,
+    })
+}
+
+fn should_offset_stream_indices_by_one(
+    skeleton: &GeoSkeleton,
+    clip: &RigidAnimClip,
+) -> bool {
+    if skeleton.bone_count <= 1 {
+        return false;
+    }
+
+    if !skeleton
+        .names
+        .first()
+        .map(|name| is_root_like_bone_name(name))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    if clip.streams.len() + 1 != skeleton.bone_count {
+        return false;
+    }
+
+    clip.streams
+        .iter()
+        .enumerate()
+        .all(|(i, stream)| stream.stream_index == i)
+}
+
+fn target_bone_index_for_stream(
+    skeleton: &GeoSkeleton,
+    stream: &RigidAnimStream,
+    use_non_root_offset: bool,
+) -> Option<usize> {
+    let bone_index = if use_non_root_offset {
+        stream.stream_index + 1
+    } else {
+        stream.stream_index
+    };
+
+    if bone_index < skeleton.bone_count {
+        Some(bone_index)
+    } else {
+        None
+    }
+}
+
+fn normalized_stream_rotations_for_pose(
+    _skeleton: &GeoSkeleton,
+    clip: &RigidAnimClip,
+    stream: &RigidAnimStream,
+    _target_bone_index: usize,
+) -> Vec<[f32; 4]> {
+    let target_len = clip.frame_times.len().max(
+        clip.streams
+            .iter()
+            .map(|s| s.rotations_xyzw.len())
+            .min()
+            .unwrap_or(0),
+    );
+
+    if target_len == 0 {
+        return Vec::new();
+    }
+
+    let samples = collapse_adjacent_duplicate_quats(&stream.rotations_xyzw, 1.0e-6);
+    if samples.is_empty() {
+        return Vec::new();
+    }
+
+    if samples.len() == target_len {
+        return samples;
+    }
+
+    resample_quat_track_len(&samples, target_len)
+}
+
+fn collapse_adjacent_duplicate_quats(
+    samples: &[[f32; 4]],
+    epsilon: f32,
+) -> Vec<[f32; 4]> {
+    let mut out = Vec::new();
+
+    for &q in samples {
+        let q = canonicalize_quat_sign(q);
+
+        let is_same_as_last = out
+            .last()
+            .map(|&last| quat_distance_sq(last, q) <= epsilon)
+            .unwrap_or(false);
+
+        if !is_same_as_last {
+            out.push(q);
+        }
+    }
+
+    out
+}
+
+fn canonicalize_quat_sign(mut q: [f32; 4]) -> [f32; 4] {
+    if q[3] < 0.0 {
+        q[0] = -q[0];
+        q[1] = -q[1];
+        q[2] = -q[2];
+        q[3] = -q[3];
+    }
+    q
+}
+
+fn quat_distance_sq(a: [f32; 4], b: [f32; 4]) -> f32 {
+    let direct =
+        (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2) + (a[3] - b[3]).powi(2);
+
+    let negated =
+        (a[0] + b[0]).powi(2) + (a[1] + b[1]).powi(2) + (a[2] + b[2]).powi(2) + (a[3] + b[3]).powi(2);
+
+    direct.min(negated)
+}
+
+fn resample_quat_track_len(samples: &[[f32; 4]], target_len: usize) -> Vec<[f32; 4]> {
+    if target_len == 0 {
+        return Vec::new();
+    }
+
+    if samples.is_empty() {
+        return vec![[0.0, 0.0, 0.0, 1.0]; target_len];
+    }
+
+    if samples.len() == 1 {
+        return vec![samples[0]; target_len];
+    }
+
+    if samples.len() == target_len {
+        return samples.to_vec();
+    }
+
+    let src_last = (samples.len() - 1) as f32;
+    let dst_last = (target_len - 1) as f32;
+
+    let mut out = Vec::with_capacity(target_len);
+    for i in 0..target_len {
+        let t = if target_len <= 1 {
+            0.0
+        } else {
+            i as f32 / dst_last
+        };
+
+        let src_pos = t * src_last;
+        let src_index = src_pos.round() as usize;
+        let src_index = src_index.min(samples.len() - 1);
+        out.push(samples[src_index]);
+    }
+
+    out
+}
+
+fn build_animated_mesh_vertices(
+    geo: &GeoFile,
+    skin_matrices: &[Mat4],
+) -> (Vec<[f32; 3]>, Vec<[f32; 3]>) {
+    let Some(skeleton) = geo.skeleton.as_ref() else {
+        return (geo.verts.clone(), geo.normals.clone());
+    };
+
+    let Some(weights) = skeleton.weights.as_ref() else {
+        return (geo.verts.clone(), geo.normals.clone());
+    };
+
+    let mut positions = Vec::with_capacity(geo.verts.len());
+    let mut normals = Vec::with_capacity(geo.normals.len());
+
+    for vertex_index in 0..geo.verts.len() {
+        let src_pos = geo.verts.get(vertex_index).copied().unwrap_or([0.0, 0.0, 0.0]);
+        let src_nrm = geo.normals.get(vertex_index).copied().unwrap_or([0.0, 1.0, 0.0]);
+
+        let src_pos = Vec3::new(src_pos[0], src_pos[1], src_pos[2]);
+        let src_nrm = Vec3::new(src_nrm[0], src_nrm[1], src_nrm[2]);
+
+        let Some(influences) = weights.get(vertex_index) else {
+            positions.push([src_pos.x, src_pos.y, src_pos.z]);
+            normals.push([src_nrm.x, src_nrm.y, src_nrm.z]);
+            continue;
+        };
+
+        if influences.is_empty() {
+            positions.push([src_pos.x, src_pos.y, src_pos.z]);
+            normals.push([src_nrm.x, src_nrm.y, src_nrm.z]);
+            continue;
+        }
+
+        let mut pos_accum = Vec3::ZERO;
+        let mut nrm_accum = Vec3::ZERO;
+
+        for influence in influences {
+            let Some(skin) = skin_matrices.get(influence.bone_index) else {
+                continue;
+            };
+
+            pos_accum += skin.transform_point3(src_pos) * influence.weight;
+            nrm_accum += skin.transform_vector3(src_nrm) * influence.weight;
+        }
+
+        let nrm_accum = if nrm_accum.length_squared() > 1.0e-8 {
+            nrm_accum.normalize()
+        } else {
+            src_nrm
+        };
+
+        positions.push([pos_accum.x, pos_accum.y, pos_accum.z]);
+        normals.push([nrm_accum.x, nrm_accum.y, nrm_accum.z]);
+    }
+
+    (positions, normals)
+}
+
+fn build_animated_bone_lines(skeleton: &GeoSkeleton, world_matrices: &[Mat4]) -> Vec<LineVertex> {
+    let color = [1.0, 0.92, 0.35, 1.0];
+    let points: Vec<[f32; 3]> = world_matrices
+        .iter()
+        .map(|mat| to_view_space(mat.transform_point3(Vec3::ZERO).into()))
+        .collect();
+
+    let mut out = Vec::new();
+    for (bone_index, parent) in skeleton.parent.iter().enumerate() {
+        let Some(parent_index) = *parent else { continue; };
+        let Some(&a) = points.get(parent_index) else { continue; };
+        let Some(&b) = points.get(bone_index) else { continue; };
+        out.push(LineVertex { position: a, color });
+        out.push(LineVertex { position: b, color });
+    }
+    out
+}
+
+fn build_wire_lines_from_positions(
+    positions: &[[f32; 3]],
+    faces: &[[u16; 3]],
+) -> Vec<LineVertex> {
+    let color = [120.0 / 255.0, 220.0 / 255.0, 1.0, 1.0];
+    let mut out = Vec::with_capacity(faces.len() * 6);
+
+    for face in faces {
+        let ia = face[0] as usize;
+        let ib = face[1] as usize;
+        let ic = face[2] as usize;
+
+        let Some(&a_raw) = positions.get(ia) else { continue; };
+        let Some(&b_raw) = positions.get(ib) else { continue; };
+        let Some(&c_raw) = positions.get(ic) else { continue; };
+
+        let a = to_view_space(a_raw);
+        let b = to_view_space(b_raw);
+        let c = to_view_space(c_raw);
+
+        out.push(LineVertex { position: a, color });
+        out.push(LineVertex { position: b, color });
+        out.push(LineVertex { position: b, color });
+        out.push(LineVertex { position: c, color });
+        out.push(LineVertex { position: c, color });
+        out.push(LineVertex { position: a, color });
+    }
+
+    out
+}
+
+fn mat4_from_arr(m: [f32; 16]) -> Mat4 {
+    Mat4::from_cols_array(&m)
+}
+
+fn is_root_like_bone_name(name: &str) -> bool {
+    let low = name.to_ascii_lowercase();
+    low == "bip01" || low == "root" || low.starts_with("root")
 }
 
 fn cpu_texture_from_dds(dds: &DdsPreview) -> CpuTexture {

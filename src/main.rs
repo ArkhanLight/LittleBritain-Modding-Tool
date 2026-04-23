@@ -1,3 +1,4 @@
+mod anm;
 mod app;
 mod audio_player;
 mod bik_preview;
