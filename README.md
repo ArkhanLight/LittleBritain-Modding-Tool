@@ -1,5 +1,18 @@
 # LittleBritain Universal Modding Tool
 
+V0.4A
+- This version implements the ability to load SCN files in the modding tool. (scene/level files)
+- View all static meshes and terrain in the level files.
+- Added fly controls in the 3D viewport. (see controls below)
+- Added a fly speed slider.
+- Implemented multi-material support on a single mesh -> needed to display the terrain correctly.
+- When loading a level, you will see 'scene nodes' at the bottom of the mod tool. These are bundles of objects you can click on to quickly move toward them.
+- Added a toggle for 'markers' of yet to be placed / not yet understood objects. (mostly skeletal meshes & scripts)
+- Added a toggle for 'Shadow Blobs / Decals'.
+- Small tweaks to the shader that is used when disabling textures.
+- Changed the 'Scenes' category name to 'Levels'.
+- Small layout tweaks.
+
 V0.3
 - Added light/dark mode toggle - by default the tool launches in dark mode
 - Added ffmpeg libraries to support reading the bik files
