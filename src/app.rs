@@ -10,13 +10,14 @@ use crate::{
     geo::{load_geo, GeoAssetType, GeoFile},
     geo_viewer::{
         draw_geo_viewer, draw_scene_viewer, focus_scene_viewer_on_point, reset_geo_viewer,
-        reset_scene_viewer, GeoViewerState, SceneGeoModel,
+        reset_scene_viewer, GeoViewerState, SceneGeoModel, SceneSelection,
     },
     scn::{load_scn, ScnFile},
 };
 use eframe::egui;
 use std::{
     collections::VecDeque,
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -39,6 +40,37 @@ struct AnmGeoCandidate {
 struct AssetLinks {
     model_to_textures: std::collections::BTreeMap<PathBuf, Vec<ModelTextureRef>>,
     texture_to_models: std::collections::BTreeMap<PathBuf, Vec<PathBuf>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ScnScriptSummary {
+    files: Vec<ScnScriptFile>,
+    matched_scene_nodes: Vec<String>,
+    unmatched_script_nodes: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ScnScriptFile {
+    path: PathBuf,
+    nodes: Vec<ScnScriptNode>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ScnScriptNode {
+    name: String,
+    animation: Option<String>,
+    steps: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ScnMarkerSummary {
+    actor_like: usize,
+    checkpoints: usize,
+    path_nodes: usize,
+    player_starts: usize,
+    player_ends: usize,
+    traffic: usize,
+    other: usize,
 }
 
 pub struct ModToolApp {
@@ -89,9 +121,12 @@ pub struct ModToolApp {
     scn_scene_unresolved: Vec<String>,
     scn_scene_error: Option<String>,
     selected_scn_node: Option<usize>,
+    selected_scn_chunk: Option<usize>,
     scn_viewer: GeoViewerState,
     scn_view_height: f32,
     scn_embedded_texture_previews: std::collections::HashMap<String, DdsPreview>,
+    scn_script_summary: ScnScriptSummary,
+    scn_script_error: Option<String>,
 
     geo_material_previews: Vec<Option<DdsPreview>>,
     geo_materials_loaded_path: Option<PathBuf>,
@@ -189,9 +224,12 @@ impl ModToolApp {
             scn_scene_unresolved: Vec::new(),
             scn_scene_error: None,
             selected_scn_node: None,
+            selected_scn_chunk: None,
             scn_viewer: GeoViewerState::default(),
             scn_view_height: 520.0,
             scn_embedded_texture_previews: std::collections::HashMap::new(),
+            scn_script_summary: ScnScriptSummary::default(),
+            scn_script_error: None,
 
             bik_preview: None,
             bik_preview_path: None,
@@ -254,15 +292,16 @@ impl ModToolApp {
                     self.active_geo_animation_time = 0.0;
                     self.scn_file = None;
                     self.scn_loaded_path = None;
-                    self.scn_error = None;   
+                    self.scn_error = None;
                     self.scn_scene_models.clear();
                     self.scn_scene_models_path = None;
                     self.scn_scene_unresolved.clear();
                     self.scn_scene_error = None;
                     self.selected_scn_node = None;
+                    self.selected_scn_chunk = None;
                     self.scn_viewer = GeoViewerState::default();
-                    self.scn_view_height = 520.0;  
-                    self.scn_embedded_texture_previews.clear();               
+                    self.scn_view_height = 520.0;
+                    self.scn_embedded_texture_previews.clear();
                     self.reset_bik_state();
                     self.status = "Loaded Data folder.".to_owned();
                 }
@@ -278,7 +317,7 @@ impl ModToolApp {
             match scan_game_data(&root) {
                 Ok(tree) => {
                     self.tree = tree;
-                    
+
                     self.asset_links = self.build_asset_links();
                     self.geo_animation_groups_path = None;
                     self.geo_animation_groups.clear();
@@ -326,8 +365,8 @@ impl ModToolApp {
                     self.scn_scene_error = None;
                     self.scn_viewer = GeoViewerState::default();
                     self.scn_view_height = 520.0;
-                    self.scn_embedded_texture_previews.clear();                    
-                    
+                    self.scn_embedded_texture_previews.clear();
+
                     self.reset_bik_state();
 
                     self.status = "Rescanned Data folder.".to_owned();
@@ -390,19 +429,21 @@ impl ModToolApp {
                         for child in &node.children {
                             match child.kind {
                                 NodeKind::Folder => real_folders.push(child),
-                                NodeKind::File => match child.category.unwrap_or(AssetCategory::Unknown) {
-                                    AssetCategory::Animation => animations.push(child),
-                                    AssetCategory::Model => models.push(child),
-                                    AssetCategory::Texture => textures.push(child),
-                                    AssetCategory::Particle => particles.push(child),
-                                    AssetCategory::AudioStream => audio.push(child),
-                                    AssetCategory::AudioBank => audio_banks.push(child),
-                                    AssetCategory::Lighting => lighting.push(child),
-                                    AssetCategory::Scene => scenes.push(child),
-                                    AssetCategory::Log => logs.push(child),
-                                    AssetCategory::Video => videos.push(child),
-                                    AssetCategory::Unknown => other.push(child),
-                                },
+                                NodeKind::File => {
+                                    match child.category.unwrap_or(AssetCategory::Unknown) {
+                                        AssetCategory::Animation => animations.push(child),
+                                        AssetCategory::Model => models.push(child),
+                                        AssetCategory::Texture => textures.push(child),
+                                        AssetCategory::Particle => particles.push(child),
+                                        AssetCategory::AudioStream => audio.push(child),
+                                        AssetCategory::AudioBank => audio_banks.push(child),
+                                        AssetCategory::Lighting => lighting.push(child),
+                                        AssetCategory::Scene => scenes.push(child),
+                                        AssetCategory::Log => logs.push(child),
+                                        AssetCategory::Video => videos.push(child),
+                                        AssetCategory::Unknown => other.push(child),
+                                    }
+                                }
                             }
                         }
 
@@ -511,7 +552,7 @@ impl ModToolApp {
                 }
             }
         }
-    }  
+    }
 
     fn reset_bik_state(&mut self) {
         self.stop_bik_audio();
@@ -545,8 +586,7 @@ impl ModToolApp {
                 .map(|p| format!("bik_video:{}", p.path.display()))
                 .unwrap_or_else(|| "bik_video".to_owned());
 
-            self.bik_texture =
-                Some(ctx.load_texture(name, image, egui::TextureOptions::LINEAR));
+            self.bik_texture = Some(ctx.load_texture(name, image, egui::TextureOptions::LINEAR));
         }
     }
 
@@ -591,10 +631,8 @@ impl ModToolApp {
     }
 
     fn start_bik_playback(&mut self, ctx: &egui::Context) {
-        let Some((preview_path, estimated_total, first_frame)) = self
-            .bik_preview
-            .as_ref()
-            .map(|preview| {
+        let Some((preview_path, estimated_total, first_frame)) =
+            self.bik_preview.as_ref().map(|preview| {
                 (
                     preview.path.clone(),
                     preview.estimated_frame_count(),
@@ -663,17 +701,13 @@ impl ModToolApp {
     fn seek_bik_to_time(&mut self, seconds: f32, ctx: &egui::Context) {
         let was_playing = self.bik_is_playing;
 
-        let Some((total, fps, first_frame)) = self
-            .bik_preview
-            .as_ref()
-            .map(|preview| {
-                (
-                    preview.total_duration_seconds(),
-                    preview.fps.max(0.001),
-                    preview.first_frame.clone(),
-                )
-            })
-        else {
+        let Some((total, fps, first_frame)) = self.bik_preview.as_ref().map(|preview| {
+            (
+                preview.total_duration_seconds(),
+                preview.fps.max(0.001),
+                preview.first_frame.clone(),
+            )
+        }) else {
             return;
         };
 
@@ -769,14 +803,12 @@ impl ModToolApp {
                         + Instant::now().duration_since(started_at).as_secs_f32()
                 })
         } else {
-            self.bik_clock_start_secs
-                + Instant::now().duration_since(started_at).as_secs_f32()
+            self.bik_clock_start_secs + Instant::now().duration_since(started_at).as_secs_f32()
         };
 
         while let Some((_, time_seconds, _)) = self.bik_frame_queue.front() {
             if *time_seconds <= target_time {
-                let (frame_index, time_seconds, image) =
-                    self.bik_frame_queue.pop_front().unwrap();
+                let (frame_index, time_seconds, image) = self.bik_frame_queue.pop_front().unwrap();
                 self.bik_current_frame = frame_index;
                 self.bik_current_time_seconds = time_seconds;
                 self.set_bik_texture_from_image(ctx, image);
@@ -836,7 +868,7 @@ impl ModToolApp {
                 self.dds_error = Some(err.to_string());
             }
         }
-    }    
+    }
 
     fn ensure_anm_loaded(&mut self) {
         let Some(path) = self.selected_file.clone() else {
@@ -1111,9 +1143,7 @@ impl ModToolApp {
         let dt = ctx.input(|i| i.unstable_dt).max(1.0 / 240.0);
         self.active_geo_animation_time += dt * self.active_geo_animation_speed.max(0.05);
 
-        let duration = clip
-            .duration_seconds
-            .max(1.0 / clip.sample_rate.max(1.0));
+        let duration = clip.duration_seconds.max(1.0 / clip.sample_rate.max(1.0));
 
         if self.active_geo_animation_time > duration {
             if self.active_geo_animation_loop {
@@ -1179,6 +1209,7 @@ impl ModToolApp {
             self.scn_loaded_path = None;
             self.scn_error = None;
             self.selected_scn_node = None;
+            self.selected_scn_chunk = None;
             return;
         };
 
@@ -1197,11 +1228,13 @@ impl ModToolApp {
 
         if !is_scn {
             self.selected_scn_node = None;
+            self.selected_scn_chunk = None;
             return;
         }
-        
+
         self.selected_scn_node = None;
-        
+        self.selected_scn_chunk = None;
+
         match load_scn(&path) {
             Ok(scn) => {
                 self.scn_file = Some(scn);
@@ -1217,6 +1250,9 @@ impl ModToolApp {
         self.scn_scene_models_path = None;
         self.scn_scene_unresolved.clear();
         self.scn_scene_error = None;
+        self.scn_script_summary = ScnScriptSummary::default();
+        self.scn_script_error = None;
+        self.selected_scn_chunk = None;
         self.scn_viewer = GeoViewerState::default();
         self.scn_view_height = 520.0;
         self.scn_embedded_texture_previews.clear();
@@ -1243,11 +1279,20 @@ impl ModToolApp {
         }
 
         self.reset_scn_scene_state();
-        self.scn_scene_models_path = Some(path);
+        self.scn_scene_models_path = Some(path.clone());
 
         let Some(scn) = self.scn_file.clone() else {
             return;
         };
+
+        match Self::load_scene_script_summary(&path, &scn) {
+            Ok(summary) => {
+                self.scn_script_summary = summary;
+            }
+            Err(err) => {
+                self.scn_script_error = Some(err.to_string());
+            }
+        }
 
         let mut texture_nodes = Vec::new();
         let mut model_nodes = Vec::new();
@@ -1350,11 +1395,7 @@ impl ModToolApp {
                         embedded_texture_previews.insert(key, preview);
                     }
                     Err(err) => {
-                        failed.push(format!(
-                            "SCN texture {}: {}",
-                            tex_path.display(),
-                            err
-                        ));
+                        failed.push(format!("SCN texture {}: {}", tex_path.display(), err));
                     }
                 }
             }
@@ -1376,7 +1417,7 @@ impl ModToolApp {
         }
 
         reset_scene_viewer(&mut self.scn_viewer, &scn);
-    }    
+    }
 
     fn find_file_case_insensitive(folder: &Path, filename: &str) -> Option<PathBuf> {
         let direct = folder.join(filename);
@@ -1424,21 +1465,22 @@ impl ModToolApp {
         };
 
         for texture_name in &geo.texture_names {
-            let preview = if let Some(tex_path) = Self::guess_geo_texture_path(&geo_path, texture_name) {
-                match load_dds_preview(ctx, &tex_path) {
-                    Ok(preview) => Some(preview),
-                    Err(err) => {
-                        self.geo_material_error = Some(format!(
-                            "Could not load GEO texture {}: {}",
-                            tex_path.display(),
-                            err
-                        ));
-                        None
+            let preview =
+                if let Some(tex_path) = Self::guess_geo_texture_path(&geo_path, texture_name) {
+                    match load_dds_preview(ctx, &tex_path) {
+                        Ok(preview) => Some(preview),
+                        Err(err) => {
+                            self.geo_material_error = Some(format!(
+                                "Could not load GEO texture {}: {}",
+                                tex_path.display(),
+                                err
+                            ));
+                            None
+                        }
                     }
-                }
-            } else {
-                None
-            };
+                } else {
+                    None
+                };
 
             self.geo_material_previews.push(preview);
         }
@@ -1482,7 +1524,7 @@ impl ModToolApp {
                 self.bnk_error = Some(err.to_string());
             }
         }
-    }    
+    }
 
     fn selected_category(&self) -> Option<AssetCategory> {
         self.selected_file.as_ref().map(|path| classify_path(path))
@@ -1681,8 +1723,7 @@ impl ModToolApp {
 
         let response = ui.add_sized(
             [ui.available_width(), 18.0],
-            egui::Slider::new(&mut timeline_secs, 0.0..=max_secs)
-                .show_value(false),
+            egui::Slider::new(&mut timeline_secs, 0.0..=max_secs).show_value(false),
         );
 
         if response.changed() {
@@ -1742,7 +1783,220 @@ impl ModToolApp {
         } else {
             without_separators.to_owned()
         }
-    }    
+    }
+
+    fn scn_marker_kind(name: &str) -> &'static str {
+        let lower = name.trim().to_ascii_lowercase();
+
+        if lower.is_empty() {
+            "Unnamed marker"
+        } else if lower == "player_start" {
+            "Player start"
+        } else if lower == "player_end" {
+            "Player end"
+        } else if lower.starts_with("checkpoint") {
+            "Checkpoint"
+        } else if lower.starts_with("path") || lower.starts_with("lane") {
+            "Route marker"
+        } else if lower.starts_with("gay")
+            || lower.starts_with("cyclist")
+            || lower.starts_with("vicky")
+            || lower.starts_with("dafydd")
+            || lower.starts_with("myfanwy")
+        {
+            "Actor marker"
+        } else if lower.starts_with("car_") || lower.starts_with("dec_car_") {
+            "Traffic marker"
+        } else {
+            "Generic marker"
+        }
+    }
+
+    fn summarize_scn_markers(scn: &ScnFile) -> ScnMarkerSummary {
+        let mut summary = ScnMarkerSummary::default();
+
+        for node in &scn.nodes {
+            if !node.is_marker() {
+                continue;
+            }
+
+            match Self::scn_marker_kind(&node.name) {
+                "Actor marker" => summary.actor_like += 1,
+                "Checkpoint" => summary.checkpoints += 1,
+                "Route marker" => summary.path_nodes += 1,
+                "Player start" => summary.player_starts += 1,
+                "Player end" => summary.player_ends += 1,
+                "Traffic marker" => summary.traffic += 1,
+                _ => summary.other += 1,
+            }
+        }
+
+        summary
+    }
+
+    fn scn_script_attr(line: &str, attr: &str) -> Option<String> {
+        let needle = format!("{attr}=\"");
+        let start = line.find(&needle)? + needle.len();
+        let rest = &line[start..];
+        let end = rest.find('"')?;
+        Some(rest[..end].to_owned())
+    }
+
+    fn parse_scn_script_file(path: &Path) -> anyhow::Result<Option<ScnScriptFile>> {
+        let text = fs::read_to_string(path)?;
+        if !text.contains("<GAMENODE") {
+            return Ok(None);
+        }
+
+        let mut nodes = Vec::new();
+        let mut current: Option<ScnScriptNode> = None;
+
+        for raw_line in text.lines() {
+            let line = raw_line.trim();
+
+            if line.starts_with("<GAMENODE") {
+                if let Some(name) = Self::scn_script_attr(line, "name") {
+                    current = Some(ScnScriptNode {
+                        name,
+                        animation: None,
+                        steps: Vec::new(),
+                    });
+                }
+                continue;
+            }
+
+            if line.starts_with("</GAMENODE") {
+                if let Some(node) = current.take() {
+                    nodes.push(node);
+                }
+                continue;
+            }
+
+            let Some(node) = current.as_mut() else {
+                continue;
+            };
+
+            if line.starts_with("<ANIM") {
+                if let Some(animation) = Self::scn_script_attr(line, "animation") {
+                    node.animation = Some(animation);
+                }
+            } else if line.starts_with("<TARGET") {
+                if let Some(offset) = Self::scn_script_attr(line, "offset") {
+                    node.steps.push(format!("target {offset}"));
+                }
+            } else if line.starts_with("<MOVE") {
+                if let Some(speed) = Self::scn_script_attr(line, "speed") {
+                    node.steps.push(format!("move speed {speed}"));
+                } else if let Some(time) = Self::scn_script_attr(line, "time") {
+                    node.steps.push(format!("move time {time}"));
+                }
+            } else if line.starts_with("<WAIT") {
+                if let Some(frames) = Self::scn_script_attr(line, "frames") {
+                    node.steps.push(format!("wait {frames} frames"));
+                }
+            } else if line.starts_with("<LOOP") {
+                node.steps.push("loop".to_owned());
+            }
+        }
+
+        if nodes.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(ScnScriptFile {
+                path: path.to_path_buf(),
+                nodes,
+            }))
+        }
+    }
+
+    fn load_scene_script_summary(path: &Path, scn: &ScnFile) -> anyhow::Result<ScnScriptSummary> {
+        let Some(scene_dir) = path.parent() else {
+            return Ok(ScnScriptSummary::default());
+        };
+
+        let mut files = Vec::new();
+        for entry in fs::read_dir(scene_dir)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            let is_xml = entry_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("xml"))
+                .unwrap_or(false);
+
+            if !is_xml {
+                continue;
+            }
+
+            if let Some(file) = Self::parse_scn_script_file(&entry_path)? {
+                files.push(file);
+            }
+        }
+
+        files.sort_by_key(|file| {
+            file.path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default()
+        });
+
+        let scene_names = scn
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                let trimmed = node.name.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_ascii_lowercase())
+                }
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let mut matched = std::collections::BTreeSet::new();
+        let mut unmatched = std::collections::BTreeSet::new();
+
+        for file in &files {
+            for node in &file.nodes {
+                let key = node.name.trim().to_ascii_lowercase();
+                if key.is_empty() {
+                    continue;
+                }
+
+                if scene_names.contains(&key) {
+                    matched.insert(node.name.clone());
+                } else {
+                    unmatched.insert(node.name.clone());
+                }
+            }
+        }
+
+        Ok(ScnScriptSummary {
+            files,
+            matched_scene_nodes: matched.into_iter().collect(),
+            unmatched_script_nodes: unmatched.into_iter().collect(),
+        })
+    }
+
+    fn scn_script_matches<'a>(
+        summary: &'a ScnScriptSummary,
+        name: &str,
+    ) -> Vec<(&'a Path, &'a ScnScriptNode)> {
+        let wanted = name.trim();
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+
+        let mut out = Vec::new();
+        for file in &summary.files {
+            for node in &file.nodes {
+                if node.name.eq_ignore_ascii_case(wanted) {
+                    out.push((file.path.as_path(), node));
+                }
+            }
+        }
+        out
+    }
 
     fn build_asset_links(&self) -> AssetLinks {
         let mut links = AssetLinks::default();
@@ -1819,7 +2073,7 @@ impl ModToolApp {
         }
 
         links
-    }    
+    }
 }
 
 impl eframe::App for ModToolApp {
@@ -1863,7 +2117,11 @@ impl eframe::App for ModToolApp {
                     self.rescan();
                 }
 
-                let theme_label = if self.dark_mode { "Light mode" } else { "Dark mode" };
+                let theme_label = if self.dark_mode {
+                    "Light mode"
+                } else {
+                    "Dark mode"
+                };
 
                 if ui.button(theme_label).clicked() {
                     self.dark_mode = !self.dark_mode;
@@ -2076,7 +2334,7 @@ impl eframe::App for ModToolApp {
                                 "Texture spans: {}",
                                 scn.texture_span_count()
                             ));
-                            
+
                             ui.label(format!(
                                 "Secondary transforms: {}",
                                 scn.secondary_transforms.len()
@@ -2144,7 +2402,7 @@ impl eframe::App for ModToolApp {
                                 format!("SCN read error: {}", err),
                             );
                         }
-                    }                  
+                    }
 
                     if ext == "geo" {
                         if let Some(geo) = &self.geo_file {
@@ -2207,7 +2465,7 @@ impl eframe::App for ModToolApp {
                             format!("GEO read error: {}", err),
                         );
                     }
-                }                    
+                }
 
                     ui.separator();
                     ui.label("Viewer:");
@@ -2378,7 +2636,7 @@ impl eframe::App for ModToolApp {
                             let preview_fps = preview.fps;
                             let estimated_frames = preview.estimated_frame_count();
                             let has_audio = preview.has_audio;
-                            let file_label = preview             
+                            let file_label = preview
                                 .path
                                 .file_name()
                                 .map(|n| n.to_string_lossy().to_string())
@@ -2610,17 +2868,35 @@ impl eframe::App for ModToolApp {
                             ui.label("BNK selected, but no bank info is loaded.");
                         }
                     }
-                     
+
                     Some("scn") => {
                         if let Some(scn) = &self.scn_file {
-                            draw_scene_viewer(
+                            let selected_scene_item = self
+                                .selected_scn_node
+                                .map(SceneSelection::Node)
+                                .or_else(|| self.selected_scn_chunk.map(SceneSelection::MeshChunk));
+
+                            if let Some(picked_item) = draw_scene_viewer(
                                 ui,
                                 scn,
                                 &self.scn_scene_models,
                                 &self.scn_embedded_texture_previews,
                                 &mut self.scn_viewer,
                                 self.scn_view_height,
-                            );
+                                selected_scene_item,
+                            ) {
+                                match picked_item {
+                                    SceneSelection::Node(index) => {
+                                        self.selected_scn_node = Some(index);
+                                        self.selected_scn_chunk = None;
+                                    }
+                                    SceneSelection::MeshChunk(index) => {
+                                        self.selected_scn_chunk = Some(index);
+                                        self.selected_scn_node = None;
+                                    }
+                                }
+                                ui.ctx().request_repaint();
+                            }
                             let (resize_rect, resize_response) = ui.allocate_exact_size(
                                 egui::vec2(ui.available_width(), 12.0),
                                 egui::Sense::drag(),
@@ -2643,6 +2919,8 @@ impl eframe::App for ModToolApp {
                             }
 
                             ui.separator();
+
+                            let marker_summary = Self::summarize_scn_markers(scn);
 
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(format!("Nodes: {}", scn.nodes.len()));
@@ -2669,8 +2947,61 @@ impl eframe::App for ModToolApp {
                                 ));
                             });
 
+                            if scn.marker_count() > 0 {
+                                ui.horizontal_wrapped(|ui| {
+                                    if marker_summary.actor_like > 0 {
+                                        ui.label(format!(
+                                            "Actor-like markers: {}",
+                                            marker_summary.actor_like
+                                        ));
+                                        ui.separator();
+                                    }
+                                    if marker_summary.player_starts > 0 {
+                                        ui.label(format!(
+                                            "Player starts: {}",
+                                            marker_summary.player_starts
+                                        ));
+                                        ui.separator();
+                                    }
+                                    if marker_summary.player_ends > 0 {
+                                        ui.label(format!(
+                                            "Player ends: {}",
+                                            marker_summary.player_ends
+                                        ));
+                                        ui.separator();
+                                    }
+                                    if marker_summary.checkpoints > 0 {
+                                        ui.label(format!(
+                                            "Checkpoints: {}",
+                                            marker_summary.checkpoints
+                                        ));
+                                        ui.separator();
+                                    }
+                                    if marker_summary.path_nodes > 0 {
+                                        ui.label(format!(
+                                            "Route markers: {}",
+                                            marker_summary.path_nodes
+                                        ));
+                                        ui.separator();
+                                    }
+                                    if marker_summary.traffic > 0 {
+                                        ui.label(format!(
+                                            "Traffic markers: {}",
+                                            marker_summary.traffic
+                                        ));
+                                        ui.separator();
+                                    }
+                                    if marker_summary.other > 0 {
+                                        ui.label(format!("Other markers: {}", marker_summary.other));
+                                    }
+                                });
+                            }
+
                             ui.small(
-                                "This 3D view now draws embedded SCN static mesh plus any placed GEO props resolved from archetype names.",
+                                "This 3D view draws embedded SCN mesh plus any placed GEO props. Marker colors now highlight actor/script anchors, starts, checkpoints, routes, and traffic helpers.",
+                            );
+                            ui.small(
+                                "Click markers, prop instances, or embedded map chunks in the 3D view to inspect them below.",
                             );
 
                             if let Some(err) = &self.scn_scene_error {
@@ -2686,6 +3017,102 @@ impl eframe::App for ModToolApp {
                                     .show(ui, |ui| {
                                         for name in &self.scn_scene_unresolved {
                                             ui.monospace(name);
+                                        }
+                                    });
+                            }
+
+                            if let Some(err) = &self.scn_script_error {
+                                ui.colored_label(
+                                    egui::Color32::RED,
+                                    format!("Companion script read error: {}", err),
+                                );
+                            } else if !self.scn_script_summary.files.is_empty() {
+                                let matched_script_names = self
+                                    .scn_script_summary
+                                    .matched_scene_nodes
+                                    .iter()
+                                    .map(|name| name.to_ascii_lowercase())
+                                    .collect::<std::collections::BTreeSet<_>>();
+
+                                egui::CollapsingHeader::new("Companion scripts")
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        ui.label(format!(
+                                            "Script files: {}",
+                                            self.scn_script_summary.files.len()
+                                        ));
+                                        ui.label(format!(
+                                            "Matched scene nodes: {}",
+                                            self.scn_script_summary.matched_scene_nodes.len()
+                                        ));
+
+                                        if !self.scn_script_summary.unmatched_script_nodes.is_empty()
+                                        {
+                                            ui.label(format!(
+                                                "Script nodes without SCN match: {}",
+                                                self.scn_script_summary.unmatched_script_nodes.len()
+                                            ));
+                                        }
+
+                                        ui.separator();
+
+                                        for file in &self.scn_script_summary.files {
+                                            let file_name = file
+                                                .path
+                                                .file_name()
+                                                .map(|name| name.to_string_lossy().to_string())
+                                                .unwrap_or_else(|| file.path.display().to_string());
+
+                                            egui::CollapsingHeader::new(format!(
+                                                "{} ({})",
+                                                file_name,
+                                                file.nodes.len()
+                                            ))
+                                            .default_open(false)
+                                            .show(ui, |ui| {
+                                                let list_height =
+                                                    ui.available_height().clamp(120.0, 220.0);
+
+                                                egui::ScrollArea::vertical()
+                                                    .max_height(list_height)
+                                                    .auto_shrink([false, false])
+                                                    .show(ui, |ui| {
+                                                        for node in &file.nodes {
+                                                            let matched = matched_script_names
+                                                                .contains(
+                                                                    &node.name.to_ascii_lowercase(),
+                                                                );
+                                                            let state = if matched {
+                                                                "scene node"
+                                                            } else {
+                                                                "script only"
+                                                            };
+
+                                                            let anim = node
+                                                                .animation
+                                                                .as_deref()
+                                                                .unwrap_or("?");
+                                                            let step_count = node.steps.len();
+
+                                                            ui.monospace(format!(
+                                                                "{:<18} anim={}  steps={}  {}",
+                                                                node.name, anim, step_count, state
+                                                            ));
+                                                        }
+                                                    });
+                                            });
+                                        }
+
+                                        if !self.scn_script_summary.unmatched_script_nodes.is_empty()
+                                        {
+                                            ui.separator();
+                                            egui::CollapsingHeader::new("Script nodes not found in SCN")
+                                                .default_open(false)
+                                                .show(ui, |ui| {
+                                                    for name in &self.scn_script_summary.unmatched_script_nodes {
+                                                        ui.monospace(name);
+                                                    }
+                                                });
                                         }
                                     });
                             }
@@ -2750,6 +3177,7 @@ impl eframe::App for ModToolApp {
 
                                                         if ui.selectable_label(is_selected, label).clicked() {
                                                             self.selected_scn_node = Some(*index);
+                                                            self.selected_scn_chunk = None;
                                                             focus_scene_viewer_on_point(
                                                                 &mut self.scn_viewer,
                                                                 *translation,
@@ -2761,6 +3189,130 @@ impl eframe::App for ModToolApp {
                                             }
                                         });
                                 });
+
+                            if self.selected_scn_node.is_some() || self.selected_scn_chunk.is_some() {
+                                ui.separator();
+                                ui.heading("Selected scene item");
+                                ui.separator();
+                            }
+
+                            if let Some(selected_index) = self.selected_scn_node {
+                                if let Some(node) = scn.nodes.get(selected_index) {
+                                    let display_name = if node.name.trim().is_empty() {
+                                        "(unnamed)"
+                                    } else {
+                                        node.name.as_str()
+                                    };
+
+                                    ui.label("Type: Scene node");
+                                    ui.label(format!("Name: {}", display_name));
+                                    ui.label(format!("Archetype: {}", node.archetype_label()));
+                                    ui.label(format!(
+                                        "Position: ({:.2}, {:.2}, {:.2})",
+                                        node.translation[0],
+                                        node.translation[1],
+                                        node.translation[2]
+                                    ));
+                                    ui.label(format!("Record: 0x{:08X}", node.record_offset));
+                                    ui.label(format!("Flags: 0x{:04X}", node.flags));
+
+                                    if node.is_marker() {
+                                        ui.label(format!(
+                                            "Marker kind: {}",
+                                            Self::scn_marker_kind(&node.name)
+                                        ));
+                                    }
+
+                                    let script_matches = Self::scn_script_matches(
+                                        &self.scn_script_summary,
+                                        &node.name,
+                                    );
+
+                                    if !script_matches.is_empty() {
+                                        ui.separator();
+                                        ui.heading("Companion script bindings");
+                                        ui.separator();
+
+                                        for (script_path, script_node) in script_matches {
+                                            let title = script_path
+                                                .file_name()
+                                                .map(|name| name.to_string_lossy().to_string())
+                                                .unwrap_or_else(|| script_path.display().to_string());
+
+                                            egui::CollapsingHeader::new(title)
+                                                .default_open(true)
+                                                .show(ui, |ui| {
+                                                    if let Some(animation) =
+                                                        script_node.animation.as_deref()
+                                                    {
+                                                        ui.label(format!(
+                                                            "Animation index: {}",
+                                                            animation
+                                                        ));
+                                                    }
+
+                                                    for step in &script_node.steps {
+                                                        ui.monospace(step);
+                                                    }
+                                                });
+                                        }
+                                    }
+                                }
+                            } else if let Some(selected_chunk_index) = self.selected_scn_chunk {
+                                if let Some(chunk) = scn.mesh_chunks.get(selected_chunk_index) {
+                                    ui.label("Type: Embedded mesh chunk");
+                                    ui.label(format!("Chunk index: {}", selected_chunk_index));
+                                    ui.label(format!("Entry index: {}", chunk.entry_index));
+                                    ui.label(format!("Entry offset: 0x{:08X}", chunk.entry_offset));
+                                    ui.label(format!("Record kind: {}", chunk.record_kind));
+                                    ui.label(format!("Vertices: {}", chunk.vertex_count));
+                                    ui.label(format!("Indices: {}", chunk.index_count));
+                                    ui.label(format!("Texture spans: {}", chunk.texture_spans.len()));
+
+                                    if let Some(transform_index) = chunk.transform_index {
+                                        ui.label(format!("Transform index: {}", transform_index));
+                                    } else {
+                                        ui.label("Transform index: none");
+                                    }
+
+                                    if !chunk.texture_names.is_empty() {
+                                        ui.separator();
+                                        ui.heading("Chunk textures");
+                                        ui.separator();
+
+                                        for name in &chunk.texture_names {
+                                            ui.monospace(name);
+                                        }
+                                    }
+
+                                    let referenced_nodes: Vec<_> = scn
+                                        .nodes
+                                        .iter()
+                                        .filter(|node| node.record_offset == chunk.entry_offset)
+                                        .collect();
+
+                                    if !referenced_nodes.is_empty() {
+                                        ui.separator();
+                                        ui.heading("Nodes sharing this record");
+                                        ui.separator();
+
+                                        for node in referenced_nodes {
+                                            let display_name = if node.name.trim().is_empty() {
+                                                "(unnamed)"
+                                            } else {
+                                                node.name.as_str()
+                                            };
+
+                                            ui.monospace(format!(
+                                                "#{:04}  {:<22}  {:<12}",
+                                                node.index,
+                                                display_name,
+                                                node.archetype_label()
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
                         } else if let Some(err) = &self.scn_error {
                             ui.colored_label(
                                 egui::Color32::RED,
@@ -2770,7 +3322,7 @@ impl eframe::App for ModToolApp {
                             ui.label("SCN selected, but no scene info is loaded.");
                         }
                     }
-                
+
                     Some("geo") | Some("anm") => {
                         let loaded_geo_path = self.geo_loaded_path.clone();
                         let show_animations = self

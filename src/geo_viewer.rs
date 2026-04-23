@@ -126,6 +126,19 @@ struct CpuPart {
     record_kind: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SceneSelection {
+    Node(usize),
+    MeshChunk(usize),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScenePickTarget {
+    selection: SceneSelection,
+    center: [f32; 3],
+    radius: f32,
+}
+
 #[allow(dead_code)]
 struct CpuScene {
     key: String,
@@ -137,6 +150,7 @@ struct CpuScene {
     bone_lines: Vec<LineVertex>,
     center: [f32; 3],
     radius: f32,
+    pick_targets: Vec<ScenePickTarget>,
 }
 
 struct GpuPart {
@@ -301,7 +315,7 @@ pub fn draw_geo_viewer(
         rect,
         GeoGpuCallback {
             rect,
-            scene,
+            scene: scene.clone(),
             yaw: state.yaw,
             pitch: state.pitch,
             eye: state.eye,
@@ -348,7 +362,8 @@ pub fn draw_scene_viewer(
     embedded_textures: &HashMap<String, DdsPreview>,
     state: &mut GeoViewerState,
     viewer_height: f32,
-) {
+    selected: Option<SceneSelection>,
+) -> Option<SceneSelection> {
     ui.horizontal(|ui| {
         if ui.button("Reset view").clicked() {
             reset_scene_viewer(state, scn);
@@ -362,13 +377,12 @@ pub fn draw_scene_viewer(
         ui.checkbox(&mut state.cull_backfaces, "Cull");
 
         ui.separator();
-        ui.add(
-            egui::Slider::new(&mut state.move_speed, 0.1..=20.0)
-                .text("Fly speed"),
-        );
+        ui.add(egui::Slider::new(&mut state.move_speed, 0.1..=20.0).text("Fly speed"));
 
         ui.separator();
-        ui.small("SCN 3D: RMB look | Ctrl+LMB look | MMB pan | wheel dolly | WASD fly | Q/E up/down");
+        ui.small(
+            "SCN 3D: RMB look | Ctrl+LMB look | MMB pan | wheel dolly | WASD fly | Q/E up/down",
+        );
     });
 
     let desired_height = viewer_height.clamp(260.0, 900.0);
@@ -416,14 +430,32 @@ pub fn draw_scene_viewer(
     }
 
     let Some(scene) = state.cpu_scene.clone() else {
-        return;
+        return None;
     };
+
+    let pick_view_proj = make_view_proj(
+        rect.width().round().max(1.0) as u32,
+        rect.height().round().max(1.0) as u32,
+        state.yaw,
+        state.pitch,
+        state.eye,
+        &scene,
+    );
+
+    let pointer_pick =
+        if !ui.input(|i| i.modifiers.ctrl) && response.clicked_by(egui::PointerButton::Primary) {
+            response.interact_pointer_pos().and_then(|pointer_pos| {
+                pick_scene_target(&scene, rect, pick_view_proj, state.eye, pointer_pos)
+            })
+        } else {
+            None
+        };
 
     let callback = egui_wgpu::Callback::new_paint_callback(
         rect,
         GeoGpuCallback {
             rect,
-            scene,
+            scene: scene.clone(),
             yaw: state.yaw,
             pitch: state.pitch,
             eye: state.eye,
@@ -438,6 +470,12 @@ pub fn draw_scene_viewer(
     );
 
     painter.add(callback);
+
+    if let Some(selection) = selected {
+        paint_scene_selection_overlay(&painter, rect, pick_view_proj, state.eye, &scene, selection);
+    }
+
+    pointer_pick
 }
 
 impl egui_wgpu::CallbackTrait for GeoGpuCallback {
@@ -463,7 +501,11 @@ impl egui_wgpu::CallbackTrait for GeoGpuCallback {
             .expect("GpuShared should exist");
 
         let gpu_scene = if let Some(scene) = shared.scenes.get(&self.scene.key) {
-            if let Some(index) = shared.scene_lru.iter().position(|key| key == &self.scene.key) {
+            if let Some(index) = shared
+                .scene_lru
+                .iter()
+                .position(|key| key == &self.scene.key)
+            {
                 shared.scene_lru.remove(index);
             }
             shared.scene_lru.push_back(self.scene.key.clone());
@@ -477,7 +519,9 @@ impl egui_wgpu::CallbackTrait for GeoGpuCallback {
             }
 
             let uploaded = Arc::new(upload_scene(device, queue, shared, &self.scene));
-            shared.scenes.insert(self.scene.key.clone(), uploaded.clone());
+            shared
+                .scenes
+                .insert(self.scene.key.clone(), uploaded.clone());
             shared.scene_lru.push_back(self.scene.key.clone());
             uploaded
         };
@@ -489,7 +533,10 @@ impl egui_wgpu::CallbackTrait for GeoGpuCallback {
             .round()
             .max(1.0) as u32;
 
-        let mut frame_guard = self.frame_targets.lock().expect("frame target mutex poisoned");
+        let mut frame_guard = self
+            .frame_targets
+            .lock()
+            .expect("frame target mutex poisoned");
         let recreate = frame_guard
             .as_ref()
             .map(|f| f.width != width || f.height != height)
@@ -499,14 +546,7 @@ impl egui_wgpu::CallbackTrait for GeoGpuCallback {
         }
         let frame = frame_guard.as_ref().expect("frame targets should exist");
 
-        let view_proj = make_view_proj(
-            width,
-            height,
-            self.yaw,
-            self.pitch,
-            self.eye,
-            &self.scene,
-        );
+        let view_proj = make_view_proj(width, height, self.yaw, self.pitch, self.eye, &self.scene);
         let globals = Globals {
             view_proj: view_proj.to_cols_array_2d(),
             light_dir: normalize4([-0.20, 0.90, -0.35, 0.0]),
@@ -1284,14 +1324,15 @@ fn build_cpu_scene(
     let ground_lines = build_ground_lines(geo, center, radius);
     let wire_lines = build_wire_lines_from_positions(&positions, &geo.faces);
     let helper_wire_lines = Vec::new();
-    let bone_lines = if let (Some(skeleton), Some(pose)) = (geo.skeleton.as_ref(), sampled_pose.as_ref()) {
-        build_animated_bone_lines(skeleton, &pose.world_matrices)
-    } else {
-        geo.skeleton
-            .as_ref()
-            .map(build_bone_lines)
-            .unwrap_or_default()
-    };
+    let bone_lines =
+        if let (Some(skeleton), Some(pose)) = (geo.skeleton.as_ref(), sampled_pose.as_ref()) {
+            build_animated_bone_lines(skeleton, &pose.world_matrices)
+        } else {
+            geo.skeleton
+                .as_ref()
+                .map(build_bone_lines)
+                .unwrap_or_default()
+        };
 
     Arc::new(CpuScene {
         key,
@@ -1303,6 +1344,7 @@ fn build_cpu_scene(
         bone_lines,
         center,
         radius,
+        pick_targets: Vec::new(),
     })
 }
 
@@ -1401,16 +1443,14 @@ fn sample_rigid_pose(
     let mut local_matrices = vec![Mat4::IDENTITY; skeleton.bone_count];
 
     for bone_index in 0..skeleton.bone_count {
-        let bind_local = if let Some(parent_index) =
-            skeleton.parent.get(bone_index).and_then(|p| *p)
-        {
-            bind_world[parent_index].inverse() * bind_world[bone_index]
-        } else {
-            bind_world[bone_index]
-        };
+        let bind_local =
+            if let Some(parent_index) = skeleton.parent.get(bone_index).and_then(|p| *p) {
+                bind_world[parent_index].inverse() * bind_world[bone_index]
+            } else {
+                bind_world[bone_index]
+            };
 
-        let (scale, bind_rotation, translation) =
-            bind_local.to_scale_rotation_translation();
+        let (scale, bind_rotation, translation) = bind_local.to_scale_rotation_translation();
 
         let final_rotation = sampled_rotations[bone_index]
             .map(|sampled| bind_rotation * sampled)
@@ -1423,8 +1463,7 @@ fn sample_rigid_pose(
     let mut world_matrices = vec![Mat4::IDENTITY; skeleton.bone_count];
     for bone_index in 0..skeleton.bone_count {
         if let Some(parent_index) = skeleton.parent.get(bone_index).and_then(|p| *p) {
-            world_matrices[bone_index] =
-                world_matrices[parent_index] * local_matrices[bone_index];
+            world_matrices[bone_index] = world_matrices[parent_index] * local_matrices[bone_index];
         } else {
             world_matrices[bone_index] = local_matrices[bone_index];
         }
@@ -1442,10 +1481,7 @@ fn sample_rigid_pose(
     })
 }
 
-fn should_offset_stream_indices_by_one(
-    skeleton: &GeoSkeleton,
-    clip: &RigidAnimClip,
-) -> bool {
+fn should_offset_stream_indices_by_one(skeleton: &GeoSkeleton, clip: &RigidAnimClip) -> bool {
     if skeleton.bone_count <= 1 {
         return false;
     }
@@ -1517,10 +1553,7 @@ fn normalized_stream_rotations_for_pose(
     resample_quat_track_len(&samples, target_len)
 }
 
-fn collapse_adjacent_duplicate_quats(
-    samples: &[[f32; 4]],
-    epsilon: f32,
-) -> Vec<[f32; 4]> {
+fn collapse_adjacent_duplicate_quats(samples: &[[f32; 4]], epsilon: f32) -> Vec<[f32; 4]> {
     let mut out = Vec::new();
 
     for &q in samples {
@@ -1550,11 +1583,15 @@ fn canonicalize_quat_sign(mut q: [f32; 4]) -> [f32; 4] {
 }
 
 fn quat_distance_sq(a: [f32; 4], b: [f32; 4]) -> f32 {
-    let direct =
-        (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2) + (a[3] - b[3]).powi(2);
+    let direct = (a[0] - b[0]).powi(2)
+        + (a[1] - b[1]).powi(2)
+        + (a[2] - b[2]).powi(2)
+        + (a[3] - b[3]).powi(2);
 
-    let negated =
-        (a[0] + b[0]).powi(2) + (a[1] + b[1]).powi(2) + (a[2] + b[2]).powi(2) + (a[3] + b[3]).powi(2);
+    let negated = (a[0] + b[0]).powi(2)
+        + (a[1] + b[1]).powi(2)
+        + (a[2] + b[2]).powi(2)
+        + (a[3] + b[3]).powi(2);
 
     direct.min(negated)
 }
@@ -1612,8 +1649,16 @@ fn build_animated_mesh_vertices(
     let mut normals = Vec::with_capacity(geo.normals.len());
 
     for vertex_index in 0..geo.verts.len() {
-        let src_pos = geo.verts.get(vertex_index).copied().unwrap_or([0.0, 0.0, 0.0]);
-        let src_nrm = geo.normals.get(vertex_index).copied().unwrap_or([0.0, 1.0, 0.0]);
+        let src_pos = geo
+            .verts
+            .get(vertex_index)
+            .copied()
+            .unwrap_or([0.0, 0.0, 0.0]);
+        let src_nrm = geo
+            .normals
+            .get(vertex_index)
+            .copied()
+            .unwrap_or([0.0, 1.0, 0.0]);
 
         let src_pos = Vec3::new(src_pos[0], src_pos[1], src_pos[2]);
         let src_nrm = Vec3::new(src_nrm[0], src_nrm[1], src_nrm[2]);
@@ -1664,19 +1709,22 @@ fn build_animated_bone_lines(skeleton: &GeoSkeleton, world_matrices: &[Mat4]) ->
 
     let mut out = Vec::new();
     for (bone_index, parent) in skeleton.parent.iter().enumerate() {
-        let Some(parent_index) = *parent else { continue; };
-        let Some(&a) = points.get(parent_index) else { continue; };
-        let Some(&b) = points.get(bone_index) else { continue; };
+        let Some(parent_index) = *parent else {
+            continue;
+        };
+        let Some(&a) = points.get(parent_index) else {
+            continue;
+        };
+        let Some(&b) = points.get(bone_index) else {
+            continue;
+        };
         out.push(LineVertex { position: a, color });
         out.push(LineVertex { position: b, color });
     }
     out
 }
 
-fn build_wire_lines_from_positions(
-    positions: &[[f32; 3]],
-    faces: &[[u16; 3]],
-) -> Vec<LineVertex> {
+fn build_wire_lines_from_positions(positions: &[[f32; 3]], faces: &[[u16; 3]]) -> Vec<LineVertex> {
     let color = [120.0 / 255.0, 220.0 / 255.0, 1.0, 1.0];
     let mut out = Vec::with_capacity(faces.len() * 6);
 
@@ -1685,9 +1733,15 @@ fn build_wire_lines_from_positions(
         let ib = face[1] as usize;
         let ic = face[2] as usize;
 
-        let Some(&a_raw) = positions.get(ia) else { continue; };
-        let Some(&b_raw) = positions.get(ib) else { continue; };
-        let Some(&c_raw) = positions.get(ic) else { continue; };
+        let Some(&a_raw) = positions.get(ia) else {
+            continue;
+        };
+        let Some(&b_raw) = positions.get(ib) else {
+            continue;
+        };
+        let Some(&c_raw) = positions.get(ic) else {
+            continue;
+        };
 
         let a = to_view_space(a_raw);
         let b = to_view_space(b_raw);
@@ -1737,6 +1791,7 @@ fn build_cpu_scene_from_scn(
     let mut wire_lines = Vec::new();
     let mut helper_wire_lines = Vec::new();
     let mut marker_lines = Vec::new();
+    let mut pick_targets = Vec::new();
 
     let mut have_bounds = false;
     let mut min = [0.0f32; 3];
@@ -1757,14 +1812,16 @@ fn build_cpu_scene_from_scn(
         }
     };
 
-    for chunk in &scn.mesh_chunks {
+    for (chunk_index, chunk) in scn.mesh_chunks.iter().enumerate() {
         append_scn_chunk_mesh(
+            chunk_index,
             chunk,
             embedded_textures,
             &mut vertices,
             &mut parts,
             &mut wire_lines,
             &mut helper_wire_lines,
+            &mut pick_targets,
             &mut update_bounds,
         );
     }
@@ -1774,7 +1831,13 @@ fn build_cpu_scene_from_scn(
         update_bounds(marker_pos);
 
         if node.is_marker() {
-            append_scene_marker_lines(&mut marker_lines, marker_pos, 75.0);
+            let (marker_color, marker_size) = scene_marker_style(&node.name);
+            append_scene_marker_lines(&mut marker_lines, marker_pos, marker_size, marker_color);
+            pick_targets.push(ScenePickTarget {
+                selection: SceneSelection::Node(node.index),
+                center: marker_pos,
+                radius: marker_size,
+            });
             continue;
         }
 
@@ -1810,9 +1873,26 @@ fn build_cpu_scene_from_scn(
             update_bounds(view_pos);
         }
 
+        if let Some((instance_center, instance_radius)) = bounds_from_points(&instance_positions) {
+            pick_targets.push(ScenePickTarget {
+                selection: SceneSelection::Node(node.index),
+                center: instance_center,
+                radius: instance_radius.max(45.0),
+            });
+        } else {
+            pick_targets.push(ScenePickTarget {
+                selection: SceneSelection::Node(node.index),
+                center: marker_pos,
+                radius: 75.0,
+            });
+        }
+
         if geo.subsets.is_empty() {
             let part_class = if model_is_helper
-                || geo.texture_names.iter().any(|name| is_shadow_like_name(name))
+                || geo
+                    .texture_names
+                    .iter()
+                    .any(|name| is_shadow_like_name(name))
             {
                 PartClass::Helper
             } else {
@@ -1833,17 +1913,41 @@ fn build_cpu_scene_from_scn(
                 let ib = face[1] as usize;
                 let ic = face[2] as usize;
 
-                let Some(&a) = instance_positions.get(ia) else { continue; };
-                let Some(&b) = instance_positions.get(ib) else { continue; };
-                let Some(&c) = instance_positions.get(ic) else { continue; };
+                let Some(&a) = instance_positions.get(ia) else {
+                    continue;
+                };
+                let Some(&b) = instance_positions.get(ib) else {
+                    continue;
+                };
+                let Some(&c) = instance_positions.get(ic) else {
+                    continue;
+                };
 
                 if draw_wire {
-                    wire_lines.push(LineVertex { position: a, color: line_color });
-                    wire_lines.push(LineVertex { position: b, color: line_color });
-                    wire_lines.push(LineVertex { position: b, color: line_color });
-                    wire_lines.push(LineVertex { position: c, color: line_color });
-                    wire_lines.push(LineVertex { position: c, color: line_color });
-                    wire_lines.push(LineVertex { position: a, color: line_color });
+                    wire_lines.push(LineVertex {
+                        position: a,
+                        color: line_color,
+                    });
+                    wire_lines.push(LineVertex {
+                        position: b,
+                        color: line_color,
+                    });
+                    wire_lines.push(LineVertex {
+                        position: b,
+                        color: line_color,
+                    });
+                    wire_lines.push(LineVertex {
+                        position: c,
+                        color: line_color,
+                    });
+                    wire_lines.push(LineVertex {
+                        position: c,
+                        color: line_color,
+                    });
+                    wire_lines.push(LineVertex {
+                        position: a,
+                        color: line_color,
+                    });
                 }
             }
 
@@ -1885,17 +1989,41 @@ fn build_cpu_scene_from_scn(
                     let ib = face[1] as usize;
                     let ic = face[2] as usize;
 
-                    let Some(&a) = instance_positions.get(ia) else { continue; };
-                    let Some(&b) = instance_positions.get(ib) else { continue; };
-                    let Some(&c) = instance_positions.get(ic) else { continue; };
+                    let Some(&a) = instance_positions.get(ia) else {
+                        continue;
+                    };
+                    let Some(&b) = instance_positions.get(ib) else {
+                        continue;
+                    };
+                    let Some(&c) = instance_positions.get(ic) else {
+                        continue;
+                    };
 
                     if draw_wire {
-                        wire_lines.push(LineVertex { position: a, color: line_color });
-                        wire_lines.push(LineVertex { position: b, color: line_color });
-                        wire_lines.push(LineVertex { position: b, color: line_color });
-                        wire_lines.push(LineVertex { position: c, color: line_color });
-                        wire_lines.push(LineVertex { position: c, color: line_color });
-                        wire_lines.push(LineVertex { position: a, color: line_color });
+                        wire_lines.push(LineVertex {
+                            position: a,
+                            color: line_color,
+                        });
+                        wire_lines.push(LineVertex {
+                            position: b,
+                            color: line_color,
+                        });
+                        wire_lines.push(LineVertex {
+                            position: b,
+                            color: line_color,
+                        });
+                        wire_lines.push(LineVertex {
+                            position: c,
+                            color: line_color,
+                        });
+                        wire_lines.push(LineVertex {
+                            position: c,
+                            color: line_color,
+                        });
+                        wire_lines.push(LineVertex {
+                            position: a,
+                            color: line_color,
+                        });
                     }
                 }
 
@@ -1952,16 +2080,19 @@ fn build_cpu_scene_from_scn(
         bone_lines: marker_lines,
         center,
         radius,
+        pick_targets,
     })
 }
 
 fn append_scn_chunk_mesh<F: FnMut([f32; 3])>(
+    chunk_index: usize,
     chunk: &ScnMeshChunk,
     embedded_textures: &HashMap<String, DdsPreview>,
     vertices: &mut Vec<MeshVertex>,
     parts: &mut Vec<CpuPart>,
     wire_lines: &mut Vec<LineVertex>,
     _helper_wire_lines: &mut Vec<LineVertex>,
+    pick_targets: &mut Vec<ScenePickTarget>,
     update_bounds: &mut F,
 ) {
     let part_class = if chunk
@@ -2007,6 +2138,14 @@ fn append_scn_chunk_mesh<F: FnMut([f32; 3])>(
         update_bounds(view_pos);
     }
 
+    if let Some((chunk_center, chunk_radius)) = bounds_from_points(&chunk_positions) {
+        pick_targets.push(ScenePickTarget {
+            selection: SceneSelection::MeshChunk(chunk_index),
+            center: chunk_center,
+            radius: chunk_radius.max(35.0),
+        });
+    }
+
     let mut part_indices = Vec::with_capacity(chunk.indices.len());
 
     for tri in chunk.indices.chunks_exact(3) {
@@ -2018,17 +2157,41 @@ fn append_scn_chunk_mesh<F: FnMut([f32; 3])>(
         part_indices.push(base_vertex + tri[1]);
         part_indices.push(base_vertex + tri[2]);
 
-        let Some(&a) = chunk_positions.get(ia) else { continue; };
-        let Some(&b) = chunk_positions.get(ib) else { continue; };
-        let Some(&c) = chunk_positions.get(ic) else { continue; };
+        let Some(&a) = chunk_positions.get(ia) else {
+            continue;
+        };
+        let Some(&b) = chunk_positions.get(ib) else {
+            continue;
+        };
+        let Some(&c) = chunk_positions.get(ic) else {
+            continue;
+        };
 
         if draw_wire {
-            wire_lines.push(LineVertex { position: a, color: line_color });
-            wire_lines.push(LineVertex { position: b, color: line_color });
-            wire_lines.push(LineVertex { position: b, color: line_color });
-            wire_lines.push(LineVertex { position: c, color: line_color });
-            wire_lines.push(LineVertex { position: c, color: line_color });
-            wire_lines.push(LineVertex { position: a, color: line_color });
+            wire_lines.push(LineVertex {
+                position: a,
+                color: line_color,
+            });
+            wire_lines.push(LineVertex {
+                position: b,
+                color: line_color,
+            });
+            wire_lines.push(LineVertex {
+                position: b,
+                color: line_color,
+            });
+            wire_lines.push(LineVertex {
+                position: c,
+                color: line_color,
+            });
+            wire_lines.push(LineVertex {
+                position: c,
+                color: line_color,
+            });
+            wire_lines.push(LineVertex {
+                position: a,
+                color: line_color,
+            });
         }
     }
 
@@ -2248,9 +2411,32 @@ fn scn_frame_distance(scn: &ScnFile) -> f32 {
     }
 }
 
-fn append_scene_marker_lines(out: &mut Vec<LineVertex>, pos: [f32; 3], half: f32) {
-    let color = [1.0, 0.92, 0.35, 1.0];
+fn scene_marker_style(name: &str) -> ([f32; 4], f32) {
+    let lower = name.trim().to_ascii_lowercase();
 
+    if lower == "player_start" {
+        ([110.0 / 255.0, 1.0, 140.0 / 255.0, 1.0], 150.0)
+    } else if lower == "player_end" {
+        ([190.0 / 255.0, 1.0, 110.0 / 255.0, 1.0], 140.0)
+    } else if lower.starts_with("checkpoint") {
+        ([1.0, 145.0 / 255.0, 70.0 / 255.0, 1.0], 130.0)
+    } else if lower.starts_with("path") || lower.starts_with("lane") {
+        ([90.0 / 255.0, 210.0 / 255.0, 1.0, 1.0], 110.0)
+    } else if lower.starts_with("gay")
+        || lower.starts_with("cyclist")
+        || lower.starts_with("vicky")
+        || lower.starts_with("dafydd")
+        || lower.starts_with("myfanwy")
+    {
+        ([1.0, 120.0 / 255.0, 190.0 / 255.0, 1.0], 120.0)
+    } else if lower.starts_with("car_") || lower.starts_with("dec_car_") {
+        ([1.0, 95.0 / 255.0, 95.0 / 255.0, 1.0], 100.0)
+    } else {
+        ([1.0, 0.92, 0.35, 1.0], 75.0)
+    }
+}
+
+fn append_scene_marker_lines(out: &mut Vec<LineVertex>, pos: [f32; 3], half: f32, color: [f32; 4]) {
     out.push(LineVertex {
         position: [pos[0] - half, pos[1], pos[2]],
         color,
@@ -2279,11 +2465,170 @@ fn append_scene_marker_lines(out: &mut Vec<LineVertex>, pos: [f32; 3], half: f32
     });
 }
 
-fn build_ground_lines_for_bounds(
-    center: [f32; 3],
-    _radius: f32,
-    ground_y: f32,
-) -> Vec<LineVertex> {
+fn bounds_from_points(points: &[[f32; 3]]) -> Option<([f32; 3], f32)> {
+    let &first = points.first()?;
+    let mut min = first;
+    let mut max = first;
+
+    for &p in points.iter().skip(1) {
+        min[0] = min[0].min(p[0]);
+        min[1] = min[1].min(p[1]);
+        min[2] = min[2].min(p[2]);
+        max[0] = max[0].max(p[0]);
+        max[1] = max[1].max(p[1]);
+        max[2] = max[2].max(p[2]);
+    }
+
+    let center = [
+        (min[0] + max[0]) * 0.5,
+        (min[1] + max[1]) * 0.5,
+        (min[2] + max[2]) * 0.5,
+    ];
+
+    let mut radius: f32 = 0.0;
+    for &p in points {
+        radius = radius.max(length3(sub3(p, center)));
+    }
+
+    Some((center, radius.max(1.0)))
+}
+
+fn scene_pick_target(scene: &CpuScene, selection: SceneSelection) -> Option<&ScenePickTarget> {
+    scene
+        .pick_targets
+        .iter()
+        .find(|target| target.selection == selection)
+}
+
+fn project_scene_point(rect: Rect, view_proj: Mat4, point: [f32; 3]) -> Option<(egui::Pos2, f32)> {
+    let clip = view_proj * Vec3::from_array(point).extend(1.0);
+    if clip.w <= 1.0e-6 {
+        return None;
+    }
+
+    let ndc = clip.truncate() / clip.w;
+    if ndc.x < -1.05
+        || ndc.x > 1.05
+        || ndc.y < -1.05
+        || ndc.y > 1.05
+        || ndc.z < -1.05
+        || ndc.z > 1.05
+    {
+        return None;
+    }
+
+    let x = rect.left() + (ndc.x * 0.5 + 0.5) * rect.width();
+    let y = rect.top() + (1.0 - (ndc.y * 0.5 + 0.5)) * rect.height();
+    Some((egui::pos2(x, y), ndc.z))
+}
+
+fn projected_pick_radius(
+    rect: Rect,
+    distance: f32,
+    world_radius: f32,
+    selection: SceneSelection,
+) -> f32 {
+    let fov_y = 55.0_f32.to_radians();
+    let pixels_per_world =
+        rect.height() / (2.0 * distance.max(NEAR_PLANE + 0.01) * (fov_y * 0.5).tan());
+    let base_radius = world_radius * pixels_per_world;
+
+    match selection {
+        SceneSelection::Node(_) => base_radius.clamp(12.0, 120.0),
+        SceneSelection::MeshChunk(_) => base_radius.clamp(10.0, 72.0),
+    }
+}
+
+fn pick_scene_target(
+    scene: &CpuScene,
+    rect: Rect,
+    view_proj: Mat4,
+    eye: [f32; 3],
+    pointer_pos: egui::Pos2,
+) -> Option<SceneSelection> {
+    let eye = arr_to_vec3(eye);
+    let mut best: Option<(u8, f32, f32, SceneSelection)> = None;
+
+    for target in &scene.pick_targets {
+        let Some((screen_pos, _depth)) = project_scene_point(rect, view_proj, target.center) else {
+            continue;
+        };
+
+        let world_distance = (arr_to_vec3(target.center) - eye).length();
+        let screen_radius =
+            projected_pick_radius(rect, world_distance, target.radius, target.selection);
+        let pointer_distance = pointer_pos.distance(screen_pos);
+
+        if pointer_distance > screen_radius {
+            continue;
+        }
+
+        let priority = match target.selection {
+            SceneSelection::Node(_) => 0,
+            SceneSelection::MeshChunk(_) => 1,
+        };
+        let normalized_distance = pointer_distance / screen_radius.max(1.0);
+
+        let should_replace = best
+            .map(|(best_priority, best_distance, best_norm, _)| {
+                priority < best_priority
+                    || (priority == best_priority
+                        && (world_distance < best_distance - 0.5
+                            || ((world_distance - best_distance).abs() <= 0.5
+                                && normalized_distance < best_norm)))
+            })
+            .unwrap_or(true);
+
+        if should_replace {
+            best = Some((
+                priority,
+                world_distance,
+                normalized_distance,
+                target.selection,
+            ));
+        }
+    }
+
+    best.map(|(_, _, _, selection)| selection)
+}
+
+fn paint_scene_selection_overlay(
+    painter: &egui::Painter,
+    rect: Rect,
+    view_proj: Mat4,
+    eye: [f32; 3],
+    scene: &CpuScene,
+    selection: SceneSelection,
+) {
+    let Some(target) = scene_pick_target(scene, selection) else {
+        return;
+    };
+    let Some((screen_pos, _depth)) = project_scene_point(rect, view_proj, target.center) else {
+        return;
+    };
+
+    let highlight_color = match selection {
+        SceneSelection::Node(_) => Color32::from_rgb(255, 214, 92),
+        SceneSelection::MeshChunk(_) => Color32::from_rgb(116, 220, 255),
+    };
+    let world_distance = (arr_to_vec3(target.center) - arr_to_vec3(eye)).length();
+    let screen_radius =
+        projected_pick_radius(rect, world_distance, target.radius, selection).clamp(10.0, 48.0);
+
+    painter.circle_stroke(
+        screen_pos,
+        screen_radius,
+        egui::Stroke::new(2.5, highlight_color),
+    );
+    painter.circle_stroke(
+        screen_pos,
+        screen_radius + 4.0,
+        egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 180)),
+    );
+    painter.circle_filled(screen_pos, 3.0, highlight_color);
+}
+
+fn build_ground_lines_for_bounds(center: [f32; 3], _radius: f32, ground_y: f32) -> Vec<LineVertex> {
     let mut out = Vec::new();
 
     const GRID_HALF: f32 = 100.0;
@@ -2297,7 +2642,11 @@ fn build_ground_lines_for_bounds(
 
     let mut x = -GRID_HALF;
     while x <= GRID_HALF + 0.5 * GRID_STEP {
-        let color = if x.abs() < GRID_STEP * 0.5 { major } else { minor };
+        let color = if x.abs() < GRID_STEP * 0.5 {
+            major
+        } else {
+            minor
+        };
 
         let a = [center_x + x, ground_y, center_z - GRID_HALF];
         let b = [center_x + x, ground_y, center_z + GRID_HALF];
@@ -2310,7 +2659,11 @@ fn build_ground_lines_for_bounds(
 
     let mut z = -GRID_HALF;
     while z <= GRID_HALF + 0.5 * GRID_STEP {
-        let color = if z.abs() < GRID_STEP * 0.5 { major } else { minor };
+        let color = if z.abs() < GRID_STEP * 0.5 {
+            major
+        } else {
+            minor
+        };
 
         let a = [center_x - GRID_HALF, ground_y, center_z + z];
         let b = [center_x + GRID_HALF, ground_y, center_z + z];
@@ -2347,9 +2700,15 @@ fn build_wire_lines(geo: &GeoFile) -> Vec<LineVertex> {
         let ia = face[0] as usize;
         let ib = face[1] as usize;
         let ic = face[2] as usize;
-        let Some(&a_raw) = geo.verts.get(ia) else { continue; };
-        let Some(&b_raw) = geo.verts.get(ib) else { continue; };
-        let Some(&c_raw) = geo.verts.get(ic) else { continue; };
+        let Some(&a_raw) = geo.verts.get(ia) else {
+            continue;
+        };
+        let Some(&b_raw) = geo.verts.get(ib) else {
+            continue;
+        };
+        let Some(&c_raw) = geo.verts.get(ic) else {
+            continue;
+        };
         let a = to_view_space(a_raw);
         let b = to_view_space(b_raw);
         let c = to_view_space(c_raw);
@@ -2380,7 +2739,11 @@ fn build_ground_lines(geo: &GeoFile, center: [f32; 3], _radius: f32) -> Vec<Line
 
     let mut x = -GRID_HALF;
     while x <= GRID_HALF + 0.5 * GRID_STEP {
-        let color = if x.abs() < GRID_STEP * 0.5 { major } else { minor };
+        let color = if x.abs() < GRID_STEP * 0.5 {
+            major
+        } else {
+            minor
+        };
 
         let a = [center_x + x, ground_y, center_z - GRID_HALF];
         let b = [center_x + x, ground_y, center_z + GRID_HALF];
@@ -2393,7 +2756,11 @@ fn build_ground_lines(geo: &GeoFile, center: [f32; 3], _radius: f32) -> Vec<Line
 
     let mut z = -GRID_HALF;
     while z <= GRID_HALF + 0.5 * GRID_STEP {
-        let color = if z.abs() < GRID_STEP * 0.5 { major } else { minor };
+        let color = if z.abs() < GRID_STEP * 0.5 {
+            major
+        } else {
+            minor
+        };
 
         let a = [center_x - GRID_HALF, ground_y, center_z + z];
         let b = [center_x + GRID_HALF, ground_y, center_z + z];
@@ -2417,9 +2784,15 @@ fn build_bone_lines(skeleton: &GeoSkeleton) -> Vec<LineVertex> {
 
     let mut out = Vec::new();
     for (bone_index, parent) in skeleton.parent.iter().enumerate() {
-        let Some(parent_index) = *parent else { continue; };
-        let Some(&a) = points.get(parent_index) else { continue; };
-        let Some(&b) = points.get(bone_index) else { continue; };
+        let Some(parent_index) = *parent else {
+            continue;
+        };
+        let Some(&a) = points.get(parent_index) else {
+            continue;
+        };
+        let Some(&b) = points.get(bone_index) else {
+            continue;
+        };
         out.push(LineVertex { position: a, color });
         out.push(LineVertex { position: b, color });
     }
@@ -2428,8 +2801,12 @@ fn build_bone_lines(skeleton: &GeoSkeleton) -> Vec<LineVertex> {
 
 fn camera_axes(yaw: f32, pitch: f32) -> (Vec3, Vec3, Vec3) {
     let pitch = pitch.clamp(-1.10, 1.10);
-    let forward =
-        Vec3::new(yaw.sin() * pitch.cos(), pitch.sin(), yaw.cos() * pitch.cos()).normalize();
+    let forward = Vec3::new(
+        yaw.sin() * pitch.cos(),
+        pitch.sin(),
+        yaw.cos() * pitch.cos(),
+    )
+    .normalize();
     let right = forward.cross(Vec3::Y).normalize_or_zero();
     let up = right.cross(forward).normalize_or_zero();
     (forward, right, up)
@@ -2448,11 +2825,7 @@ fn eye_from_target(yaw: f32, pitch: f32, distance: f32, target: [f32; 3]) -> [f3
     vec3_to_arr(arr_to_vec3(target) - forward * distance.max(NEAR_PLANE + 0.01))
 }
 
-fn orbit_eye_around_target(
-    state: &mut GeoViewerState,
-    target: [f32; 3],
-    delta: Vec2,
-) {
+fn orbit_eye_around_target(state: &mut GeoViewerState, target: [f32; 3], delta: Vec2) {
     let current_distance = (arr_to_vec3(state.eye) - arr_to_vec3(target))
         .length()
         .max(NEAR_PLANE + 0.01);
@@ -2499,9 +2872,8 @@ fn apply_viewer_input(
         // Keep pan speed independent from fly speed.
         let pan_scale = (scene_radius * 0.00008).clamp(0.5, 1.0);
 
-        let eye = arr_to_vec3(state.eye)
-            + right * (-delta.x * pan_scale)
-            + up * (delta.y * pan_scale);
+        let eye =
+            arr_to_vec3(state.eye) + right * (-delta.x * pan_scale) + up * (delta.y * pan_scale);
 
         state.eye = vec3_to_arr(eye);
         ui.ctx().request_repaint();
@@ -2518,9 +2890,7 @@ fn apply_viewer_input(
             .max(scene_radius * 0.01)
             .clamp(2.0, 600.0);
 
-        let dt = ui
-            .input(|i| i.unstable_dt)
-            .clamp(1.0 / 240.0, 1.0 / 20.0);
+        let dt = ui.input(|i| i.unstable_dt).clamp(1.0 / 240.0, 1.0 / 20.0);
 
         let shift = ui.input(|i| i.modifiers.shift);
 
@@ -2693,9 +3063,7 @@ fn normalize3(v: [f32; 3]) -> [f32; 3] {
 fn is_shadow_like_name(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
 
-    n.contains("shadow")
-        || n.contains("blob")
-        || n.contains("decal")
+    n.contains("shadow") || n.contains("blob") || n.contains("decal")
 }
 
 const FACE_SHADER: &str = r#"
