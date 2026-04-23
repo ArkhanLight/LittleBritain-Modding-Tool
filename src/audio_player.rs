@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source};
-use std::{fs::File, io::Cursor, path::Path, time::Duration};
+use std::{fs::File, io::Cursor, path::Path, sync::Arc, time::Duration};
 
 pub struct AudioPlayer {
     _device_sink: MixerDeviceSink,
@@ -43,8 +43,11 @@ impl AudioPlayer {
         Ok(())
     }
 
-    pub fn play_data(&mut self, label: impl Into<String>, data: Vec<u8>) -> Result<()> {
-        let decoder = Decoder::try_from(Cursor::new(data))
+    pub fn play_data<T>(&mut self, label: impl Into<String>, data: T) -> Result<()>
+    where
+        T: Into<Arc<[u8]>>,
+    {
+        let decoder = Decoder::try_from(Cursor::new(data.into()))
             .context("Failed to decode in-memory audio")?;
 
         let duration = decoder.total_duration();

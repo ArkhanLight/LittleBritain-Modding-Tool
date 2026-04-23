@@ -1,7 +1,7 @@
 use crate::{
     anm::{RigidAnimClip, RigidAnimStream},
     dds_preview::DdsPreview,
-    geo::{GeoAssetType, GeoFile, GeoSkeleton},
+    geo::{GeoFile, GeoSkeleton},
     scn::{ScnFile, ScnMeshChunk},
 };
 use bytemuck::{Pod, Zeroable};
@@ -11,7 +11,7 @@ use eframe::{
 };
 use glam::{Mat4, Quat, Vec3};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -22,6 +22,7 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 const MAX_MATERIAL_LAYERS: usize = 8;
+const MAX_CACHED_GPU_SCENES: usize = 24;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -47,6 +48,7 @@ pub struct GeoViewerState {
 
     scene_key: Option<String>,
     cpu_scene: Option<Arc<CpuScene>>,
+    frame_targets: Arc<Mutex<Option<FrameTargets>>>,
 }
 
 impl Default for GeoViewerState {
@@ -66,6 +68,7 @@ impl Default for GeoViewerState {
             cull_backfaces: false,
             scene_key: None,
             cpu_scene: None,
+            frame_targets: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -183,6 +186,8 @@ struct GpuShared {
     texture_sampler: wgpu::Sampler,
     blit_sampler: wgpu::Sampler,
     scenes: HashMap<String, Arc<GpuScene>>,
+    scene_lru: VecDeque<String>,
+    fallback_white: Option<(wgpu::Texture, wgpu::TextureView)>,
 }
 
 struct GeoGpuCallback {
@@ -252,11 +257,9 @@ pub fn draw_geo_viewer(
 
     painter.rect_filled(rect, 0.0, Color32::from_rgb(30, 30, 34));
 
-    let scene_radius = geo_bounds(geo).1;
+    let (scene_center, scene_radius) = geo_bounds(geo);
     let min_distance = NEAR_PLANE + 0.01;
     let max_distance = (scene_radius * 6.0).max(25.0);
-
-    let scene_center = geo_bounds(geo).0;
     apply_viewer_input(
         ui,
         &response,
@@ -308,7 +311,7 @@ pub fn draw_geo_viewer(
             show_bones: state.show_bones,
             show_helpers: state.show_helpers,
             cull_backfaces: state.cull_backfaces,
-            frame_targets: Arc::new(Mutex::new(None)),
+            frame_targets: state.frame_targets.clone(),
         },
     );
 
@@ -430,7 +433,7 @@ pub fn draw_scene_viewer(
             show_bones: state.show_bones,
             show_helpers: state.show_helpers,
             cull_backfaces: state.cull_backfaces,
-            frame_targets: Arc::new(Mutex::new(None)),
+            frame_targets: state.frame_targets.clone(),
         },
     );
 
@@ -460,10 +463,22 @@ impl egui_wgpu::CallbackTrait for GeoGpuCallback {
             .expect("GpuShared should exist");
 
         let gpu_scene = if let Some(scene) = shared.scenes.get(&self.scene.key) {
+            if let Some(index) = shared.scene_lru.iter().position(|key| key == &self.scene.key) {
+                shared.scene_lru.remove(index);
+            }
+            shared.scene_lru.push_back(self.scene.key.clone());
             scene.clone()
         } else {
+            while shared.scenes.len() >= MAX_CACHED_GPU_SCENES {
+                let Some(evicted) = shared.scene_lru.pop_front() else {
+                    break;
+                };
+                shared.scenes.remove(&evicted);
+            }
+
             let uploaded = Arc::new(upload_scene(device, queue, shared, &self.scene));
             shared.scenes.insert(self.scene.key.clone(), uploaded.clone());
+            shared.scene_lru.push_back(self.scene.key.clone());
             uploaded
         };
 
@@ -785,6 +800,8 @@ impl GpuShared {
             texture_sampler,
             blit_sampler,
             scenes: HashMap::new(),
+            scene_lru: VecDeque::new(),
+            fallback_white: None,
         }
     }
 }
@@ -1044,7 +1061,7 @@ fn upload_cpu_texture(
 fn upload_scene(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    shared: &GpuShared,
+    shared: &mut GpuShared,
     scene: &CpuScene,
 ) -> GpuScene {
     let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1103,14 +1120,23 @@ fn upload_scene(
         }
 
         while views.len() < MAX_MATERIAL_LAYERS {
-            let white = upload_cpu_texture(device, queue, &CpuTexture {
-                width: 1,
-                height: 1,
-                rgba: vec![255, 255, 255, 255],
-            });
-            let view = white.create_view(&wgpu::TextureViewDescriptor::default());
-            keepalive.push(white);
-            views.push(view);
+            if shared.fallback_white.is_none() {
+                let white = upload_cpu_texture(
+                    device,
+                    queue,
+                    &CpuTexture {
+                        width: 1,
+                        height: 1,
+                        rgba: vec![255, 255, 255, 255],
+                    },
+                );
+                let view = white.create_view(&wgpu::TextureViewDescriptor::default());
+                shared.fallback_white = Some((white, view));
+            }
+
+            if let Some((_, view)) = shared.fallback_white.as_ref() {
+                views.push(view.clone());
+            }
         }
 
         let mut entries = vec![

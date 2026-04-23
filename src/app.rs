@@ -18,6 +18,7 @@ use eframe::egui;
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -97,6 +98,8 @@ pub struct ModToolApp {
     geo_material_error: Option<String>,
 
     asset_links: AssetLinks,
+    geo_animation_groups_path: Option<PathBuf>,
+    geo_animation_groups: Vec<(String, Vec<PathBuf>)>,
 
     geo_viewer: GeoViewerState,
     geo_viewer_path: Option<PathBuf>,
@@ -107,7 +110,7 @@ pub struct ModToolApp {
     bik_texture: Option<egui::TextureHandle>,
     bik_error: Option<String>,
     bik_audio_error: Option<String>,
-    bik_audio_wav: Option<Vec<u8>>,
+    bik_audio_wav: Option<Arc<[u8]>>,
     bik_audio_path: Option<PathBuf>,
     bik_audio_active: bool,
     bik_zoom: f32,
@@ -174,6 +177,8 @@ impl ModToolApp {
             geo_material_error: None,
 
             asset_links: AssetLinks::default(),
+            geo_animation_groups_path: None,
+            geo_animation_groups: Vec::new(),
 
             geo_viewer: GeoViewerState::default(),
             geo_viewer_path: None,
@@ -217,6 +222,8 @@ impl ModToolApp {
                     self.game_root = Some(folder);
                     self.tree = tree;
                     self.asset_links = self.build_asset_links();
+                    self.geo_animation_groups_path = None;
+                    self.geo_animation_groups.clear();
                     self.selected_file = None;
                     self.dds_preview = None;
                     self.dds_preview_path = None;
@@ -273,6 +280,8 @@ impl ModToolApp {
                     self.tree = tree;
                     
                     self.asset_links = self.build_asset_links();
+                    self.geo_animation_groups_path = None;
+                    self.geo_animation_groups.clear();
 
                     self.dds_preview = None;
                     self.dds_preview_path = None;
@@ -448,7 +457,7 @@ impl ModToolApp {
 
         match extract_bik_audio_wav(&path) {
             Ok(Some(wav_bytes)) => {
-                self.bik_audio_wav = Some(wav_bytes);
+                self.bik_audio_wav = Some(wav_bytes.into());
                 true
             }
             Ok(None) => false,
@@ -1044,6 +1053,15 @@ impl ModToolApp {
         });
 
         out
+    }
+
+    fn ensure_geo_animation_groups_loaded(&mut self, geo_path: &Path) {
+        if self.geo_animation_groups_path.as_deref() == Some(geo_path) {
+            return;
+        }
+
+        self.geo_animation_groups = self.animations_for_geo_grouped(geo_path);
+        self.geo_animation_groups_path = Some(geo_path.to_path_buf());
     }
 
     fn ensure_active_geo_animation_loaded(&mut self) {
@@ -1979,7 +1997,7 @@ impl eframe::App for ModToolApp {
                     }
 
                     if ext == "anm" {
-                        if let Some(anm) = self.anm_file.clone() {
+                        if let Some(anm) = self.anm_file.as_ref() {
                             ui.label(format!("Version: {}.{}", anm.version_major, anm.version_minor));
                             ui.label(format!("Payload size: {} bytes", anm.payload_size));
                             ui.label(format!("Rig bones: {}", anm.rig_bone_count));
@@ -2555,13 +2573,13 @@ impl eframe::App for ModToolApp {
 
                         if let Some(bnk) = &self.bnk_file {
                             let entry_count = bnk.entry_count;
-                            let entries = bnk.entries.clone();
+                            let selected_bnk_entry = &mut self.selected_bnk_entry;
 
                             ui.heading(format!("Entries ({})", entry_count));
                             ui.separator();
 
                             egui::ScrollArea::vertical().show(ui, |ui| {
-                                for entry in &entries {
+                                for entry in &bnk.entries {
                                     let duration_text = entry
                                         .estimated_duration_seconds()
                                         .map(|seconds| format!("{seconds:.2}s"))
@@ -2575,10 +2593,10 @@ impl eframe::App for ModToolApp {
                                         duration_text
                                     );
 
-                                    let is_selected = self.selected_bnk_entry == Some(entry.index);
+                                    let is_selected = *selected_bnk_entry == Some(entry.index);
 
                                     if ui.selectable_label(is_selected, label).clicked() {
-                                        self.selected_bnk_entry = Some(entry.index);
+                                        *selected_bnk_entry = Some(entry.index);
                                     }
                                 }
                             });
@@ -2751,9 +2769,37 @@ impl eframe::App for ModToolApp {
                         } else {
                             ui.label("SCN selected, but no scene info is loaded.");
                         }
-                    }                
-
+                    }
+                
                     Some("geo") | Some("anm") => {
+                        let loaded_geo_path = self.geo_loaded_path.clone();
+                        let show_animations = self
+                            .geo_file
+                            .as_ref()
+                            .map(|geo| {
+                                geo.skeleton.is_some()
+                                    && matches!(
+                                        geo.asset_type,
+                                        GeoAssetType::SkinnedMesh | GeoAssetType::RigidProp
+                                    )
+                            })
+                            .unwrap_or(false);
+
+                        if show_animations {
+                            if let Some(path) = loaded_geo_path.as_deref() {
+                                self.ensure_geo_animation_groups_loaded(path);
+                            }
+                        } else {
+                            self.geo_animation_groups_path = None;
+                            self.geo_animation_groups.clear();
+                        }
+
+                        let animation_groups = if show_animations {
+                            self.geo_animation_groups.clone()
+                        } else {
+                            Vec::new()
+                        };
+
                         if let Some(geo) = &self.geo_file {
                             let active_rigid_clip = self
                                 .active_geo_animation_file
@@ -2801,34 +2847,14 @@ impl eframe::App for ModToolApp {
                             ui.separator();
 
                             let active_anm_path = self.active_geo_animation.clone();
-                            let show_animations =
-                                geo.skeleton.is_some()
-                                    && matches!(
-                                        geo.asset_type,
-                                        GeoAssetType::SkinnedMesh | GeoAssetType::RigidProp
-                                    );
-
-                            let loaded_geo_path = self.geo_loaded_path.clone();
-
                             let model_texture_refs = loaded_geo_path
                                 .as_ref()
                                 .and_then(|path| self.asset_links.model_to_textures.get(path).cloned());
-
-                            let animation_groups = if show_animations {
-                                loaded_geo_path
-                                    .as_ref()
-                                    .map(|path| self.animations_for_geo_grouped(path))
-                                    .unwrap_or_default()
-                            } else {
-                                Vec::new()
-                            };
 
                             let geo_stem = loaded_geo_path
                                 .as_ref()
                                 .map(|path| Self::asset_stem_lower(path))
                                 .unwrap_or_default();
-
-                            let mut newly_selected_animation: Option<PathBuf> = None;
 
                             if show_animations {
                                 ui.columns(3, |columns| {
@@ -2978,13 +3004,6 @@ impl eframe::App for ModToolApp {
 
                                         if let Some(anm) = &self.active_geo_animation_file {
                                             if let Some(clip) = &anm.rigid_clip {
-                                                let frame_count = clip
-                                                    .streams
-                                                    .iter()
-                                                    .map(|stream| stream.rotations_xyzw.len())
-                                                    .min()
-                                                    .unwrap_or(0);
-
                                                 right.horizontal(|ui| {
                                                     if ui
                                                         .button(if self.active_geo_animation_playing { "Pause" } else { "Play" })
@@ -3213,10 +3232,6 @@ impl eframe::App for ModToolApp {
                                         right.label("No skeleton detected.");
                                     }
                                 });
-                            }
-
-                            if let Some(path) = newly_selected_animation {
-                                self.active_geo_animation = Some(path);
                             }
                         } else if let Some(err) = &self.geo_error {
                             ui.colored_label(
