@@ -94,6 +94,8 @@ struct AudioPreviewWindow {
     id: u64,
     title: String,
     path: PathBuf,
+    audio_player: Option<AudioPlayer>,
+    audio_error: Option<String>,
     open: bool,
 }
 
@@ -103,6 +105,8 @@ struct BnkPreviewWindow {
     path: PathBuf,
     bnk_file: Option<BnkFile>,
     error: Option<String>,
+    audio_player: Option<AudioPlayer>,
+    audio_error: Option<String>,
     selected_entry: Option<usize>,
     open: bool,
 }
@@ -1481,6 +1485,8 @@ impl ModToolApp {
             id,
             title: format!("Audio - {}", Self::path_title(path)),
             path: path.to_path_buf(),
+            audio_player: None,
+            audio_error: None,
             open: true,
         });
         self.status = format!("Opened audio preview: {}", path.display());
@@ -1514,6 +1520,8 @@ impl ModToolApp {
             path: path.to_path_buf(),
             bnk_file,
             error,
+            audio_player: None,
+            audio_error: None,
             selected_entry,
             open: true,
         });
@@ -2204,7 +2212,13 @@ impl ModToolApp {
     }
 
     fn audio_snapshot(&self) -> (bool, bool, f32, f32, Option<f32>, Option<String>) {
-        if let Some(player) = self.audio_player.as_ref() {
+        Self::audio_snapshot_for(self.audio_player.as_ref())
+    }
+
+    fn audio_snapshot_for(
+        player: Option<&AudioPlayer>,
+    ) -> (bool, bool, f32, f32, Option<f32>, Option<String>) {
+        if let Some(player) = player {
             (
                 player.is_paused(),
                 player.is_empty(),
@@ -2215,6 +2229,96 @@ impl ModToolApp {
             )
         } else {
             (false, true, 1.0, 0.0, None, None)
+        }
+    }
+
+    fn ensure_preview_audio_player(
+        player: &mut Option<AudioPlayer>,
+        audio_error: &mut Option<String>,
+    ) -> bool {
+        if player.is_some() {
+            return true;
+        }
+
+        match AudioPlayer::new() {
+            Ok(new_player) => {
+                *player = Some(new_player);
+                *audio_error = None;
+                true
+            }
+            Err(err) => {
+                *audio_error = Some(err.to_string());
+                false
+            }
+        }
+    }
+
+    fn execute_preview_audio_command(
+        player: &mut Option<AudioPlayer>,
+        audio_error: &mut Option<String>,
+        status: &mut String,
+        command: AudioWindowCommand,
+    ) {
+        match command {
+            AudioWindowCommand::PlayFile { path, .. } => {
+                if !Self::ensure_preview_audio_player(player, audio_error) {
+                    return;
+                }
+
+                if let Some(player) = player.as_mut() {
+                    match player.play_file(&path) {
+                        Ok(()) => {
+                            *audio_error = None;
+                            *status = format!("Playing {}", path.display());
+                        }
+                        Err(err) => {
+                            *audio_error = Some(err.to_string());
+                        }
+                    }
+                }
+            }
+            AudioWindowCommand::PlayData { label, wav_bytes, .. } => {
+                if !Self::ensure_preview_audio_player(player, audio_error) {
+                    return;
+                }
+
+                if let Some(player) = player.as_mut() {
+                    match player.play_data(label.clone(), wav_bytes) {
+                        Ok(()) => {
+                            *audio_error = None;
+                            *status = format!("Playing {label}");
+                        }
+                        Err(err) => {
+                            *audio_error = Some(err.to_string());
+                        }
+                    }
+                }
+            }
+            AudioWindowCommand::PauseResume(_) => {
+                if let Some(player) = player.as_ref() {
+                    if player.is_paused() {
+                        player.resume();
+                    } else {
+                        player.pause();
+                    }
+                }
+            }
+            AudioWindowCommand::Stop(_) => {
+                if let Some(player) = player.as_ref() {
+                    player.stop();
+                    *status = "Stopped audio preview.".to_owned();
+                }
+            }
+            AudioWindowCommand::Seek { seconds, .. } => {
+                if let Some(player) = player.as_ref() {
+                    player.seek(Duration::from_secs_f32(seconds.max(0.0)));
+                }
+            }
+            AudioWindowCommand::SetVolume(volume) => {
+                if let Some(player) = player.as_ref() {
+                    player.set_volume(volume);
+                }
+            }
         }
     }
 
@@ -2232,22 +2336,8 @@ impl ModToolApp {
     ) {
         let has_active_audio = is_active && !is_empty;
 
-        if has_active_audio {
-            if let Some(path) = now_playing {
-                ui.small(format!("Now playing: {path}"));
-            }
-        }
-
-        if !has_active_audio {
-            ui.small("State: idle");
-        } else if is_paused {
-            ui.small("State: paused");
-        } else {
-            ui.small("State: playing");
-        }
-
         ui.horizontal(|ui| {
-            let pause_label = if is_paused { "Resume" } else { "Pause" };
+            let pause_label = if has_active_audio && is_paused { "Resume" } else { "Pause" };
             if ui
                 .add_enabled(has_active_audio, egui::Button::new(pause_label))
                 .clicked()
@@ -2303,13 +2393,13 @@ impl ModToolApp {
     }
 
     fn draw_audio_preview_windows(&mut self, ctx: &egui::Context) {
-        let (is_paused, is_empty, volume, position_secs, duration_secs, now_playing) =
-            self.audio_snapshot();
-        let active_audio_window = self.active_audio_window;
-        let mut commands = Vec::new();
+        let mut latest_status = None;
 
         for window in &mut self.audio_preview_windows {
             let mut open = window.open;
+            let mut commands = Vec::new();
+            let mut window_status = None;
+
             egui::Window::new(window.title.clone())
                 .id(egui::Id::new(("audio_preview_window", window.id)))
                 .open(&mut open)
@@ -2328,13 +2418,19 @@ impl ModToolApp {
                         }
                     });
 
+                    let (is_paused, is_empty, volume, position_secs, duration_secs, now_playing) =
+                        Self::audio_snapshot_for(window.audio_player.as_ref());
+
+                    if !is_empty && !is_paused {
+                        ctx.request_repaint_after(Duration::from_secs_f32(1.0 / 60.0));
+                    }
+
                     let source = AudioWindowKey::Audio(window.id);
-                    let is_active = active_audio_window == Some(source);
                     Self::show_audio_transport_snapshot(
                         ui,
                         &mut commands,
                         source,
-                        is_active,
+                        true,
                         is_paused,
                         is_empty,
                         volume,
@@ -2342,26 +2438,54 @@ impl ModToolApp {
                         duration_secs,
                         &now_playing,
                     );
+
+                    if let Some(err) = &window.audio_error {
+                        ui.separator();
+                        ui.colored_label(egui::Color32::RED, format!("Audio error: {err}"));
+                    }
                 });
+
+            for command in commands {
+                let mut status = String::new();
+                Self::execute_preview_audio_command(
+                    &mut window.audio_player,
+                    &mut window.audio_error,
+                    &mut status,
+                    command,
+                );
+                if !status.is_empty() {
+                    window_status = Some(status);
+                }
+            }
+
+            if let Some(player) = window.audio_player.as_ref() {
+                if !player.is_empty() && !player.is_paused() {
+                    ctx.request_repaint_after(Duration::from_secs_f32(1.0 / 60.0));
+                }
+            }
+
+            if let Some(status) = window_status {
+                latest_status = Some(status);
+            }
 
             window.open = open;
         }
 
         self.audio_preview_windows.retain(|window| window.open);
 
-        for command in commands {
-            self.execute_audio_window_command(command);
+        if let Some(status) = latest_status {
+            self.status = status;
         }
     }
 
     fn draw_bnk_preview_windows(&mut self, ctx: &egui::Context) {
-        let (is_paused, is_empty, volume, position_secs, duration_secs, now_playing) =
-            self.audio_snapshot();
-        let active_audio_window = self.active_audio_window;
-        let mut commands = Vec::new();
+        let mut latest_status = None;
 
         for window in &mut self.bnk_preview_windows {
             let mut open = window.open;
+            let mut commands = Vec::new();
+            let mut window_status = None;
+
             egui::Window::new(window.title.clone())
                 .id(egui::Id::new(("bnk_preview_window", window.id)))
                 .open(&mut open)
@@ -2408,7 +2532,7 @@ impl ModToolApp {
 
                                     match bnk.entry_wav_bytes(index) {
                                         Ok(wav_bytes) => {
-                                            window.error = None;
+                                            window.audio_error = None;
                                             commands.push(AudioWindowCommand::PlayData {
                                                 label,
                                                 wav_bytes,
@@ -2416,22 +2540,28 @@ impl ModToolApp {
                                             });
                                         }
                                         Err(err) => {
-                                            window.error = Some(err.to_string());
+                                            window.audio_error = Some(err.to_string());
                                         }
                                     }
                                 } else {
-                                    window.error = Some("Select a BNK entry first.".to_owned());
+                                    window.audio_error = Some("Select a BNK entry first.".to_owned());
                                 }
                             }
                         });
 
+                        let (is_paused, is_empty, volume, position_secs, duration_secs, now_playing) =
+                            Self::audio_snapshot_for(window.audio_player.as_ref());
+
+                        if !is_empty && !is_paused {
+                            ctx.request_repaint_after(Duration::from_secs_f32(1.0 / 60.0));
+                        }
+
                         let source = AudioWindowKey::Bnk(window.id);
-                        let is_active = active_audio_window == Some(source);
                         Self::show_audio_transport_snapshot(
                             ui,
                             &mut commands,
                             source,
-                            is_active,
+                            true,
                             is_paused,
                             is_empty,
                             volume,
@@ -2476,19 +2606,42 @@ impl ModToolApp {
                         ui.label("BNK selected, but no bank info is loaded.");
                     }
 
-                    if let Some(err) = &window.error {
+                    if let Some(err) = &window.audio_error {
                         ui.separator();
-                        ui.colored_label(egui::Color32::RED, format!("BNK/audio error: {err}"));
+                        ui.colored_label(egui::Color32::RED, format!("Audio error: {err}"));
                     }
                 });
+
+            for command in commands {
+                let mut status = String::new();
+                Self::execute_preview_audio_command(
+                    &mut window.audio_player,
+                    &mut window.audio_error,
+                    &mut status,
+                    command,
+                );
+                if !status.is_empty() {
+                    window_status = Some(status);
+                }
+            }
+
+            if let Some(player) = window.audio_player.as_ref() {
+                if !player.is_empty() && !player.is_paused() {
+                    ctx.request_repaint_after(Duration::from_secs_f32(1.0 / 60.0));
+                }
+            }
+
+            if let Some(status) = window_status {
+                latest_status = Some(status);
+            }
 
             window.open = open;
         }
 
         self.bnk_preview_windows.retain(|window| window.open);
 
-        for command in commands {
-            self.execute_audio_window_command(command);
+        if let Some(status) = latest_status {
+            self.status = status;
         }
     }
 
