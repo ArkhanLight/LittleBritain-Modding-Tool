@@ -1,18 +1,20 @@
 use crate::{
-    anm::{load_anm, AnmFile},
+    anm::{AnmFile, load_anm},
     audio_player::AudioPlayer,
     bik_preview::{
-        extract_bik_audio_wav, load_bik_preview, spawn_bik_decoder, BikPreview, BikWorkerEvent,
+        BikPreview, BikWorkerEvent, extract_bik_audio_wav, load_bik_preview, spawn_bik_decoder,
     },
-    bnk::{format_name, load_bnk, BnkFile},
-    dds_preview::{load_dds_preview, DdsPreview},
-    fs_tree::{category_name, classify_path, scan_game_data, AssetCategory, FileNode, NodeKind},
-    geo::{load_geo, GeoAssetType, GeoFile},
+    bnk::{BnkFile, format_name, load_bnk},
+    dds_preview::{DdsPreview, load_dds_preview},
+    fs_tree::{AssetCategory, FileNode, NodeKind, category_name, classify_path, scan_game_data},
+    geo::{GeoAssetType, GeoFile, load_geo},
     geo_viewer::{
-        draw_geo_viewer, draw_scene_viewer, focus_scene_viewer_on_point, reset_geo_viewer,
-        reset_scene_viewer, GeoViewerState, SceneGeoModel, SceneSelection,
+        GeoViewerState, SceneGeoModel, SceneSelection, draw_geo_viewer, draw_scene_viewer,
+        focus_scene_viewer_on_point, reset_geo_viewer, reset_scene_viewer,
     },
-    scn::{load_scn, ScnFile},
+    mod_workspace::{ModPackage, create_lua_mod, read_text_file, scan_mods, write_text_file},
+    scn::{ScnFile, ScnMeshChunk, load_scn},
+    script_engine::ScriptEngine,
 };
 use eframe::egui;
 use std::{
@@ -43,34 +45,48 @@ struct AssetLinks {
 }
 
 #[derive(Clone, Debug, Default)]
-struct ScnScriptSummary {
-    files: Vec<ScnScriptFile>,
-    matched_scene_nodes: Vec<String>,
-    unmatched_script_nodes: Vec<String>,
-}
-
-#[derive(Clone, Debug)]
-struct ScnScriptFile {
-    path: PathBuf,
-    nodes: Vec<ScnScriptNode>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct ScnScriptNode {
-    name: String,
-    animation: Option<String>,
-    steps: Vec<String>,
+struct GameCodeMap {
+    exe_path: Option<PathBuf>,
+    symbol_dump_path: Option<PathBuf>,
+    strings_path: Option<PathBuf>,
+    bink_proxy_path: Option<PathBuf>,
+    real_bink_path: Option<PathBuf>,
+    modloader_path: Option<PathBuf>,
+    error: Option<String>,
+    rtti_classes: Vec<String>,
+    function_names: Vec<String>,
+    source_paths: Vec<String>,
+    game_modes: Vec<String>,
+    frontend_functions: Vec<String>,
+    character_names: Vec<String>,
+    resource_names: Vec<String>,
+    asset_refs: Vec<String>,
+    code_refs: Vec<String>,
+    script_tokens: Vec<String>,
+    modloader_tokens: Vec<String>,
+    injection_notes: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct ScnMarkerSummary {
     actor_like: usize,
+    cameras: usize,
     checkpoints: usize,
+    gameplay_targets: usize,
     path_nodes: usize,
     player_starts: usize,
     player_ends: usize,
+    spawns: usize,
     traffic: usize,
     other: usize,
+}
+
+struct TexturePreviewWindow {
+    id: u64,
+    title: String,
+    preview: DdsPreview,
+    zoom: f32,
+    open: bool,
 }
 
 pub struct ModToolApp {
@@ -85,6 +101,8 @@ pub struct ModToolApp {
     dds_error: Option<String>,
     texture_zoom: f32,
     dds_view_height: f32,
+    texture_preview_windows: Vec<TexturePreviewWindow>,
+    next_texture_preview_window_id: u64,
 
     bnk_file: Option<BnkFile>,
     bnk_loaded_path: Option<PathBuf>,
@@ -122,17 +140,26 @@ pub struct ModToolApp {
     scn_scene_error: Option<String>,
     selected_scn_node: Option<usize>,
     selected_scn_chunk: Option<usize>,
+    hidden_scn_nodes: std::collections::BTreeSet<usize>,
+    hidden_scn_chunks: std::collections::BTreeSet<usize>,
     scn_viewer: GeoViewerState,
     scn_view_height: f32,
     scn_embedded_texture_previews: std::collections::HashMap<String, DdsPreview>,
-    scn_script_summary: ScnScriptSummary,
-    scn_script_error: Option<String>,
 
     geo_material_previews: Vec<Option<DdsPreview>>,
     geo_materials_loaded_path: Option<PathBuf>,
     geo_material_error: Option<String>,
 
     asset_links: AssetLinks,
+    game_code_map: GameCodeMap,
+    mods: Vec<ModPackage>,
+    mods_error: Option<String>,
+    new_mod_name: String,
+    selected_mod_index: Option<usize>,
+    mod_script_path: Option<PathBuf>,
+    mod_script_text: String,
+    mod_script_dirty: bool,
+    mod_script_error: Option<String>,
     geo_animation_groups_path: Option<PathBuf>,
     geo_animation_groups: Vec<(String, Vec<PathBuf>)>,
 
@@ -159,6 +186,9 @@ pub struct ModToolApp {
     bik_clock_started_at: Option<Instant>,
     bik_clock_start_secs: f32,
     bik_decoder_finished: bool,
+
+    script_path: String,
+    script_logs: Vec<String>,
 }
 
 impl ModToolApp {
@@ -176,6 +206,8 @@ impl ModToolApp {
             dds_error: None,
             texture_zoom: 1.0,
             dds_view_height: 420.0,
+            texture_preview_windows: Vec::new(),
+            next_texture_preview_window_id: 1,
 
             bnk_file: None,
             bnk_loaded_path: None,
@@ -212,6 +244,15 @@ impl ModToolApp {
             geo_material_error: None,
 
             asset_links: AssetLinks::default(),
+            game_code_map: GameCodeMap::default(),
+            mods: Vec::new(),
+            mods_error: None,
+            new_mod_name: "MyLuaMod".to_owned(),
+            selected_mod_index: None,
+            mod_script_path: None,
+            mod_script_text: String::new(),
+            mod_script_dirty: false,
+            mod_script_error: None,
             geo_animation_groups_path: None,
             geo_animation_groups: Vec::new(),
 
@@ -225,11 +266,11 @@ impl ModToolApp {
             scn_scene_error: None,
             selected_scn_node: None,
             selected_scn_chunk: None,
+            hidden_scn_nodes: std::collections::BTreeSet::new(),
+            hidden_scn_chunks: std::collections::BTreeSet::new(),
             scn_viewer: GeoViewerState::default(),
             scn_view_height: 520.0,
             scn_embedded_texture_previews: std::collections::HashMap::new(),
-            scn_script_summary: ScnScriptSummary::default(),
-            scn_script_error: None,
 
             bik_preview: None,
             bik_preview_path: None,
@@ -250,6 +291,9 @@ impl ModToolApp {
             bik_clock_started_at: None,
             bik_clock_start_secs: 0.0,
             bik_decoder_finished: false,
+
+            script_path: String::new(),
+            script_logs: Vec::new(),
         }
     }
 
@@ -257,8 +301,10 @@ impl ModToolApp {
         if let Some(folder) = rfd::FileDialog::new().pick_folder() {
             match scan_game_data(&folder) {
                 Ok(tree) => {
+                    self.game_code_map = Self::scan_game_code_map(&folder);
                     self.game_root = Some(folder);
                     self.tree = tree;
+                    self.refresh_mod_workspace();
                     self.asset_links = self.build_asset_links();
                     self.geo_animation_groups_path = None;
                     self.geo_animation_groups.clear();
@@ -299,6 +345,8 @@ impl ModToolApp {
                     self.scn_scene_error = None;
                     self.selected_scn_node = None;
                     self.selected_scn_chunk = None;
+                    self.hidden_scn_nodes.clear();
+                    self.hidden_scn_chunks.clear();
                     self.scn_viewer = GeoViewerState::default();
                     self.scn_view_height = 520.0;
                     self.scn_embedded_texture_previews.clear();
@@ -317,6 +365,8 @@ impl ModToolApp {
             match scan_game_data(&root) {
                 Ok(tree) => {
                     self.tree = tree;
+                    self.game_code_map = Self::scan_game_code_map(&root);
+                    self.refresh_mod_workspace();
 
                     self.asset_links = self.build_asset_links();
                     self.geo_animation_groups_path = None;
@@ -374,6 +424,89 @@ impl ModToolApp {
                 Err(err) => {
                     self.status = err.to_string();
                 }
+            }
+        }
+    }
+
+    fn refresh_mod_workspace(&mut self) {
+        let Some(root) = self.game_root.as_ref() else {
+            self.mods.clear();
+            self.mods_error = None;
+            self.selected_mod_index = None;
+            return;
+        };
+
+        match scan_mods(root) {
+            Ok(mods) => {
+                self.mods = mods;
+                self.mods_error = None;
+                if self
+                    .selected_mod_index
+                    .map(|index| index >= self.mods.len())
+                    .unwrap_or(false)
+                {
+                    self.selected_mod_index = None;
+                }
+            }
+            Err(err) => {
+                self.mods_error = Some(err.to_string());
+            }
+        }
+    }
+
+    fn create_new_lua_mod(&mut self) {
+        let Some(root) = self.game_root.as_ref() else {
+            self.mods_error = Some("Open the Little Britain game folder first.".to_owned());
+            return;
+        };
+
+        match create_lua_mod(root, &self.new_mod_name) {
+            Ok(package) => {
+                let script_to_open = package.scripts.first().cloned();
+                self.status = format!("Created Lua mod: {}", package.manifest.name);
+                self.refresh_mod_workspace();
+
+                if let Some(script_path) = script_to_open {
+                    self.open_mod_script(script_path);
+                }
+            }
+            Err(err) => {
+                self.mods_error = Some(err.to_string());
+            }
+        }
+    }
+
+    fn open_mod_script(&mut self, path: PathBuf) {
+        match read_text_file(&path) {
+            Ok(text) => {
+                self.mod_script_path = Some(path);
+                self.mod_script_text = text;
+                self.mod_script_dirty = false;
+                self.mod_script_error = None;
+                self.selected_file = None;
+            }
+            Err(err) => {
+                self.mod_script_error = Some(err.to_string());
+            }
+        }
+    }
+
+    fn save_mod_script(&mut self) {
+        let Some(path) = self.mod_script_path.as_ref() else {
+            return;
+        };
+
+        match write_text_file(path, &self.mod_script_text) {
+            Ok(()) => {
+                self.mod_script_dirty = false;
+                self.mod_script_error = None;
+                self.status = format!(
+                    "Saved script: {}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                );
+            }
+            Err(err) => {
+                self.mod_script_error = Some(err.to_string());
             }
         }
     }
@@ -870,6 +1003,92 @@ impl ModToolApp {
         }
     }
 
+    fn open_texture_preview_window(&mut self, title: String, preview: DdsPreview) {
+        let id = self.next_texture_preview_window_id;
+        self.next_texture_preview_window_id = self.next_texture_preview_window_id.wrapping_add(1);
+
+        self.texture_preview_windows.push(TexturePreviewWindow {
+            id,
+            title,
+            preview,
+            zoom: 1.0,
+            open: true,
+        });
+    }
+
+    fn open_texture_path_preview_window(&mut self, ctx: &egui::Context, path: &Path) {
+        let title = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+
+        match load_dds_preview(ctx, path) {
+            Ok(preview) => {
+                self.open_texture_preview_window(title, preview);
+                self.status = format!("Opened texture preview: {}", path.display());
+            }
+            Err(err) => {
+                self.status = format!("Texture preview error: {}", err);
+            }
+        }
+    }
+
+    fn draw_texture_preview_windows(&mut self, ctx: &egui::Context) {
+        for window in &mut self.texture_preview_windows {
+            let mut open = window.open;
+            egui::Window::new(window.title.clone())
+                .id(egui::Id::new(("texture_preview_window", window.id)))
+                .open(&mut open)
+                .resizable(true)
+                .default_size(egui::vec2(520.0, 420.0))
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "{} x {}  |  mipmaps {}",
+                            window.preview.width, window.preview.height, window.preview.mipmaps
+                        ));
+                        ui.separator();
+                        ui.label("Zoom");
+                        ui.add(
+                            egui::Slider::new(&mut window.zoom, 0.25..=8.0)
+                                .logarithmic(true)
+                                .text("x"),
+                        );
+                        if ui.button("Reset").clicked() {
+                            window.zoom = 1.0;
+                        }
+                    });
+
+                    ui.separator();
+
+                    let available = ui.available_size().max(egui::vec2(120.0, 120.0));
+                    let tex_size = window.preview.texture.size_vec2();
+                    let fit_scale = (available.x / tex_size.x)
+                        .min(available.y / tex_size.y)
+                        .min(1.0);
+                    let desired_size = tex_size * fit_scale.max(0.1) * window.zoom;
+
+                    egui::ScrollArea::both()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let response = ui.image((window.preview.texture.id(), desired_size));
+                            if response.hovered() {
+                                let scroll_y = ui.ctx().input(|i| i.smooth_scroll_delta.y);
+                                if scroll_y.abs() > 0.0 {
+                                    let zoom_factor = (1.0 + scroll_y * 0.001).clamp(0.5, 1.5);
+                                    window.zoom = (window.zoom * zoom_factor).clamp(0.25, 8.0);
+                                    ui.ctx().request_repaint();
+                                }
+                            }
+                        });
+                });
+
+            window.open = open;
+        }
+
+        self.texture_preview_windows.retain(|window| window.open);
+    }
+
     fn ensure_anm_loaded(&mut self) {
         let Some(path) = self.selected_file.clone() else {
             self.anm_file = None;
@@ -1210,6 +1429,8 @@ impl ModToolApp {
             self.scn_error = None;
             self.selected_scn_node = None;
             self.selected_scn_chunk = None;
+            self.hidden_scn_nodes.clear();
+            self.hidden_scn_chunks.clear();
             return;
         };
 
@@ -1229,11 +1450,15 @@ impl ModToolApp {
         if !is_scn {
             self.selected_scn_node = None;
             self.selected_scn_chunk = None;
+            self.hidden_scn_nodes.clear();
+            self.hidden_scn_chunks.clear();
             return;
         }
 
         self.selected_scn_node = None;
         self.selected_scn_chunk = None;
+        self.hidden_scn_nodes.clear();
+        self.hidden_scn_chunks.clear();
 
         match load_scn(&path) {
             Ok(scn) => {
@@ -1250,9 +1475,10 @@ impl ModToolApp {
         self.scn_scene_models_path = None;
         self.scn_scene_unresolved.clear();
         self.scn_scene_error = None;
-        self.scn_script_summary = ScnScriptSummary::default();
-        self.scn_script_error = None;
+        self.selected_scn_node = None;
         self.selected_scn_chunk = None;
+        self.hidden_scn_nodes.clear();
+        self.hidden_scn_chunks.clear();
         self.scn_viewer = GeoViewerState::default();
         self.scn_view_height = 520.0;
         self.scn_embedded_texture_previews.clear();
@@ -1284,15 +1510,6 @@ impl ModToolApp {
         let Some(scn) = self.scn_file.clone() else {
             return;
         };
-
-        match Self::load_scene_script_summary(&path, &scn) {
-            Ok(summary) => {
-                self.scn_script_summary = summary;
-            }
-            Err(err) => {
-                self.scn_script_error = Some(err.to_string());
-            }
-        }
 
         let mut texture_nodes = Vec::new();
         let mut model_nodes = Vec::new();
@@ -1796,6 +2013,10 @@ impl ModToolApp {
             "Player end"
         } else if lower.starts_with("checkpoint") {
             "Checkpoint"
+        } else if lower == "startposition" || lower.contains("spawn") {
+            "Spawn marker"
+        } else if lower.contains("camera") || lower.contains("cameratarget") {
+            "Camera marker"
         } else if lower.starts_with("path") || lower.starts_with("lane") {
             "Route marker"
         } else if lower.starts_with("gay")
@@ -1803,10 +2024,46 @@ impl ModToolApp {
             || lower.starts_with("vicky")
             || lower.starts_with("dafydd")
             || lower.starts_with("myfanwy")
+            || lower.starts_with("andy")
+            || lower.starts_with("lou")
+            || lower.starts_with("lifeguard")
+            || lower.starts_with("marjorie")
+            || lower.starts_with("female")
+            || lower.starts_with("male")
+            || lower.starts_with("letty")
+            || lower.starts_with("frog")
+            || lower.starts_with("emily")
+            || lower.starts_with("florence")
+            || lower.starts_with("football_kid")
+            || lower.starts_with("pirate")
+            || lower.starts_with("judy")
+            || lower.starts_with("maggie")
+            || lower.starts_with("brownie")
+            || lower.starts_with("vicar")
         {
             "Actor marker"
         } else if lower.starts_with("car_") || lower.starts_with("dec_car_") {
             "Traffic marker"
+        } else if lower.starts_with("target")
+            || lower.starts_with("board")
+            || lower.starts_with("stand_table")
+            || lower.starts_with("node_table")
+            || lower.starts_with("line_pos")
+            || lower.starts_with("return")
+            || lower.starts_with("tochair")
+            || lower.starts_with("defender")
+            || lower.starts_with("easy")
+            || lower.starts_with("medium")
+            || lower.starts_with("hard")
+            || lower.starts_with("vase")
+            || lower.starts_with("cushion")
+            || lower.starts_with("beachball")
+            || lower.starts_with("ornament")
+            || lower.starts_with("bowl")
+            || lower.starts_with("softfrog")
+            || lower.starts_with("chairnode")
+        {
+            "Gameplay target"
         } else {
             "Generic marker"
         }
@@ -1822,10 +2079,13 @@ impl ModToolApp {
 
             match Self::scn_marker_kind(&node.name) {
                 "Actor marker" => summary.actor_like += 1,
+                "Camera marker" => summary.cameras += 1,
                 "Checkpoint" => summary.checkpoints += 1,
+                "Gameplay target" => summary.gameplay_targets += 1,
                 "Route marker" => summary.path_nodes += 1,
                 "Player start" => summary.player_starts += 1,
                 "Player end" => summary.player_ends += 1,
+                "Spawn marker" => summary.spawns += 1,
                 "Traffic marker" => summary.traffic += 1,
                 _ => summary.other += 1,
             }
@@ -1834,168 +2094,1308 @@ impl ModToolApp {
         summary
     }
 
-    fn scn_script_attr(line: &str, attr: &str) -> Option<String> {
-        let needle = format!("{attr}=\"");
-        let start = line.find(&needle)? + needle.len();
+    fn extract_ascii_strings(data: &[u8], min_len: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut current = Vec::new();
+
+        for &byte in data {
+            if (0x20..=0x7e).contains(&byte) {
+                current.push(byte);
+            } else {
+                if current.len() >= min_len {
+                    out.push(String::from_utf8_lossy(&current).to_string());
+                }
+                current.clear();
+            }
+        }
+
+        if current.len() >= min_len {
+            out.push(String::from_utf8_lossy(&current).to_string());
+        }
+
+        out
+    }
+
+    fn extract_utf16le_strings(data: &[u8], min_len: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut current = Vec::new();
+
+        for pair in data.chunks_exact(2) {
+            let word = u16::from_le_bytes([pair[0], pair[1]]);
+            if (0x20..=0x7e).contains(&word) {
+                current.push(word);
+            } else {
+                if current.len() >= min_len {
+                    out.push(String::from_utf16_lossy(&current));
+                }
+                current.clear();
+            }
+        }
+
+        if current.len() >= min_len {
+            out.push(String::from_utf16_lossy(&current));
+        }
+
+        out
+    }
+
+    fn read_lossy_text(path: &Path) -> anyhow::Result<String> {
+        let bytes = fs::read(path)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn push_unique_limited(out: &mut Vec<String>, value: impl Into<String>, limit: usize) {
+        if out.len() >= limit {
+            return;
+        }
+
+        let value = value
+            .into()
+            .trim()
+            .trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == ',' || ch == ';')
+            .trim()
+            .to_owned();
+
+        if value.is_empty() {
+            return;
+        }
+
+        if !out
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&value))
+        {
+            out.push(value);
+        }
+    }
+
+    fn quoted_value(line: &str) -> Option<String> {
+        let start = line.find('"')? + 1;
         let rest = &line[start..];
         let end = rest.find('"')?;
         Some(rest[..end].to_owned())
     }
 
-    fn parse_scn_script_file(path: &Path) -> anyhow::Result<Option<ScnScriptFile>> {
-        let text = fs::read_to_string(path)?;
-        if !text.contains("<GAMENODE") {
-            return Ok(None);
+    fn looks_like_asset_ref(value: &str) -> bool {
+        let lower = value.to_ascii_lowercase();
+        [
+            ".scn", ".geo", ".anm", ".dds", ".bnk", ".bik", ".lgt", ".ps2", ".psf", ".ogg", ".wav",
+            ".xml",
+        ]
+        .iter()
+        .any(|ext| lower.contains(ext))
+    }
+
+    fn symbol_function_name(line: &str) -> Option<String> {
+        let line = line.trim().trim_end_matches('\\').trim();
+        if !(line.ends_with("();") || line.ends_with("()")) {
+            return None;
         }
 
-        let mut nodes = Vec::new();
-        let mut current: Option<ScnScriptNode> = None;
+        let open = line.find('(')?;
+        let before = line[..open].trim();
+        let name = before.split_whitespace().last()?;
 
+        let mut chars = name.chars();
+        let first = chars.next()?;
+        if !first.is_ascii_alphabetic() && first != '_' {
+            return None;
+        }
+
+        if chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+            Some(name.to_owned())
+        } else {
+            None
+        }
+    }
+
+    fn ingest_symbol_dump(map: &mut GameCodeMap, path: &Path) -> anyhow::Result<()> {
+        let text = Self::read_lossy_text(path)?;
+        map.symbol_dump_path = Some(path.to_path_buf());
+
+        let mut section = String::new();
         for raw_line in text.lines() {
             let line = raw_line.trim();
-
-            if line.starts_with("<GAMENODE") {
-                if let Some(name) = Self::scn_script_attr(line, "name") {
-                    current = Some(ScnScriptNode {
-                        name,
-                        animation: None,
-                        steps: Vec::new(),
-                    });
-                }
+            if line.starts_with("// SECTION") {
+                section = line.to_ascii_lowercase();
                 continue;
             }
 
-            if line.starts_with("</GAMENODE") {
-                if let Some(node) = current.take() {
-                    nodes.push(node);
+            if section.contains("rtti") {
+                if let Some(start) = line.find("_(") {
+                    let rest = &line[start + 2..];
+                    if let Some(end) = rest.find(')') {
+                        Self::push_unique_limited(&mut map.rtti_classes, &rest[..end], 300);
+                    }
                 }
-                continue;
             }
 
-            let Some(node) = current.as_mut() else {
+            if let Some(name) = Self::symbol_function_name(line) {
+                Self::push_unique_limited(&mut map.function_names, name, 500);
+            }
+
+            let Some(value) = Self::quoted_value(line) else {
                 continue;
             };
 
-            if line.starts_with("<ANIM") {
-                if let Some(animation) = Self::scn_script_attr(line, "animation") {
-                    node.animation = Some(animation);
-                }
-            } else if line.starts_with("<TARGET") {
-                if let Some(offset) = Self::scn_script_attr(line, "offset") {
-                    node.steps.push(format!("target {offset}"));
-                }
-            } else if line.starts_with("<MOVE") {
-                if let Some(speed) = Self::scn_script_attr(line, "speed") {
-                    node.steps.push(format!("move speed {speed}"));
-                } else if let Some(time) = Self::scn_script_attr(line, "time") {
-                    node.steps.push(format!("move time {time}"));
-                }
-            } else if line.starts_with("<WAIT") {
-                if let Some(frames) = Self::scn_script_attr(line, "frames") {
-                    node.steps.push(format!("wait {frames} frames"));
-                }
-            } else if line.starts_with("<LOOP") {
-                node.steps.push("loop".to_owned());
+            if section.contains("resource") {
+                Self::push_unique_limited(&mut map.resource_names, value.clone(), 300);
+                Self::push_unique_limited(&mut map.asset_refs, value, 1500);
+            } else if section.contains("source") {
+                Self::push_unique_limited(&mut map.source_paths, value, 250);
+            } else if section.contains("game mode") {
+                Self::push_unique_limited(&mut map.game_modes, value, 100);
+            } else if section.contains("lbfe") {
+                Self::push_unique_limited(&mut map.frontend_functions, value, 150);
+            } else if section.contains("character") {
+                Self::push_unique_limited(&mut map.character_names, value, 150);
             }
         }
 
-        if nodes.is_empty() {
-            Ok(None)
+        Ok(())
+    }
+
+    fn ingest_game_code_token(map: &mut GameCodeMap, token: &str) {
+        let cleaned = token
+            .trim()
+            .trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == ',' || ch == ';')
+            .trim();
+
+        if cleaned.len() < 3 {
+            return;
+        }
+
+        let lower = cleaned.to_ascii_lowercase();
+
+        if Self::looks_like_asset_ref(cleaned) {
+            Self::push_unique_limited(&mut map.asset_refs, cleaned, 2500);
+        }
+
+        if lower.contains(".cpp")
+            || lower.contains(".h")
+            || lower.contains(".pdb")
+            || lower.contains("::")
+            || lower.contains("\\engine\\")
+            || lower.contains("\\game\\")
+            || lower.contains("/engine/")
+            || lower.contains("/game/")
+        {
+            Self::push_unique_limited(&mut map.code_refs, cleaned, 1000);
+        }
+
+        if lower.contains(".cpp")
+            || lower.contains(".h")
+            || lower.contains(".pdb")
+            || lower.contains("\\engine\\")
+            || lower.contains("\\game\\")
+            || lower.contains("/engine/")
+            || lower.contains("/game/")
+        {
+            Self::push_unique_limited(&mut map.source_paths, cleaned, 400);
+        }
+
+        if lower.contains("script")
+            || lower.contains("gamenode")
+            || lower.contains("xmlparser")
+            || lower == "anim"
+            || lower == "target"
+            || lower == "move"
+            || lower == "wait"
+            || lower == "loop"
+        {
+            Self::push_unique_limited(&mut map.script_tokens, cleaned, 200);
+        }
+    }
+
+    fn scan_modloader_bridge(map: &mut GameCodeMap, game_root: &Path) {
+        let bink_proxy_path = game_root.join("binkw32.dll");
+        if bink_proxy_path.is_file() {
+            map.bink_proxy_path = Some(bink_proxy_path.clone());
+            if let Ok(bytes) = fs::read(&bink_proxy_path) {
+                let mut bridge_tokens = Vec::new();
+                for token in Self::extract_ascii_strings(&bytes, 4)
+                    .into_iter()
+                    .chain(Self::extract_utf16le_strings(&bytes, 4))
+                {
+                    let lower = token.to_ascii_lowercase();
+                    if lower.contains("binkw32_real")
+                        || lower.contains("modloader")
+                        || lower.contains("loadlibrary")
+                        || lower.contains("getprocaddress")
+                    {
+                        Self::push_unique_limited(&mut bridge_tokens, token, 80);
+                    }
+                }
+
+                if bridge_tokens
+                    .iter()
+                    .any(|token| token.eq_ignore_ascii_case("binkw32_real.dll"))
+                {
+                    Self::push_unique_limited(
+                        &mut map.injection_notes,
+                        "binkw32.dll looks like a Bink proxy and references binkw32_real.dll.",
+                        40,
+                    );
+                }
+
+                if bridge_tokens
+                    .iter()
+                    .any(|token| token.to_ascii_lowercase().contains("modloader"))
+                {
+                    Self::push_unique_limited(
+                        &mut map.injection_notes,
+                        "The Bink proxy references modloader.dll.",
+                        40,
+                    );
+                } else {
+                    Self::push_unique_limited(
+                        &mut map.injection_notes,
+                        "The Bink proxy does not expose a modloader.dll string; modloader injection may need to be wired separately.",
+                        40,
+                    );
+                }
+
+                for token in bridge_tokens {
+                    Self::push_unique_limited(&mut map.modloader_tokens, token, 200);
+                }
+            }
+        }
+
+        let real_bink_path = game_root.join("binkw32_real.dll");
+        if real_bink_path.is_file() {
+            map.real_bink_path = Some(real_bink_path);
+        }
+
+        let modloader_path = game_root.join("modloader.dll");
+        if modloader_path.is_file() {
+            map.modloader_path = Some(modloader_path.clone());
+            if let Ok(bytes) = fs::read(&modloader_path) {
+                for token in Self::extract_ascii_strings(&bytes, 4)
+                    .into_iter()
+                    .chain(Self::extract_utf16le_strings(&bytes, 4))
+                {
+                    let lower = token.to_ascii_lowercase();
+                    if lower.contains("modloader")
+                        || lower.contains("gameapi")
+                        || lower.starts_with("mod_")
+                        || lower.contains(".lua")
+                        || lower.contains(".patch")
+                        || lower.contains("hook")
+                    {
+                        Self::push_unique_limited(&mut map.modloader_tokens, token, 200);
+                    }
+                }
+            }
+        }
+    }
+
+    fn scan_game_code_map(game_root: &Path) -> GameCodeMap {
+        let mut map = GameCodeMap::default();
+
+        let exe_path = game_root.join("LittleBritain.exe");
+        if exe_path.is_file() {
+            map.exe_path = Some(exe_path.clone());
         } else {
-            Ok(Some(ScnScriptFile {
-                path: path.to_path_buf(),
-                nodes,
-            }))
+            map.error = Some(format!(
+                "LittleBritain.exe was not found at {}",
+                exe_path.display()
+            ));
+        }
+
+        let symbol_dump_path = game_root.join("COMPLETE_symbol_dump.h");
+        if symbol_dump_path.is_file() {
+            if let Err(err) = Self::ingest_symbol_dump(&mut map, &symbol_dump_path) {
+                map.error = Some(format!(
+                    "Could not parse {}: {}",
+                    symbol_dump_path.display(),
+                    err
+                ));
+            }
+        }
+
+        let strings_path = game_root.join("strings.txt");
+        if strings_path.is_file() {
+            match fs::read(&strings_path) {
+                Ok(bytes) => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    map.strings_path = Some(strings_path);
+                    for line in text.lines() {
+                        Self::ingest_game_code_token(&mut map, line);
+                    }
+                    for token in Self::extract_ascii_strings(&bytes, 4)
+                        .into_iter()
+                        .chain(Self::extract_utf16le_strings(&bytes, 4))
+                    {
+                        Self::ingest_game_code_token(&mut map, &token);
+                    }
+                }
+                Err(err) => {
+                    map.error = Some(format!("Could not read strings.txt: {err}"));
+                }
+            }
+        } else if exe_path.is_file() {
+            match fs::read(&exe_path) {
+                Ok(bytes) => {
+                    for token in Self::extract_ascii_strings(&bytes, 4) {
+                        Self::ingest_game_code_token(&mut map, &token);
+                    }
+                }
+                Err(err) => {
+                    map.error = Some(format!("Could not scan LittleBritain.exe strings: {err}"));
+                }
+            }
+        }
+
+        Self::scan_modloader_bridge(&mut map, game_root);
+
+        map
+    }
+
+    fn asset_ref_file_name_lower(asset_ref: &str) -> Option<String> {
+        let normalized = asset_ref.replace('\\', "/");
+        let file_name = normalized.rsplit('/').next()?.trim();
+        if file_name.is_empty() {
+            None
+        } else {
+            Some(file_name.to_ascii_lowercase())
         }
     }
 
-    fn load_scene_script_summary(path: &Path, scn: &ScnFile) -> anyhow::Result<ScnScriptSummary> {
-        let Some(scene_dir) = path.parent() else {
-            return Ok(ScnScriptSummary::default());
-        };
+    fn hardcoded_refs_for_selected_path(path: &Path, map: &GameCodeMap) -> Vec<String> {
+        let mut sibling_names = std::collections::BTreeSet::new();
 
-        let mut files = Vec::new();
-        for entry in fs::read_dir(scene_dir)? {
-            let entry = entry?;
-            let entry_path = entry.path();
-            let is_xml = entry_path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("xml"))
-                .unwrap_or(false);
-
-            if !is_xml {
-                continue;
-            }
-
-            if let Some(file) = Self::parse_scn_script_file(&entry_path)? {
-                files.push(file);
-            }
+        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            sibling_names.insert(name.to_ascii_lowercase());
         }
 
-        files.sort_by_key(|file| {
-            file.path
-                .file_name()
-                .map(|name| name.to_string_lossy().to_ascii_lowercase())
-                .unwrap_or_default()
-        });
-
-        let scene_names = scn
-            .nodes
-            .iter()
-            .filter_map(|node| {
-                let trimmed = node.name.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_ascii_lowercase())
-                }
-            })
-            .collect::<std::collections::BTreeSet<_>>();
-
-        let mut matched = std::collections::BTreeSet::new();
-        let mut unmatched = std::collections::BTreeSet::new();
-
-        for file in &files {
-            for node in &file.nodes {
-                let key = node.name.trim().to_ascii_lowercase();
-                if key.is_empty() {
-                    continue;
-                }
-
-                if scene_names.contains(&key) {
-                    matched.insert(node.name.clone());
-                } else {
-                    unmatched.insert(node.name.clone());
+        if let Some(parent) = path.parent() {
+            if let Ok(entries) = fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        sibling_names.insert(name.to_ascii_lowercase());
+                    }
                 }
             }
-        }
-
-        Ok(ScnScriptSummary {
-            files,
-            matched_scene_nodes: matched.into_iter().collect(),
-            unmatched_script_nodes: unmatched.into_iter().collect(),
-        })
-    }
-
-    fn scn_script_matches<'a>(
-        summary: &'a ScnScriptSummary,
-        name: &str,
-    ) -> Vec<(&'a Path, &'a ScnScriptNode)> {
-        let wanted = name.trim();
-        if wanted.is_empty() {
-            return Vec::new();
         }
 
         let mut out = Vec::new();
-        for file in &summary.files {
-            for node in &file.nodes {
-                if node.name.eq_ignore_ascii_case(wanted) {
-                    out.push((file.path.as_path(), node));
+        for asset_ref in map.asset_refs.iter().chain(map.resource_names.iter()) {
+            let Some(file_name) = Self::asset_ref_file_name_lower(asset_ref) else {
+                continue;
+            };
+
+            if sibling_names.contains(&file_name) {
+                Self::push_unique_limited(&mut out, asset_ref, 150);
+            }
+        }
+
+        out
+    }
+
+    fn show_limited_code_list(ui: &mut egui::Ui, title: &str, values: &[String], limit: usize) {
+        egui::CollapsingHeader::new(format!("{} ({})", title, values.len()))
+            .default_open(false)
+            .show(ui, |ui| {
+                if values.is_empty() {
+                    ui.small("None found.");
+                    return;
+                }
+
+                for value in values.iter().take(limit) {
+                    ui.monospace(value);
+                }
+
+                if values.len() > limit {
+                    ui.small(format!("...and {} more", values.len() - limit));
+                }
+            });
+    }
+
+    fn show_game_code_map(ui: &mut egui::Ui, map: &GameCodeMap, selected_path: Option<&Path>) {
+        egui::CollapsingHeader::new("EXE code map")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.small(
+                    "This is a reverse-engineering map from the EXE strings and symbol dump. It shows compiled-code clues, not editable source code.",
+                );
+
+                if let Some(err) = &map.error {
+                    ui.colored_label(egui::Color32::YELLOW, err);
+                }
+
+                if let Some(path) = &map.exe_path {
+                    ui.label(format!("EXE: {}", path.display()));
+                }
+                if let Some(path) = &map.symbol_dump_path {
+                    ui.label(format!("Symbols: {}", path.display()));
+                }
+                if let Some(path) = &map.strings_path {
+                    ui.label(format!("Strings: {}", path.display()));
+                }
+                if let Some(path) = &map.bink_proxy_path {
+                    ui.label(format!("Bink proxy: {}", path.display()));
+                }
+                if let Some(path) = &map.real_bink_path {
+                    ui.label(format!("Real Bink: {}", path.display()));
+                }
+                if let Some(path) = &map.modloader_path {
+                    ui.label(format!("Mod loader: {}", path.display()));
+                }
+
+                ui.separator();
+                ui.label(format!("RTTI classes: {}", map.rtti_classes.len()));
+                ui.label(format!("Functions/patterns: {}", map.function_names.len()));
+                ui.label(format!("Source/code refs: {}", map.code_refs.len()));
+                ui.label(format!("Hardcoded asset refs: {}", map.asset_refs.len()));
+                ui.label(format!("Script/XML tokens: {}", map.script_tokens.len()));
+                ui.label(format!("Mod loader tokens: {}", map.modloader_tokens.len()));
+
+                if !map.injection_notes.is_empty() {
+                    ui.separator();
+                    ui.heading("Mod-loader bridge");
+                    for note in &map.injection_notes {
+                        ui.small(note);
+                    }
+                }
+
+                if let Some(path) = selected_path {
+                    let refs = Self::hardcoded_refs_for_selected_path(path, map);
+                    egui::CollapsingHeader::new(format!(
+                        "Hardcoded refs matching this folder ({})",
+                        refs.len()
+                    ))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        if refs.is_empty() {
+                            ui.small("No exact file-name matches found in EXE strings/symbol dump.");
+                        } else {
+                            for value in refs.iter().take(80) {
+                                ui.monospace(value);
+                            }
+                            if refs.len() > 80 {
+                                ui.small(format!("...and {} more", refs.len() - 80));
+                            }
+                        }
+                    });
+                }
+
+                Self::show_limited_code_list(ui, "Game modes", &map.game_modes, 80);
+                Self::show_limited_code_list(ui, "Frontend entry points", &map.frontend_functions, 80);
+                Self::show_limited_code_list(ui, "Character names", &map.character_names, 80);
+                Self::show_limited_code_list(ui, "RTTI classes", &map.rtti_classes, 120);
+                Self::show_limited_code_list(ui, "Function names", &map.function_names, 160);
+                Self::show_limited_code_list(ui, "Source/debug paths", &map.source_paths, 120);
+                Self::show_limited_code_list(ui, "Script/XML clues", &map.script_tokens, 120);
+                Self::show_limited_code_list(
+                    ui,
+                    "Mod-loader/proxy clues",
+                    &map.modloader_tokens,
+                    120,
+                );
+                Self::show_limited_code_list(ui, "Hardcoded asset refs", &map.asset_refs, 160);
+            });
+    }
+
+    fn show_mod_workspace(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Mod workspace")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.small(
+                    "Lua is the planned runtime scripting language. These packages live in the game's Mods folder.",
+                );
+
+                if self.game_root.is_none() {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "Open the Little Britain game folder to create or edit mods.",
+                    );
+                    return;
+                }
+
+                ui.horizontal(|ui| {
+                    if ui.small_button("Refresh").clicked() {
+                        self.refresh_mod_workspace();
+                    }
+
+                    ui.label(format!("Mods: {}", self.mods.len()));
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("New:");
+                    ui.text_edit_singleline(&mut self.new_mod_name);
+                });
+
+                if ui.button("Create Lua Mod").clicked() {
+                    self.create_new_lua_mod();
+                }
+
+                if let Some(err) = &self.mods_error {
+                    ui.colored_label(egui::Color32::RED, err);
+                }
+
+                if let Some(err) = &self.mod_script_error {
+                    ui.colored_label(egui::Color32::RED, err);
+                }
+
+                ui.separator();
+
+                if self.mods.is_empty() {
+                    ui.small("No mod packages found yet.");
+                    return;
+                }
+
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let packages = self.mods.clone();
+                        for (index, package) in packages.iter().enumerate() {
+                            let selected = self.selected_mod_index == Some(index);
+                            let title = format!(
+                                "{}  v{}",
+                                package.manifest.name, package.manifest.version
+                            );
+
+                            egui::CollapsingHeader::new(title)
+                                .default_open(selected)
+                                .show(ui, |ui| {
+                                    if ui.selectable_label(selected, "Select mod").clicked() {
+                                        self.selected_mod_index = Some(index);
+                                    }
+
+                                    ui.label(format!("Path: {}", package.path.display()));
+                                    ui.label(format!("Manifest: {}", package.manifest_path.display()));
+                                    ui.label(format!("Language: {}", package.manifest.language));
+                                    ui.label(format!(
+                                        "Entry script: {}",
+                                        package.manifest.entry_script
+                                    ));
+                                    ui.small(&package.manifest.description);
+
+                                    ui.separator();
+                                    ui.label(format!("Scripts: {}", package.scripts.len()));
+                                    for script_path in &package.scripts {
+                                        let name = script_path
+                                            .strip_prefix(&package.path)
+                                            .unwrap_or(script_path)
+                                            .display()
+                                            .to_string();
+
+                                        if ui.button(name).clicked() {
+                                            self.open_mod_script(script_path.clone());
+                                        }
+                                    }
+
+                                    ui.label(format!("Assets: {}", package.assets.len()));
+                                    ui.label(format!("Patches: {}", package.patches.len()));
+                                });
+                        }
+                    });
+            });
+    }
+
+    fn show_mod_script_editor(&mut self, ui: &mut egui::Ui) {
+        let Some(path) = self.mod_script_path.clone() else {
+            ui.label("Select a file or create a Lua mod.");
+            return;
+        };
+
+        ui.horizontal(|ui| {
+            ui.heading("Lua Script");
+            if self.mod_script_dirty {
+                ui.colored_label(egui::Color32::YELLOW, "modified");
+            }
+        });
+
+        ui.label(path.display().to_string());
+
+        ui.horizontal(|ui| {
+            if ui.button("Save Script").clicked() {
+                self.save_mod_script();
+            }
+
+            if ui.button("Close Script").clicked() {
+                self.mod_script_path = None;
+                self.mod_script_text.clear();
+                self.mod_script_dirty = false;
+                self.mod_script_error = None;
+            }
+        });
+
+        if let Some(err) = &self.mod_script_error {
+            ui.colored_label(egui::Color32::RED, err);
+        }
+
+        ui.separator();
+
+        let response = ui.add(
+            egui::TextEdit::multiline(&mut self.mod_script_text)
+                .font(egui::TextStyle::Monospace)
+                .desired_width(f32::INFINITY)
+                .desired_rows(34)
+                .lock_focus(true),
+        );
+
+        if response.changed() {
+            self.mod_script_dirty = true;
+        }
+
+        ui.small("Ctrl+S saves this script while it is open.");
+    }
+
+    fn current_scn_selection(
+        selected_scn_node: Option<usize>,
+        selected_scn_chunk: Option<usize>,
+    ) -> Option<SceneSelection> {
+        selected_scn_node
+            .map(SceneSelection::Node)
+            .or_else(|| selected_scn_chunk.map(SceneSelection::MeshChunk))
+    }
+
+    fn apply_scn_selection(
+        selected_scn_node: &mut Option<usize>,
+        selected_scn_chunk: &mut Option<usize>,
+        selection: SceneSelection,
+    ) {
+        match selection {
+            SceneSelection::Node(index) => {
+                *selected_scn_node = Some(index);
+                *selected_scn_chunk = None;
+            }
+            SceneSelection::MeshChunk(index) => {
+                *selected_scn_chunk = Some(index);
+                *selected_scn_node = None;
+            }
+        }
+    }
+
+    fn scn_item_is_visible(
+        hidden_scn_nodes: &std::collections::BTreeSet<usize>,
+        hidden_scn_chunks: &std::collections::BTreeSet<usize>,
+        selection: SceneSelection,
+    ) -> bool {
+        match selection {
+            SceneSelection::Node(index) => !hidden_scn_nodes.contains(&index),
+            SceneSelection::MeshChunk(index) => !hidden_scn_chunks.contains(&index),
+        }
+    }
+
+    fn set_scn_item_visibility(
+        hidden_scn_nodes: &mut std::collections::BTreeSet<usize>,
+        hidden_scn_chunks: &mut std::collections::BTreeSet<usize>,
+        selection: SceneSelection,
+        visible: bool,
+    ) {
+        match selection {
+            SceneSelection::Node(index) => {
+                if visible {
+                    hidden_scn_nodes.remove(&index);
+                } else {
+                    hidden_scn_nodes.insert(index);
+                }
+            }
+            SceneSelection::MeshChunk(index) => {
+                if visible {
+                    hidden_scn_chunks.remove(&index);
+                } else {
+                    hidden_scn_chunks.insert(index);
                 }
             }
         }
-        out
+    }
+
+    fn apply_scn_transform_point(m: &[f32; 16], p: [f32; 3]) -> [f32; 3] {
+        [
+            m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12],
+            m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13],
+            m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14],
+        ]
+    }
+
+    fn scn_chunk_focus_point(chunk: &ScnMeshChunk) -> Option<[f32; 3]> {
+        let mut min = [0.0f32; 3];
+        let mut max = [0.0f32; 3];
+        let mut have_bounds = false;
+
+        for vertex in &chunk.vertices {
+            let world_pos = if let Some(transform) = &chunk.transform {
+                Self::apply_scn_transform_point(transform, vertex.position)
+            } else {
+                vertex.position
+            };
+
+            if !have_bounds {
+                min = world_pos;
+                max = world_pos;
+                have_bounds = true;
+            } else {
+                min[0] = min[0].min(world_pos[0]);
+                min[1] = min[1].min(world_pos[1]);
+                min[2] = min[2].min(world_pos[2]);
+                max[0] = max[0].max(world_pos[0]);
+                max[1] = max[1].max(world_pos[1]);
+                max[2] = max[2].max(world_pos[2]);
+            }
+        }
+
+        have_bounds.then_some([
+            (min[0] + max[0]) * 0.5,
+            (min[1] + max[1]) * 0.5,
+            (min[2] + max[2]) * 0.5,
+        ])
+    }
+
+    fn scn_chunk_fallback_name(chunk: &ScnMeshChunk) -> String {
+        chunk
+            .texture_names
+            .first()
+            .and_then(|name| {
+                let trimmed = name.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(
+                        Path::new(trimmed)
+                            .file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .unwrap_or(trimmed)
+                            .to_owned(),
+                    )
+                }
+            })
+            .unwrap_or_else(|| format!("entry {}", chunk.entry_index))
+    }
+
+    fn scn_chunk_display_name(
+        names: &std::collections::BTreeSet<String>,
+        chunk: &ScnMeshChunk,
+    ) -> String {
+        let Some(first_name) = names.iter().next() else {
+            return Self::scn_chunk_fallback_name(chunk);
+        };
+
+        let extra_count = names.len().saturating_sub(1);
+        if extra_count == 0 {
+            first_name.clone()
+        } else {
+            format!("{} +{}", first_name, extra_count)
+        }
+    }
+
+    fn scn_chunk_group_name(
+        names: &std::collections::BTreeSet<String>,
+        chunk: &ScnMeshChunk,
+    ) -> String {
+        let groups = names
+            .iter()
+            .map(|name| Self::scn_node_group_name(name))
+            .collect::<std::collections::BTreeSet<_>>();
+
+        if let Some(first_group) = groups.iter().next() {
+            let extra_count = groups.len().saturating_sub(1);
+            if extra_count == 0 {
+                first_group.clone()
+            } else {
+                format!("{} +{}", first_group, extra_count)
+            }
+        } else {
+            Self::scn_node_group_name(&Self::scn_chunk_fallback_name(chunk))
+        }
+    }
+
+    fn show_scn_scene_items_inspector(
+        ui: &mut egui::Ui,
+        scn: &ScnFile,
+        scn_scene_unresolved: &[String],
+        selected_scn_node: &mut Option<usize>,
+        selected_scn_chunk: &mut Option<usize>,
+        hidden_scn_nodes: &mut std::collections::BTreeSet<usize>,
+        hidden_scn_chunks: &mut std::collections::BTreeSet<usize>,
+        scn_viewer: &mut GeoViewerState,
+        embedded_texture_previews: &std::collections::HashMap<String, DdsPreview>,
+        pending_embedded_texture_preview: &mut Option<(String, DdsPreview)>,
+    ) {
+        if !scn_scene_unresolved.is_empty() {
+            egui::CollapsingHeader::new("Missing archetypes")
+                .default_open(false)
+                .show(ui, |ui| {
+                    for name in scn_scene_unresolved {
+                        ui.monospace(name);
+                    }
+                });
+        }
+
+        ui.separator();
+        ui.heading("Scene items");
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            let hidden_total = hidden_scn_nodes.len() + hidden_scn_chunks.len();
+            ui.small(format!(
+                "Hidden: {} nodes, {} chunks",
+                hidden_scn_nodes.len(),
+                hidden_scn_chunks.len()
+            ));
+
+            if hidden_total > 0 && ui.small_button("Show all").clicked() {
+                hidden_scn_nodes.clear();
+                hidden_scn_chunks.clear();
+                ui.ctx().request_repaint();
+            }
+        });
+
+        let mut grouped_markers: std::collections::BTreeMap<
+            String,
+            Vec<(usize, String, [f32; 3], u32, u16)>,
+        > = std::collections::BTreeMap::new();
+
+        for node in scn.nodes.iter().filter(|node| node.is_marker()) {
+            grouped_markers
+                .entry(Self::scn_marker_kind(&node.name).to_owned())
+                .or_default()
+                .push((
+                    node.index,
+                    node.name.clone(),
+                    node.translation,
+                    node.record_offset,
+                    node.flags,
+                ));
+        }
+
+        egui::CollapsingHeader::new("Markers")
+            .id_salt(format!("scene_markers:{}", scn.path.display()))
+            .default_open(false)
+            .show(ui, |ui| {
+                if grouped_markers.is_empty() {
+                    ui.small("No named marker/gameplay nodes were found in this SCN.");
+                    return;
+                }
+
+                ui.small(
+                    "Markers are SCN nodes with no GEO archetype. The game uses their names as anchors for starts, cameras, routes, actors, and gameplay targets.",
+                );
+
+                egui::ScrollArea::vertical()
+                    .id_salt(format!("scene_markers_scroll:{}", scn.path.display()))
+                    .max_height(260.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (kind, markers) in &grouped_markers {
+                            egui::CollapsingHeader::new(format!("{} ({})", kind, markers.len()))
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    for (index, name, translation, record_offset, flags) in markers
+                                    {
+                                        let display_name = if name.trim().is_empty() {
+                                            "(unnamed)"
+                                        } else {
+                                            name.as_str()
+                                        };
+                                        let label = format!("#{:04} {}", index, display_name);
+                                        let hover_text = format!(
+                                            "kind={}\npos=({:.2}, {:.2}, {:.2})\nrec=0x{:08X}\nflags=0x{:04X}",
+                                            kind,
+                                            translation[0],
+                                            translation[1],
+                                            translation[2],
+                                            record_offset,
+                                            flags,
+                                        );
+                                        let is_selected = *selected_scn_node == Some(*index);
+                                        let is_visible = !hidden_scn_nodes.contains(index);
+
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .small_button(if is_visible { "Hide" } else { "Show" })
+                                                .clicked()
+                                            {
+                                                Self::set_scn_item_visibility(
+                                                    hidden_scn_nodes,
+                                                    hidden_scn_chunks,
+                                                    SceneSelection::Node(*index),
+                                                    !is_visible,
+                                                );
+                                                ui.ctx().request_repaint();
+                                            }
+
+                                            let text = if is_visible {
+                                                egui::RichText::new(label.clone())
+                                            } else {
+                                                egui::RichText::new(label.clone()).weak()
+                                            };
+                                            let response = ui.selectable_label(is_selected, text);
+                                            if response.clicked() {
+                                                Self::apply_scn_selection(
+                                                    selected_scn_node,
+                                                    selected_scn_chunk,
+                                                    SceneSelection::Node(*index),
+                                                );
+                                                focus_scene_viewer_on_point(scn_viewer, *translation);
+                                                ui.ctx().request_repaint();
+                                            }
+                                            response.on_hover_text(hover_text);
+                                        });
+                                    }
+                                });
+                        }
+                    });
+            });
+
+        let mut grouped_scene_nodes: std::collections::BTreeMap<
+            String,
+            Vec<(usize, String, String, [f32; 3], u32, u16)>,
+        > = std::collections::BTreeMap::new();
+
+        for node in &scn.nodes {
+            grouped_scene_nodes
+                .entry(Self::scn_node_group_name(&node.name))
+                .or_default()
+                .push((
+                    node.index,
+                    node.name.clone(),
+                    node.archetype_label().to_owned(),
+                    node.translation,
+                    node.record_offset,
+                    node.flags,
+                ));
+        }
+
+        egui::CollapsingHeader::new("Scene nodes")
+            .id_salt(format!("scene_nodes:{}", scn.path.display()))
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt(format!("scene_nodes_scroll:{}", scn.path.display()))
+                    .max_height(260.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (group_name, nodes) in &grouped_scene_nodes {
+                            egui::CollapsingHeader::new(format!(
+                                "{} ({})",
+                                group_name,
+                                nodes.len()
+                            ))
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                for (index, name, archetype, translation, record_offset, flags) in
+                                    nodes
+                                {
+                                    let display_name = if name.trim().is_empty() {
+                                        "(unnamed)"
+                                    } else {
+                                        name.as_str()
+                                    };
+                                    let label =
+                                        format!("#{:04} {} [{}]", index, display_name, archetype);
+                                    let hover_text = format!(
+                                        "pos=({:.2}, {:.2}, {:.2})\nrec=0x{:08X}\nflags=0x{:04X}",
+                                        translation[0],
+                                        translation[1],
+                                        translation[2],
+                                        record_offset,
+                                        flags,
+                                    );
+                                    let is_selected = *selected_scn_node == Some(*index);
+                                    let is_visible = !hidden_scn_nodes.contains(index);
+
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .small_button(if is_visible { "Hide" } else { "Show" })
+                                            .clicked()
+                                        {
+                                            Self::set_scn_item_visibility(
+                                                hidden_scn_nodes,
+                                                hidden_scn_chunks,
+                                                SceneSelection::Node(*index),
+                                                !is_visible,
+                                            );
+                                            ui.ctx().request_repaint();
+                                        }
+
+                                        let text = if is_visible {
+                                            egui::RichText::new(label.clone())
+                                        } else {
+                                            egui::RichText::new(label.clone()).weak()
+                                        };
+                                        let response = ui.selectable_label(is_selected, text);
+                                        if response.clicked() {
+                                            Self::apply_scn_selection(
+                                                selected_scn_node,
+                                                selected_scn_chunk,
+                                                SceneSelection::Node(*index),
+                                            );
+                                            focus_scene_viewer_on_point(scn_viewer, *translation);
+                                            ui.ctx().request_repaint();
+                                        }
+                                        response.on_hover_text(hover_text);
+                                    });
+                                }
+                            });
+                        }
+                    });
+            });
+
+        egui::CollapsingHeader::new("Embedded map chunks")
+            .id_salt(format!("scene_chunks:{}", scn.path.display()))
+            .default_open(false)
+            .show(ui, |ui| {
+                let mut chunk_names_by_record =
+                    std::collections::BTreeMap::<u32, std::collections::BTreeSet<String>>::new();
+                for node in &scn.nodes {
+                    let trimmed_name = node.name.trim();
+                    if !trimmed_name.is_empty() {
+                        chunk_names_by_record
+                            .entry(node.record_offset)
+                            .or_default()
+                            .insert(trimmed_name.to_owned());
+                    }
+                }
+
+                let mut grouped_chunks: std::collections::BTreeMap<
+                    String,
+                    Vec<(usize, String, String, Option<[f32; 3]>)>,
+                > = std::collections::BTreeMap::new();
+
+                for (chunk_index, chunk) in scn.mesh_chunks.iter().enumerate() {
+                    let name_hints = chunk_names_by_record
+                        .get(&chunk.entry_offset)
+                        .cloned()
+                        .unwrap_or_default();
+                    if !name_hints.is_empty() {
+                        continue;
+                    }
+                    let display_name = Self::scn_chunk_display_name(&name_hints, chunk);
+                    let group_name = Self::scn_chunk_group_name(&name_hints, chunk);
+                    let texture_hint = chunk
+                        .texture_names
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or("(no texture)");
+                    let names_line = if name_hints.is_empty() {
+                        "Names: none".to_owned()
+                    } else {
+                        format!(
+                            "Names: {}",
+                            name_hints.iter().cloned().collect::<Vec<_>>().join(", ")
+                        )
+                    };
+                    let hover_text = format!(
+                        "{}\nentry_off=0x{:08X}\nrecord_kind={}\nvertices={}\nindices={}\ntextures={}\nfirst_texture={}",
+                        names_line,
+                        chunk.entry_offset,
+                        chunk.record_kind,
+                        chunk.vertex_count,
+                        chunk.index_count,
+                        chunk.texture_names.len(),
+                        texture_hint,
+                    );
+
+                    grouped_chunks.entry(group_name).or_default().push((
+                        chunk_index,
+                        display_name,
+                        hover_text,
+                        Self::scn_chunk_focus_point(chunk),
+                    ));
+                }
+
+                egui::ScrollArea::vertical()
+                    .id_salt(format!("scene_chunks_scroll:{}", scn.path.display()))
+                    .max_height(220.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if grouped_chunks.is_empty() {
+                            ui.small(
+                                "All named embedded chunks are already represented by scene nodes. Unreferenced map chunks will show here.",
+                            );
+                        }
+                        for (group_name, chunks) in &grouped_chunks {
+                            egui::CollapsingHeader::new(format!(
+                                "{} ({})",
+                                group_name,
+                                chunks.len()
+                            ))
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                for (chunk_index, display_name, hover_text, focus_point) in chunks {
+                                    let chunk = &scn.mesh_chunks[*chunk_index];
+                                    let label = format!(
+                                        "#{:04} {}  entry={}  tris={}",
+                                        chunk_index,
+                                        display_name,
+                                        chunk.entry_index,
+                                        chunk.indices.len() / 3,
+                                    );
+                                    let is_selected = *selected_scn_chunk == Some(*chunk_index);
+                                    let is_visible = !hidden_scn_chunks.contains(chunk_index);
+
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .small_button(if is_visible { "Hide" } else { "Show" })
+                                            .clicked()
+                                        {
+                                            Self::set_scn_item_visibility(
+                                                hidden_scn_nodes,
+                                                hidden_scn_chunks,
+                                                SceneSelection::MeshChunk(*chunk_index),
+                                                !is_visible,
+                                            );
+                                            ui.ctx().request_repaint();
+                                        }
+
+                                        let text = if is_visible {
+                                            egui::RichText::new(label.clone())
+                                        } else {
+                                            egui::RichText::new(label.clone()).weak()
+                                        };
+                                        let response = ui.selectable_label(is_selected, text);
+                                        if response.clicked() {
+                                            Self::set_scn_item_visibility(
+                                                hidden_scn_nodes,
+                                                hidden_scn_chunks,
+                                                SceneSelection::MeshChunk(*chunk_index),
+                                                true,
+                                            );
+                                            Self::apply_scn_selection(
+                                                selected_scn_node,
+                                                selected_scn_chunk,
+                                                SceneSelection::MeshChunk(*chunk_index),
+                                            );
+                                            if let Some(center) = focus_point {
+                                                focus_scene_viewer_on_point(scn_viewer, *center);
+                                            }
+                                            ui.ctx().request_repaint();
+                                        }
+                                        response.on_hover_text(hover_text);
+                                    });
+                                }
+                            });
+                        }
+                    });
+            });
+
+        if let Some(selection) =
+            Self::current_scn_selection(*selected_scn_node, *selected_scn_chunk)
+        {
+            let is_visible =
+                Self::scn_item_is_visible(hidden_scn_nodes, hidden_scn_chunks, selection);
+
+            ui.separator();
+            ui.heading("Selected scene item");
+            ui.separator();
+
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "Visible: {}",
+                    if is_visible { "yes" } else { "no" }
+                ));
+                if ui
+                    .small_button(if is_visible { "Hide item" } else { "Show item" })
+                    .clicked()
+                {
+                    Self::set_scn_item_visibility(
+                        hidden_scn_nodes,
+                        hidden_scn_chunks,
+                        selection,
+                        !is_visible,
+                    );
+                    ui.ctx().request_repaint();
+                }
+            });
+
+            match selection {
+                SceneSelection::Node(selected_index) => {
+                    if let Some(node) = scn.nodes.get(selected_index) {
+                        let display_name = if node.name.trim().is_empty() {
+                            "(unnamed)"
+                        } else {
+                            node.name.as_str()
+                        };
+
+                        ui.label("Type: Scene node");
+                        ui.label(format!("Name: {}", display_name));
+                        ui.label(format!("Archetype: {}", node.archetype_label()));
+                        ui.label(format!(
+                            "Position: ({:.2}, {:.2}, {:.2})",
+                            node.translation[0], node.translation[1], node.translation[2]
+                        ));
+                        ui.label(format!("Record: 0x{:08X}", node.record_offset));
+                        ui.label(format!("Flags: 0x{:04X}", node.flags));
+
+                        if node.is_marker() {
+                            ui.label(format!(
+                                "Marker kind: {}",
+                                Self::scn_marker_kind(&node.name)
+                            ));
+                        }
+                    }
+                }
+                SceneSelection::MeshChunk(selected_chunk_index) => {
+                    if let Some(chunk) = scn.mesh_chunks.get(selected_chunk_index) {
+                        ui.label("Type: Embedded mesh chunk");
+                        ui.label(format!("Chunk index: {}", selected_chunk_index));
+                        ui.label(format!("Entry index: {}", chunk.entry_index));
+                        ui.label(format!("Entry offset: 0x{:08X}", chunk.entry_offset));
+                        ui.label(format!("Record kind: {}", chunk.record_kind));
+                        ui.label(format!("Vertices: {}", chunk.vertex_count));
+                        ui.label(format!("Indices: {}", chunk.index_count));
+                        ui.label(format!("Texture spans: {}", chunk.texture_spans.len()));
+
+                        if let Some(transform_index) = chunk.transform_index {
+                            ui.label(format!("Transform index: {}", transform_index));
+                        } else {
+                            ui.label("Transform index: none");
+                        }
+
+                        if !chunk.texture_names.is_empty() {
+                            ui.separator();
+                            ui.heading("Chunk textures");
+                            ui.separator();
+
+                            for name in &chunk.texture_names {
+                                let key = name.to_ascii_lowercase();
+                                if let Some(preview) = embedded_texture_previews.get(&key) {
+                                    if ui.button(name).clicked() {
+                                        *pending_embedded_texture_preview =
+                                            Some((name.clone(), preview.clone()));
+                                    }
+                                } else {
+                                    ui.colored_label(
+                                        egui::Color32::YELLOW,
+                                        format!("{} (not previewed)", name),
+                                    );
+                                }
+                            }
+                        }
+
+                        let referenced_nodes: Vec<_> = scn
+                            .nodes
+                            .iter()
+                            .filter(|node| node.record_offset == chunk.entry_offset)
+                            .collect();
+
+                        if !referenced_nodes.is_empty() {
+                            ui.separator();
+                            ui.heading("Nodes sharing this record");
+                            ui.separator();
+
+                            for node in referenced_nodes {
+                                let display_name = if node.name.trim().is_empty() {
+                                    "(unnamed)"
+                                } else {
+                                    node.name.as_str()
+                                };
+
+                                ui.monospace(format!(
+                                    "#{:04}  {:<22}  {:<12}",
+                                    node.index,
+                                    display_name,
+                                    node.archetype_label()
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn build_asset_links(&self) -> AssetLinks {
@@ -2091,13 +3491,35 @@ impl eframe::App for ModToolApp {
         self.update_bik_playback_clock(ui.ctx());
         self.ensure_anm_loaded();
         self.ensure_active_geo_animation_loaded();
-        self.update_active_geo_animation_clock(ui.ctx());
         self.ensure_geo_loaded();
         self.ensure_scn_loaded();
         self.ensure_scn_scene_loaded(ui.ctx());
         self.ensure_geo_materials_loaded(ui.ctx());
 
+        if ui
+            .ctx()
+            .input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::S))
+        {
+            if self.mod_script_path.is_some() {
+                self.save_mod_script();
+            } else if let (Some(scn), Some(path)) = (&self.scn_file, &self.scn_loaded_path) {
+                match scn.save_scn(path) {
+                    Ok(_) => {
+                        self.status = format!(
+                            "Saved: {}",
+                            path.file_name().unwrap_or_default().to_string_lossy()
+                        );
+                    }
+                    Err(e) => {
+                        self.scn_error = Some(format!("Save failed: {}", e));
+                    }
+                }
+            }
+        }
+
         let mut pending_jump: Option<PathBuf> = None;
+        let mut pending_texture_preview_path: Option<PathBuf> = None;
+        let mut pending_embedded_texture_preview: Option<(String, DdsPreview)> = None;
         if let Some(player) = self.audio_player.as_ref() {
             if !player.is_empty() {
                 ui.ctx().request_repaint();
@@ -2115,6 +3537,25 @@ impl eframe::App for ModToolApp {
                     .clicked()
                 {
                     self.rescan();
+                }
+
+                if ui
+                    .add_enabled(self.scn_file.is_some(), egui::Button::new("Save"))
+                    .clicked()
+                {
+                    if let (Some(scn), Some(path)) = (&self.scn_file, &self.scn_loaded_path) {
+                        match scn.save_scn(path) {
+                            Ok(_) => {
+                                self.status = format!(
+                                    "Saved: {}",
+                                    path.file_name().unwrap_or_default().to_string_lossy()
+                                );
+                            }
+                            Err(e) => {
+                                self.scn_error = Some(format!("Save failed: {}", e));
+                            }
+                        }
+                    }
                 }
 
                 let theme_label = if self.dark_mode {
@@ -2157,35 +3598,117 @@ impl eframe::App for ModToolApp {
                 ui.heading("Inspector");
                 ui.separator();
 
-                if let Some(path) = &self.selected_file {
-                    let ext = self.selected_extension().unwrap_or_else(|| "(none)".into());
-                    let size = std::fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0);
+                egui::ScrollArea::vertical()
+                    .id_salt("inspector_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.show_mod_workspace(ui);
+                        ui.separator();
 
-                    ui.label(format!("Path: {}", path.display()));
-                    ui.label(format!("Extension: {}", ext));
+                        if let Some(path) = &self.selected_file {
+                            let ext = self.selected_extension().unwrap_or_else(|| "(none)".into());
+                            let size = std::fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0);
 
-                    if let Some(category) = self.selected_category() {
-                        ui.label(format!("Category: {}", category_name(category)));
-                    }
+                            ui.label(format!("Path: {}", path.display()));
+                            ui.label(format!("Extension: {}", ext));
 
-                    ui.label(format!("Size: {} bytes", size));
+                            if let Some(category) = self.selected_category() {
+                                ui.label(format!("Category: {}", category_name(category)));
+                            }
 
-                    if ext == "dds" {
-                        if let Some(preview) = &self.dds_preview {
-                            ui.label(format!("Width: {}", preview.width));
-                            ui.label(format!("Height: {}", preview.height));
-                            ui.label(format!("Mipmaps: {}", preview.mipmaps));
-                        }
+                            ui.label(format!("Size: {} bytes", size));
 
-                        if let Some(err) = &self.dds_error {
-                            ui.colored_label(
-                                egui::Color32::RED,
-                                format!("DDS preview error: {}", err),
+                            ui.separator();
+                            Self::show_game_code_map(ui, &self.game_code_map, Some(path.as_path()));
+
+                            ui.separator();
+                            ui.heading("Tool scripting");
+                            ui.small(
+                                "Experimental mod-tool commands. This is separate from the game's Daffyd-only XML files.",
                             );
-                        }
-                    }
+                            ui.horizontal(|ui| {
+                                ui.label("Script:");
+                                ui.text_edit_singleline(&mut self.script_path);
+                            });
+                            if ui.button("Run Script").clicked() {
+                                let script_path = PathBuf::from(&self.script_path);
+                                if script_path.exists() {
+                                    let mut engine = ScriptEngine::new();
+                                    engine.init();
+                                    match engine.run_script(&script_path) {
+                                        Ok(_) => {
+                                            // Handle queued operations BEFORE getting logs
+                                            if let Some(load_path) = engine.get_pending_load() {
+                                                self.script_logs.push(format!("[DEBUG] Loading: {}", load_path));
+                                                match load_scn(Path::new(&load_path)) {
+                                                    Ok(scn) => {
+                                                        self.scn_file = Some(scn);
+                                                        self.scn_loaded_path = Some(PathBuf::from(&load_path));
+                                                        self.script_logs.push(format!("[OK] Loaded: {} nodes", self.scn_file.as_ref().map(|s| s.nodes.len()).unwrap_or(0)));
+                                                    }
+                                                    Err(e) => {
+                                                        self.script_logs.push(format!("[ERR] Load failed: {}", e));
+                                                    }
+                                                }
+                                            }
 
-                    if ext == "bnk" {
+                                            if let Some(save_path) = engine.get_pending_save() {
+                                                self.script_logs.push(format!("[DEBUG] Saving to: {}", save_path));
+                                                if let Some(ref scn) = self.scn_file {
+                                                    match scn.save_scn(Path::new(&save_path)) {
+                                                        Ok(_) => {
+                                                            self.script_logs.push(format!("[OK] Saved: {}", save_path));
+                                                        }
+                                                        Err(e) => {
+                                                            self.script_logs.push(format!("[ERR] Save failed: {}", e));
+                                                        }
+                                                    }
+                                                } else {
+                                                    self.script_logs.push("[ERR] No SCN loaded to save".to_string());
+                                                }
+                                            }
+
+                                            // Append script logs
+                                            for msg in engine.get_logs() {
+                                                self.script_logs.push(msg.clone());
+                                            }
+                                            self.status = "Script executed".to_owned();
+                                        }
+                                        Err(e) => {
+                                            self.script_logs.push(format!("Error: {}", e));
+                                        }
+                                    }
+                                } else {
+                                    self.script_logs.push("Script file not found".to_string());
+                                }
+                            }
+                            if ui.button("Clear Logs").clicked() {
+                                self.script_logs.clear();
+                            }
+                            egui::ScrollArea::both()
+                                .auto_shrink([false, false])
+                                .stick_to_bottom(true)
+                                .show(ui, |ui| {
+                                    for msg in &self.script_logs {
+                                        ui.label(msg);
+                                    }
+                                });
+
+                            ui.separator();
+
+                            if ext == "dds" {
+                                if let Some(preview) = &self.dds_preview {
+                                    ui.label(format!("Width: {}", preview.width));
+                                    ui.label(format!("Height: {}", preview.height));
+                                    ui.label(format!("Mipmaps: {}", preview.mipmaps));
+                                }
+
+                                if let Some(err) = &self.dds_error {
+                                    ui.colored_label(egui::Color32::RED, format!("DDS preview error: {}", err));
+                                }
+                            }
+
+                            if ext == "bnk" {
                         if let Some(bnk) = &self.bnk_file {
                             ui.label(format!("Entries: {}", bnk.entry_count));
                             ui.label(format!("Bank size: {} bytes", bnk.file_size));
@@ -2311,98 +3834,116 @@ impl eframe::App for ModToolApp {
                         }
                     }
 
-                    if ext == "scn" {
-                        if let Some(scn) = &self.scn_file {
-                            ui.label(format!("Nodes: {}", scn.nodes.len()));
-                            ui.label(format!("Renderable nodes: {}", scn.renderable_count()));
-                            ui.label(format!("Marker nodes: {}", scn.marker_count()));
-                            ui.label(format!(
-                                "Embedded chunks: {}",
-                                scn.embedded_mesh_chunk_count()
-                            ));
-                            ui.label(format!(
-                                "Embedded tris: {}",
-                                scn.embedded_triangle_count()
-                            ));
+                            if ext == "scn" {
+                                if let Some(scn) = self.scn_file.as_ref() {
+                                    ui.label(format!("Nodes: {}", scn.nodes.len()));
+                                    ui.label(format!("Renderable nodes: {}", scn.renderable_count()));
+                                    ui.label(format!("Marker nodes: {}", scn.marker_count()));
+                                    ui.label(format!(
+                                        "Embedded chunks: {}",
+                                        scn.embedded_mesh_chunk_count()
+                                    ));
+                                    ui.label(format!(
+                                        "Embedded tris: {}",
+                                        scn.embedded_triangle_count()
+                                    ));
+                                    ui.label(format!(
+                                        "Embedded textures: {}",
+                                        scn.embedded_texture_name_count()
+                                    ));
+                                    ui.label(format!(
+                                        "Texture spans: {}",
+                                        scn.texture_span_count()
+                                    ));
+                                    ui.label(format!(
+                                        "Secondary transforms: {}",
+                                        scn.secondary_transforms.len()
+                                    ));
+                                    ui.label(format!("Remap pairs: {}", scn.remap_pairs.len()));
+                                    ui.label(format!("Resolved GEOs: {}", self.scn_scene_models.len()));
+                                    ui.label(format!(
+                                        "Missing archetypes: {}",
+                                        self.scn_scene_unresolved.len()
+                                    ));
+                                    ui.label(format!(
+                                        "Hidden nodes: {}",
+                                        self.hidden_scn_nodes.len()
+                                    ));
+                                    ui.label(format!(
+                                        "Hidden chunks: {}",
+                                        self.hidden_scn_chunks.len()
+                                    ));
 
-                            ui.label(format!(
-                                "Embedded textures: {}",
-                                scn.embedded_texture_name_count()
-                            ));
+                                    Self::show_scn_scene_items_inspector(
+                                        ui,
+                                        scn,
+                                        &self.scn_scene_unresolved,
+                                        &mut self.selected_scn_node,
+                                        &mut self.selected_scn_chunk,
+                                        &mut self.hidden_scn_nodes,
+                                        &mut self.hidden_scn_chunks,
+                                        &mut self.scn_viewer,
+                                        &self.scn_embedded_texture_previews,
+                                        &mut pending_embedded_texture_preview,
+                                    );
 
-                            ui.label(format!(
-                                "Texture spans: {}",
-                                scn.texture_span_count()
-                            ));
+                                    ui.separator();
+                                    ui.heading("Header");
+                                    ui.separator();
 
-                            ui.label(format!(
-                                "Secondary transforms: {}",
-                                scn.secondary_transforms.len()
-                            ));
-                            ui.label(format!("Remap pairs: {}", scn.remap_pairs.len()));
-                            ui.label(format!("Resolved GEOs: {}", self.scn_scene_models.len()));
-                            ui.label(format!(
-                                "Missing archetypes: {}",
-                                self.scn_scene_unresolved.len()
-                            ));
+                                    ui.label(format!("version: {}", scn.header.version));
+                                    ui.label(format!("unk_04: {}", scn.header.unk_04));
+                                    ui.label(format!("remap_count: {}", scn.header.remap_count));
+                                    ui.label(format!(
+                                        "record_table_off: 0x{:08X}",
+                                        scn.header.record_table_offset
+                                    ));
+                                    ui.label(format!("node_count: {}", scn.header.node_count));
+                                    ui.label(format!(
+                                        "names_off: 0x{:08X}",
+                                        scn.header.names_offset
+                                    ));
+                                    ui.label(format!(
+                                        "xforms_off: 0x{:08X}",
+                                        scn.header.transforms_offset
+                                    ));
+                                    ui.label(format!(
+                                        "archetypes_off: 0x{:08X}",
+                                        scn.header.archetypes_offset
+                                    ));
+                                    ui.label(format!(
+                                        "flags_off: 0x{:08X}",
+                                        scn.header.flags_offset
+                                    ));
+                                    ui.label(format!(
+                                        "secondary_xforms_off: 0x{:08X}",
+                                        scn.header.secondary_transform_offset
+                                    ));
 
-                            ui.separator();
-                            ui.heading("Header");
-                            ui.separator();
+                                    ui.separator();
+                                    ui.heading("Span modes");
+                                    ui.separator();
 
-                            ui.label(format!("version: {}", scn.header.version));
-                            ui.label(format!("unk_04: {}", scn.header.unk_04));
-                            ui.label(format!("remap_count: {}", scn.header.remap_count));
-                            ui.label(format!(
-                                "record_table_off: 0x{:08X}",
-                                scn.header.record_table_offset
-                            ));
-                            ui.label(format!("node_count: {}", scn.header.node_count));
-                            ui.label(format!(
-                                "names_off: 0x{:08X}",
-                                scn.header.names_offset
-                            ));
-                            ui.label(format!(
-                                "xforms_off: 0x{:08X}",
-                                scn.header.transforms_offset
-                            ));
-                            ui.label(format!(
-                                "archetypes_off: 0x{:08X}",
-                                scn.header.archetypes_offset
-                            ));
-                            ui.label(format!(
-                                "flags_off: 0x{:08X}",
-                                scn.header.flags_offset
-                            ));
-                            ui.label(format!(
-                                "secondary_xforms_off: 0x{:08X}",
-                                scn.header.secondary_transform_offset
-                            ));
+                                    for (mode, count) in scn.texture_span_mode_counts() {
+                                        ui.label(format!("mode {}: {}", mode, count));
+                                    }
 
-                            ui.separator();
-                            ui.heading("Span modes");
-                            ui.separator();
+                                    ui.separator();
+                                    ui.heading("Top archetypes");
+                                    ui.separator();
 
-                            for (mode, count) in scn.texture_span_mode_counts() {
-                                ui.label(format!("mode {}: {}", mode, count));
+                                    for (name, count) in scn.top_archetypes(24) {
+                                        ui.label(format!("{name}: {count}"));
+                                    }
+                                }
+
+                                if let Some(err) = &self.scn_error {
+                                    ui.colored_label(
+                                        egui::Color32::RED,
+                                        format!("SCN read error: {}", err),
+                                    );
+                                }
                             }
-
-                            ui.separator();
-                            ui.heading("Top archetypes");
-                            ui.separator();
-
-                            for (name, count) in scn.top_archetypes(24) {
-                                ui.label(format!("{name}: {count}"));
-                            }
-                        }
-
-                        if let Some(err) = &self.scn_error {
-                            ui.colored_label(
-                                egui::Color32::RED,
-                                format!("SCN read error: {}", err),
-                            );
-                        }
-                    }
 
                     if ext == "geo" {
                         if let Some(geo) = &self.geo_file {
@@ -2467,35 +4008,40 @@ impl eframe::App for ModToolApp {
                     }
                 }
 
-                    ui.separator();
-                    ui.label("Viewer:");
+                            ui.separator();
+                            ui.label("Viewer:");
 
-                    match ext.as_str() {
-                        "dds" => {
-                            ui.label("Texture viewer loaded.");
+                            match ext.as_str() {
+                                "dds" => {
+                                    ui.label("Texture viewer loaded.");
+                                }
+                                "bnk" => {
+                                    ui.label("BNK reader loaded.");
+                                }
+                                "wav" | "ogg" => {
+                                    ui.label("Audio controls are shown in the preview panel.");
+                                }
+                                "geo" => {
+                                    ui.label("GEO reader loaded.");
+                                }
+                                "bik" => {
+                                    ui.label("BIK player loaded.");
+                                }
+                                "scn" => {
+                                    ui.label("SCN inspector loaded.");
+                                }
+                                _ => {
+                                    ui.label("No viewer yet. Raw/hex viewer later.");
+                                }
+                            }
+                        } else {
+                            if self.mod_script_path.is_some() {
+                                self.show_mod_script_editor(ui);
+                            } else {
+                                ui.label("Select a file or create a Lua mod.");
+                            }
                         }
-                        "bnk" => {
-                            ui.label("BNK reader loaded.");
-                        }
-                        "wav" | "ogg" => {
-                            ui.label("Audio controls are shown in the preview panel.");
-                        }
-                        "geo" => {
-                            ui.label("GEO reader loaded.");
-                        }
-                        "bik" => {
-                            ui.label("BIK player loaded.");
-                        }
-                        "scn" => {
-                            ui.label("SCN inspector loaded.");
-                        }
-                        _ => {
-                            ui.label("No viewer yet. Raw/hex viewer later.");
-                        }
-                    }
-                } else {
-                    ui.label("Select a file.");
-                }
+                    });
             });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
@@ -2870,11 +4416,19 @@ impl eframe::App for ModToolApp {
                     }
 
                     Some("scn") => {
-                        if let Some(scn) = &self.scn_file {
-                            let selected_scene_item = self
-                                .selected_scn_node
-                                .map(SceneSelection::Node)
-                                .or_else(|| self.selected_scn_chunk.map(SceneSelection::MeshChunk));
+                        if let Some(scn) = self.scn_file.as_mut() {
+                            if (self.selected_scn_node.is_some() || self.selected_scn_chunk.is_some())
+                                && ui.ctx().input(|i| i.key_pressed(egui::Key::Escape))
+                            {
+                                self.selected_scn_node = None;
+                                self.selected_scn_chunk = None;
+                                ui.ctx().request_repaint();
+                            }
+
+                            let selected_scene_item = Self::current_scn_selection(
+                                self.selected_scn_node,
+                                self.selected_scn_chunk,
+                            );
 
                             if let Some(picked_item) = draw_scene_viewer(
                                 ui,
@@ -2884,17 +4438,14 @@ impl eframe::App for ModToolApp {
                                 &mut self.scn_viewer,
                                 self.scn_view_height,
                                 selected_scene_item,
+                                &self.hidden_scn_nodes,
+                                &self.hidden_scn_chunks,
                             ) {
-                                match picked_item {
-                                    SceneSelection::Node(index) => {
-                                        self.selected_scn_node = Some(index);
-                                        self.selected_scn_chunk = None;
-                                    }
-                                    SceneSelection::MeshChunk(index) => {
-                                        self.selected_scn_chunk = Some(index);
-                                        self.selected_scn_node = None;
-                                    }
-                                }
+                                Self::apply_scn_selection(
+                                    &mut self.selected_scn_node,
+                                    &mut self.selected_scn_chunk,
+                                    picked_item,
+                                );
                                 ui.ctx().request_repaint();
                             }
                             let (resize_rect, resize_response) = ui.allocate_exact_size(
@@ -2970,6 +4521,14 @@ impl eframe::App for ModToolApp {
                                         ));
                                         ui.separator();
                                     }
+                                    if marker_summary.spawns > 0 {
+                                        ui.label(format!("Spawns: {}", marker_summary.spawns));
+                                        ui.separator();
+                                    }
+                                    if marker_summary.cameras > 0 {
+                                        ui.label(format!("Cameras: {}", marker_summary.cameras));
+                                        ui.separator();
+                                    }
                                     if marker_summary.checkpoints > 0 {
                                         ui.label(format!(
                                             "Checkpoints: {}",
@@ -2981,6 +4540,13 @@ impl eframe::App for ModToolApp {
                                         ui.label(format!(
                                             "Route markers: {}",
                                             marker_summary.path_nodes
+                                        ));
+                                        ui.separator();
+                                    }
+                                    if marker_summary.gameplay_targets > 0 {
+                                        ui.label(format!(
+                                            "Gameplay targets: {}",
+                                            marker_summary.gameplay_targets
                                         ));
                                         ui.separator();
                                     }
@@ -2998,10 +4564,13 @@ impl eframe::App for ModToolApp {
                             }
 
                             ui.small(
-                                "This 3D view draws embedded SCN mesh plus any placed GEO props. Marker colors now highlight actor/script anchors, starts, checkpoints, routes, and traffic helpers.",
+                                "This 3D view draws embedded SCN mesh plus any placed GEO props. Marker groups now separate actors, starts, cameras, checkpoints, routes, traffic, and gameplay targets.",
                             );
                             ui.small(
-                                "Click markers, prop instances, or embedded map chunks in the 3D view to inspect them below.",
+                                "Click markers, prop instances, or embedded map chunks in the 3D view to inspect them. Press Esc to clear the selection.",
+                            );
+                            ui.small(
+                                "Scene items, selection details, and visibility toggles are in the Inspector panel on the right. Move/Rotate/Scale mode lives in the viewport's top-right corner.",
                             );
 
                             if let Some(err) = &self.scn_scene_error {
@@ -3009,309 +4578,6 @@ impl eframe::App for ModToolApp {
                                     egui::Color32::RED,
                                     format!("SCN scene load error: {}", err),
                                 );
-                            }
-
-                            if !self.scn_scene_unresolved.is_empty() {
-                                egui::CollapsingHeader::new("Missing archetypes")
-                                    .default_open(false)
-                                    .show(ui, |ui| {
-                                        for name in &self.scn_scene_unresolved {
-                                            ui.monospace(name);
-                                        }
-                                    });
-                            }
-
-                            if let Some(err) = &self.scn_script_error {
-                                ui.colored_label(
-                                    egui::Color32::RED,
-                                    format!("Companion script read error: {}", err),
-                                );
-                            } else if !self.scn_script_summary.files.is_empty() {
-                                let matched_script_names = self
-                                    .scn_script_summary
-                                    .matched_scene_nodes
-                                    .iter()
-                                    .map(|name| name.to_ascii_lowercase())
-                                    .collect::<std::collections::BTreeSet<_>>();
-
-                                egui::CollapsingHeader::new("Companion scripts")
-                                    .default_open(false)
-                                    .show(ui, |ui| {
-                                        ui.label(format!(
-                                            "Script files: {}",
-                                            self.scn_script_summary.files.len()
-                                        ));
-                                        ui.label(format!(
-                                            "Matched scene nodes: {}",
-                                            self.scn_script_summary.matched_scene_nodes.len()
-                                        ));
-
-                                        if !self.scn_script_summary.unmatched_script_nodes.is_empty()
-                                        {
-                                            ui.label(format!(
-                                                "Script nodes without SCN match: {}",
-                                                self.scn_script_summary.unmatched_script_nodes.len()
-                                            ));
-                                        }
-
-                                        ui.separator();
-
-                                        for file in &self.scn_script_summary.files {
-                                            let file_name = file
-                                                .path
-                                                .file_name()
-                                                .map(|name| name.to_string_lossy().to_string())
-                                                .unwrap_or_else(|| file.path.display().to_string());
-
-                                            egui::CollapsingHeader::new(format!(
-                                                "{} ({})",
-                                                file_name,
-                                                file.nodes.len()
-                                            ))
-                                            .default_open(false)
-                                            .show(ui, |ui| {
-                                                let list_height =
-                                                    ui.available_height().clamp(120.0, 220.0);
-
-                                                egui::ScrollArea::vertical()
-                                                    .max_height(list_height)
-                                                    .auto_shrink([false, false])
-                                                    .show(ui, |ui| {
-                                                        for node in &file.nodes {
-                                                            let matched = matched_script_names
-                                                                .contains(
-                                                                    &node.name.to_ascii_lowercase(),
-                                                                );
-                                                            let state = if matched {
-                                                                "scene node"
-                                                            } else {
-                                                                "script only"
-                                                            };
-
-                                                            let anim = node
-                                                                .animation
-                                                                .as_deref()
-                                                                .unwrap_or("?");
-                                                            let step_count = node.steps.len();
-
-                                                            ui.monospace(format!(
-                                                                "{:<18} anim={}  steps={}  {}",
-                                                                node.name, anim, step_count, state
-                                                            ));
-                                                        }
-                                                    });
-                                            });
-                                        }
-
-                                        if !self.scn_script_summary.unmatched_script_nodes.is_empty()
-                                        {
-                                            ui.separator();
-                                            egui::CollapsingHeader::new("Script nodes not found in SCN")
-                                                .default_open(false)
-                                                .show(ui, |ui| {
-                                                    for name in &self.scn_script_summary.unmatched_script_nodes {
-                                                        ui.monospace(name);
-                                                    }
-                                                });
-                                        }
-                                    });
-                            }
-
-                            ui.separator();
-
-                            let mut grouped_scene_nodes: std::collections::BTreeMap<
-                                String,
-                                Vec<(usize, String, String, [f32; 3], u32, u16)>,
-                            > = std::collections::BTreeMap::new();
-
-                            for node in &scn.nodes {
-                                let group_name = Self::scn_node_group_name(&node.name);
-
-                                grouped_scene_nodes
-                                    .entry(group_name)
-                                    .or_default()
-                                    .push((
-                                        node.index,
-                                        node.name.clone(),
-                                        node.archetype_label().to_owned(),
-                                        node.translation,
-                                        node.record_offset,
-                                        node.flags,
-                                    ));
-                            }
-
-                            egui::CollapsingHeader::new("Scene nodes")
-                                .id_salt(format!("scene_nodes:{}", scn.path.display()))
-                                .default_open(true)
-                                .show(ui, |ui| {
-                                    let scene_nodes_height = ui.available_height().clamp(180.0, 420.0);
-
-                                    egui::ScrollArea::vertical()
-                                        .id_salt(format!("scene_nodes_scroll:{}", scn.path.display()))
-                                        .max_height(scene_nodes_height)
-                                        .auto_shrink([false, false])
-                                        .show(ui, |ui| {
-                                            for (group_name, nodes) in &grouped_scene_nodes {
-                                                egui::CollapsingHeader::new(format!(
-                                                    "{} ({})",
-                                                    group_name,
-                                                    nodes.len()
-                                                ))
-                                                .default_open(false)
-                                                .show(ui, |ui| {
-                                                    for (index, name, archetype, translation, record_offset, flags) in nodes {
-                                                        let label = format!(
-                                                            "#{:04}  {:<22}  {:<12}  pos=({:>9.2}, {:>9.2}, {:>9.2})  rec=0x{:08X}  flag=0x{:04X}",
-                                                            index,
-                                                            name,
-                                                            archetype,
-                                                            translation[0],
-                                                            translation[1],
-                                                            translation[2],
-                                                            record_offset,
-                                                            flags,
-                                                        );
-
-                                                        let is_selected =
-                                                            self.selected_scn_node == Some(*index);
-
-                                                        if ui.selectable_label(is_selected, label).clicked() {
-                                                            self.selected_scn_node = Some(*index);
-                                                            self.selected_scn_chunk = None;
-                                                            focus_scene_viewer_on_point(
-                                                                &mut self.scn_viewer,
-                                                                *translation,
-                                                            );
-                                                            ui.ctx().request_repaint();
-                                                        }
-                                                    }
-                                                });
-                                            }
-                                        });
-                                });
-
-                            if self.selected_scn_node.is_some() || self.selected_scn_chunk.is_some() {
-                                ui.separator();
-                                ui.heading("Selected scene item");
-                                ui.separator();
-                            }
-
-                            if let Some(selected_index) = self.selected_scn_node {
-                                if let Some(node) = scn.nodes.get(selected_index) {
-                                    let display_name = if node.name.trim().is_empty() {
-                                        "(unnamed)"
-                                    } else {
-                                        node.name.as_str()
-                                    };
-
-                                    ui.label("Type: Scene node");
-                                    ui.label(format!("Name: {}", display_name));
-                                    ui.label(format!("Archetype: {}", node.archetype_label()));
-                                    ui.label(format!(
-                                        "Position: ({:.2}, {:.2}, {:.2})",
-                                        node.translation[0],
-                                        node.translation[1],
-                                        node.translation[2]
-                                    ));
-                                    ui.label(format!("Record: 0x{:08X}", node.record_offset));
-                                    ui.label(format!("Flags: 0x{:04X}", node.flags));
-
-                                    if node.is_marker() {
-                                        ui.label(format!(
-                                            "Marker kind: {}",
-                                            Self::scn_marker_kind(&node.name)
-                                        ));
-                                    }
-
-                                    let script_matches = Self::scn_script_matches(
-                                        &self.scn_script_summary,
-                                        &node.name,
-                                    );
-
-                                    if !script_matches.is_empty() {
-                                        ui.separator();
-                                        ui.heading("Companion script bindings");
-                                        ui.separator();
-
-                                        for (script_path, script_node) in script_matches {
-                                            let title = script_path
-                                                .file_name()
-                                                .map(|name| name.to_string_lossy().to_string())
-                                                .unwrap_or_else(|| script_path.display().to_string());
-
-                                            egui::CollapsingHeader::new(title)
-                                                .default_open(true)
-                                                .show(ui, |ui| {
-                                                    if let Some(animation) =
-                                                        script_node.animation.as_deref()
-                                                    {
-                                                        ui.label(format!(
-                                                            "Animation index: {}",
-                                                            animation
-                                                        ));
-                                                    }
-
-                                                    for step in &script_node.steps {
-                                                        ui.monospace(step);
-                                                    }
-                                                });
-                                        }
-                                    }
-                                }
-                            } else if let Some(selected_chunk_index) = self.selected_scn_chunk {
-                                if let Some(chunk) = scn.mesh_chunks.get(selected_chunk_index) {
-                                    ui.label("Type: Embedded mesh chunk");
-                                    ui.label(format!("Chunk index: {}", selected_chunk_index));
-                                    ui.label(format!("Entry index: {}", chunk.entry_index));
-                                    ui.label(format!("Entry offset: 0x{:08X}", chunk.entry_offset));
-                                    ui.label(format!("Record kind: {}", chunk.record_kind));
-                                    ui.label(format!("Vertices: {}", chunk.vertex_count));
-                                    ui.label(format!("Indices: {}", chunk.index_count));
-                                    ui.label(format!("Texture spans: {}", chunk.texture_spans.len()));
-
-                                    if let Some(transform_index) = chunk.transform_index {
-                                        ui.label(format!("Transform index: {}", transform_index));
-                                    } else {
-                                        ui.label("Transform index: none");
-                                    }
-
-                                    if !chunk.texture_names.is_empty() {
-                                        ui.separator();
-                                        ui.heading("Chunk textures");
-                                        ui.separator();
-
-                                        for name in &chunk.texture_names {
-                                            ui.monospace(name);
-                                        }
-                                    }
-
-                                    let referenced_nodes: Vec<_> = scn
-                                        .nodes
-                                        .iter()
-                                        .filter(|node| node.record_offset == chunk.entry_offset)
-                                        .collect();
-
-                                    if !referenced_nodes.is_empty() {
-                                        ui.separator();
-                                        ui.heading("Nodes sharing this record");
-                                        ui.separator();
-
-                                        for node in referenced_nodes {
-                                            let display_name = if node.name.trim().is_empty() {
-                                                "(unnamed)"
-                                            } else {
-                                                node.name.as_str()
-                                            };
-
-                                            ui.monospace(format!(
-                                                "#{:04}  {:<22}  {:<12}",
-                                                node.index,
-                                                display_name,
-                                                node.archetype_label()
-                                            ));
-                                        }
-                                    }
-                                }
                             }
                         } else if let Some(err) = &self.scn_error {
                             ui.colored_label(
@@ -3451,7 +4717,8 @@ impl eframe::App for ModToolApp {
                                                 match &tex.resolved_path {
                                                     Some(path) => {
                                                         if left.button(&tex.name).clicked() {
-                                                            pending_jump = Some(path.clone());
+                                                            pending_texture_preview_path =
+                                                                Some(path.clone());
                                                         }
                                                     }
                                                     None => {
@@ -3486,8 +4753,11 @@ impl eframe::App for ModToolApp {
                                                         texture_refs.iter().find(|t| t.name == *tex_name)
                                                     {
                                                         match &tex_ref.resolved_path {
-                                                            Some(_path) => {
-                                                                ui.label(tex_name);
+                                                            Some(path) => {
+                                                                if ui.small_button(tex_name).clicked() {
+                                                                    pending_texture_preview_path =
+                                                                        Some(path.clone());
+                                                                }
                                                             }
                                                             None => {
                                                                 ui.colored_label(
@@ -3696,7 +4966,8 @@ impl eframe::App for ModToolApp {
                                                 match &tex.resolved_path {
                                                     Some(path) => {
                                                         if left.button(&tex.name).clicked() {
-                                                            pending_jump = Some(path.clone());
+                                                            pending_texture_preview_path =
+                                                                Some(path.clone());
                                                         }
                                                     }
                                                     None => {
@@ -3731,8 +5002,11 @@ impl eframe::App for ModToolApp {
                                                         texture_refs.iter().find(|t| t.name == *tex_name)
                                                     {
                                                         match &tex_ref.resolved_path {
-                                                            Some(_path) => {
-                                                                ui.label(tex_name);
+                                                            Some(path) => {
+                                                                if ui.small_button(tex_name).clicked() {
+                                                                    pending_texture_preview_path =
+                                                                        Some(path.clone());
+                                                                }
                                                             }
                                                             None => {
                                                                 ui.colored_label(
@@ -3818,6 +5092,16 @@ impl eframe::App for ModToolApp {
                 ui.label("Open the game folder, then click a file.");
             }
         });
+
+        if let Some((title, preview)) = pending_embedded_texture_preview {
+            self.open_texture_preview_window(title, preview);
+        }
+
+        if let Some(path) = pending_texture_preview_path {
+            self.open_texture_path_preview_window(ui.ctx(), &path);
+        }
+
+        self.draw_texture_preview_windows(ui.ctx());
 
         if let Some(path) = pending_jump {
             self.jump_to_file(path);

@@ -708,5 +708,110 @@ fn read_f32(data: &[u8], off: usize) -> Result<f32> {
     let bytes = data
         .get(off..off + 4)
         .ok_or_else(|| anyhow!("f32 read out of range at 0x{:X}", off))?;
-    Ok(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+Ok(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+impl ScnFile {
+    pub fn save_scn(&self, path: &Path) -> Result<()> {
+        let source = &self.path;
+        
+        if !source.exists() {
+            bail!("Source SCN file not found: {}", source.display());
+        }
+        
+        let mut data = fs::read(source).with_context(|| format!("Failed to read source SCN"))?;
+        
+        let transforms_offset = read_u32(&data, 0x1C)? as usize;
+        let node_count = read_u32(&data, 0x14)? as usize;
+
+        if self.nodes.len() != node_count {
+            bail!("Node count mismatch");
+        }
+
+        for (i, node) in self.nodes.iter().enumerate() {
+            let off = transforms_offset + i * MATRIX_STRIDE;
+            for (j, &val) in node.transform.iter().enumerate() {
+                write_f32(&mut data, off + j * 4, val);
+            }
+        }
+
+        let secondary_offset = read_u32(&data, 0x34)? as usize;
+        let secondary_count = read_u32(&data, 0x30)? as usize;
+
+        for chunk in &self.mesh_chunks {
+            if let Some(transform) = chunk.transform {
+                if let Some(idx) = chunk.transform_index {
+                    if idx < secondary_count {
+                        let off = secondary_offset + idx * MATRIX_STRIDE;
+                        for (j, &val) in transform.iter().enumerate() {
+                            write_f32(&mut data, off + j * 4, val);
+                        }
+                    }
+                }
+            }
+        }
+
+        fs::write(path, data).with_context(|| format!("Failed to write SCN"))?;
+
+        Ok(())
+    }
+
+    pub fn update_node_transform(&mut self, index: usize, transform: [f32; 16]) {
+        if index < self.nodes.len() {
+            self.nodes[index].transform = transform;
+            self.nodes[index].translation = [transform[12], transform[13], transform[14]];
+        }
+    }
+
+    pub fn add_node(&mut self, name: String, archetype: String, transform: [f32; 16], flags: u16) {
+        let new_node = ScnNode {
+            index: self.nodes.len(),
+            record_offset: 0,
+            name,
+            archetype,
+            flags,
+            transform,
+            translation: [transform[12], transform[13], transform[14]],
+        };
+        self.nodes.push(new_node);
+    }
+
+    pub fn remove_node(&mut self, index: usize) -> Option<ScnNode> {
+        if index < self.nodes.len() {
+            Some(self.nodes.remove(index))
+        } else {
+            None
+        }
+    }
+}
+
+fn write_u16(data: &mut Vec<u8>, off: usize, val: u16) {
+    let bytes = val.to_le_bytes();
+    if off + 2 > data.len() {
+        data.resize(off + 2, 0);
+    }
+    data[off] = bytes[0];
+    data[off + 1] = bytes[1];
+}
+
+fn write_u32(data: &mut Vec<u8>, off: usize, val: u32) {
+    let bytes = val.to_le_bytes();
+    if off + 4 > data.len() {
+        data.resize(off + 4, 0);
+    }
+    data[off] = bytes[0];
+    data[off + 1] = bytes[1];
+    data[off + 2] = bytes[2];
+    data[off + 3] = bytes[3];
+}
+
+fn write_f32(data: &mut Vec<u8>, off: usize, val: f32) {
+    let bytes = val.to_le_bytes();
+    if off + 4 > data.len() {
+        data.resize(off + 4, 0);
+    }
+    data[off] = bytes[0];
+    data[off + 1] = bytes[1];
+    data[off + 2] = bytes[2];
+    data[off + 3] = bytes[3];
 }

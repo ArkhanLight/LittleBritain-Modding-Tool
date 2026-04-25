@@ -2,7 +2,7 @@ use crate::{
     anm::{RigidAnimClip, RigidAnimStream},
     dds_preview::DdsPreview,
     geo::{GeoFile, GeoSkeleton},
-    scn::{ScnFile, ScnMeshChunk},
+    scn::{ScnFile, ScnMeshChunk, ScnNode},
 };
 use bytemuck::{Pod, Zeroable};
 use eframe::{
@@ -11,7 +11,8 @@ use eframe::{
 };
 use glam::{Mat4, Quat, Vec3};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque, hash_map::DefaultHasher},
+    hash::{Hash, Hasher},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -45,6 +46,9 @@ pub struct GeoViewerState {
     pub show_bones: bool,
     pub show_helpers: bool,
     pub cull_backfaces: bool,
+    scene_transform_mode: SceneTransformMode,
+    scene_gizmo_drag: Option<SceneGizmoDrag>,
+    scene_edit_revision: u64,
 
     scene_key: Option<String>,
     cpu_scene: Option<Arc<CpuScene>>,
@@ -66,6 +70,9 @@ impl Default for GeoViewerState {
             show_bones: true,
             show_helpers: true,
             cull_backfaces: false,
+            scene_transform_mode: SceneTransformMode::Translate,
+            scene_gizmo_drag: None,
+            scene_edit_revision: 0,
             scene_key: None,
             cpu_scene: None,
             frame_targets: Arc::new(Mutex::new(None)),
@@ -124,6 +131,35 @@ struct CpuPart {
     textures: Vec<CpuTexture>,
     class: PartClass,
     record_kind: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SceneTransformMode {
+    Translate,
+    Rotate,
+    Scale,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GizmoAxis {
+    X,
+    Y,
+    Z,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SceneGizmoDrag {
+    mode: SceneTransformMode,
+    axis: GizmoAxis,
+    start_pointer: egui::Pos2,
+    start_translation: Vec3,
+    start_rotation: Quat,
+    start_scale: Vec3,
+    start_pointer_vec: Vec2,
+    axis_world: Vec3,
+    axis_screen_dir: Vec2,
+    handle_world_len: f32,
+    screen_origin: egui::Pos2,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -344,6 +380,7 @@ pub fn reset_scene_viewer(state: &mut GeoViewerState, scn: &ScnFile) {
     state.show_wireframe = false;
     state.show_bones = true;
     state.cull_backfaces = false;
+    state.scene_gizmo_drag = None;
     state.scene_key = None;
     state.cpu_scene = None;
 }
@@ -357,12 +394,14 @@ pub fn focus_scene_viewer_on_point(state: &mut GeoViewerState, world_pos: [f32; 
 
 pub fn draw_scene_viewer(
     ui: &mut egui::Ui,
-    scn: &ScnFile,
+    scn: &mut ScnFile,
     models: &[SceneGeoModel],
     embedded_textures: &HashMap<String, DdsPreview>,
     state: &mut GeoViewerState,
     viewer_height: f32,
     selected: Option<SceneSelection>,
+    hidden_nodes: &BTreeSet<usize>,
+    hidden_chunks: &BTreeSet<usize>,
 ) -> Option<SceneSelection> {
     ui.horizontal(|ui| {
         if ui.button("Reset view").clicked() {
@@ -381,7 +420,7 @@ pub fn draw_scene_viewer(
 
         ui.separator();
         ui.small(
-            "SCN 3D: RMB look | Ctrl+LMB look | MMB pan | wheel dolly | WASD fly | Q/E up/down",
+            "SCN 3D: RMB look | Ctrl+LMB look | MMB pan | wheel dolly | WASD fly | Q/E up/down | gizmo via Move/Rotate/Scale",
         );
     });
 
@@ -392,31 +431,29 @@ pub fn draw_scene_viewer(
 
     painter.rect_filled(rect, 0.0, Color32::from_rgb(30, 30, 34));
 
+    if !selected_scene_is_visible(selected, hidden_nodes, hidden_chunks) {
+        state.scene_gizmo_drag = None;
+    }
+
     let scene_radius = scn_bounds(scn).1;
     let min_distance = 5.0;
     let max_distance = (scene_radius * 8.0).max(600.0);
-
-    apply_viewer_input(
-        ui,
-        &response,
-        state,
-        scene_radius,
-        min_distance,
-        max_distance,
-        None,
-    );
     let model_texture_state: usize = models
         .iter()
         .map(|m| m.textures.iter().filter(|t| t.is_some()).count())
         .sum();
 
     let scene_key = format!(
-        "scn:{}#nodes:{}#models:{}#embtex:{}#mdltex:{}",
+        "scn:{}#nodes:{}#models:{}#embtex:{}#mdltex:{}#hidden_nodes:{:016x}#hidden_chunks:{:016x}#selection:{}#edit:{}",
         scn.path.display(),
         scn.nodes.len(),
         models.len(),
         embedded_textures.len(),
         model_texture_state,
+        visibility_set_hash(hidden_nodes),
+        visibility_set_hash(hidden_chunks),
+        scene_selection_cache_tag(selected),
+        state.scene_edit_revision,
     );
 
     if state.scene_key.as_deref() != Some(scene_key.as_str()) {
@@ -424,6 +461,9 @@ pub fn draw_scene_viewer(
             scn,
             models,
             embedded_textures,
+            hidden_nodes,
+            hidden_chunks,
+            selected,
             scene_key.clone(),
         ));
         state.scene_key = Some(scene_key);
@@ -433,7 +473,7 @@ pub fn draw_scene_viewer(
         return None;
     };
 
-    let pick_view_proj = make_view_proj(
+    let mut pick_view_proj = make_view_proj(
         rect.width().round().max(1.0) as u32,
         rect.height().round().max(1.0) as u32,
         state.yaw,
@@ -442,14 +482,52 @@ pub fn draw_scene_viewer(
         &scene,
     );
 
-    let pointer_pick =
-        if !ui.input(|i| i.modifiers.ctrl) && response.clicked_by(egui::PointerButton::Primary) {
-            response.interact_pointer_pos().and_then(|pointer_pos| {
-                pick_scene_target(&scene, rect, pick_view_proj, state.eye, pointer_pos)
-            })
-        } else {
-            None
-        };
+    let toolbar_consumed = interact_scene_gizmo_toolbar(ui, rect, state);
+    let gizmo_consumed = handle_scene_gizmo_interaction(
+        ui,
+        &response,
+        rect,
+        pick_view_proj,
+        scn,
+        state,
+        selected,
+        hidden_nodes,
+        hidden_chunks,
+        scene_radius,
+    );
+    let block_viewer_input = toolbar_consumed || gizmo_consumed || state.scene_gizmo_drag.is_some();
+
+    let pointer_pick = if !block_viewer_input
+        && !ui.input(|i| i.modifiers.ctrl)
+        && response.clicked_by(egui::PointerButton::Primary)
+    {
+        response.interact_pointer_pos().and_then(|pointer_pos| {
+            pick_scene_target(&scene, rect, pick_view_proj, state.eye, pointer_pos)
+        })
+    } else {
+        None
+    };
+
+    if !block_viewer_input {
+        apply_viewer_input(
+            ui,
+            &response,
+            state,
+            scene_radius,
+            min_distance,
+            max_distance,
+            None,
+        );
+
+        pick_view_proj = make_view_proj(
+            rect.width().round().max(1.0) as u32,
+            rect.height().round().max(1.0) as u32,
+            state.yaw,
+            state.pitch,
+            state.eye,
+            &scene,
+        );
+    }
 
     let callback = egui_wgpu::Callback::new_paint_callback(
         rect,
@@ -470,10 +548,18 @@ pub fn draw_scene_viewer(
     );
 
     painter.add(callback);
-
-    if let Some(selection) = selected {
-        paint_scene_selection_overlay(&painter, rect, pick_view_proj, state.eye, &scene, selection);
-    }
+    paint_scene_gizmo(
+        &painter,
+        rect,
+        pick_view_proj,
+        scn,
+        state,
+        selected,
+        hidden_nodes,
+        hidden_chunks,
+        scene_radius,
+    );
+    paint_scene_gizmo_toolbar(&painter, rect, state);
 
     pointer_pick
 }
@@ -1269,7 +1355,7 @@ fn build_cpu_scene(
                 .map(to_view_space)
                 .map(normalize3)
                 .unwrap_or([0.0, 1.0, 0.0]),
-            color: [1.0, 1.0, 1.0, 1.0],
+            color: scene_vertex_color(false),
             uv: geo.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
         })
         .collect();
@@ -1779,6 +1865,9 @@ fn build_cpu_scene_from_scn(
     scn: &ScnFile,
     models: &[SceneGeoModel],
     embedded_textures: &HashMap<String, DdsPreview>,
+    hidden_nodes: &BTreeSet<usize>,
+    hidden_chunks: &BTreeSet<usize>,
+    selected: Option<SceneSelection>,
     key: String,
 ) -> Arc<CpuScene> {
     let geo_by_archetype: HashMap<String, &SceneGeoModel> = models
@@ -1813,10 +1902,15 @@ fn build_cpu_scene_from_scn(
     };
 
     for (chunk_index, chunk) in scn.mesh_chunks.iter().enumerate() {
+        if hidden_chunks.contains(&chunk_index) {
+            continue;
+        }
+
         append_scn_chunk_mesh(
             chunk_index,
             chunk,
             embedded_textures,
+            selected == Some(SceneSelection::MeshChunk(chunk_index)),
             &mut vertices,
             &mut parts,
             &mut wire_lines,
@@ -1827,11 +1921,20 @@ fn build_cpu_scene_from_scn(
     }
 
     for node in &scn.nodes {
+        if hidden_nodes.contains(&node.index) {
+            continue;
+        }
+
         let marker_pos = to_view_space(node.translation);
         update_bounds(marker_pos);
 
         if node.is_marker() {
             let (marker_color, marker_size) = scene_marker_style(&node.name);
+            let marker_color = if selected == Some(SceneSelection::Node(node.index)) {
+                selected_scene_tint_color()
+            } else {
+                marker_color
+            };
             append_scene_marker_lines(&mut marker_lines, marker_pos, marker_size, marker_color);
             pick_targets.push(ScenePickTarget {
                 selection: SceneSelection::Node(node.index),
@@ -1848,6 +1951,7 @@ fn build_cpu_scene_from_scn(
 
         let geo = &model.geo;
         let model_is_helper = is_shadow_like_name(&archetype_key);
+        let is_selected = selected == Some(SceneSelection::Node(node.index));
 
         let base_vertex = vertices.len() as u32;
         let mut instance_positions = Vec::with_capacity(geo.verts.len());
@@ -1865,7 +1969,7 @@ fn build_cpu_scene_from_scn(
             vertices.push(MeshVertex {
                 position: view_pos,
                 normal: view_normal,
-                color: [1.0, 1.0, 1.0, 1.0],
+                color: scene_vertex_color(is_selected),
                 uv,
             });
 
@@ -1873,19 +1977,9 @@ fn build_cpu_scene_from_scn(
             update_bounds(view_pos);
         }
 
-        if let Some((instance_center, instance_radius)) = bounds_from_points(&instance_positions) {
-            pick_targets.push(ScenePickTarget {
-                selection: SceneSelection::Node(node.index),
-                center: instance_center,
-                radius: instance_radius.max(45.0),
-            });
-        } else {
-            pick_targets.push(ScenePickTarget {
-                selection: SceneSelection::Node(node.index),
-                center: marker_pos,
-                radius: 75.0,
-            });
-        }
+        let (instance_center, instance_radius) = bounds_from_points(&instance_positions)
+            .map(|(center, radius)| (center, radius.max(45.0)))
+            .unwrap_or((marker_pos, 75.0));
 
         if geo.subsets.is_empty() {
             let part_class = if model_is_helper
@@ -1899,7 +1993,11 @@ fn build_cpu_scene_from_scn(
                 PartClass::Solid
             };
 
-            let line_color = [120.0 / 255.0, 220.0 / 255.0, 1.0, 1.0];
+            let line_color = if is_selected {
+                selected_scene_tint_color()
+            } else {
+                [120.0 / 255.0, 220.0 / 255.0, 1.0, 1.0]
+            };
             let draw_wire = !matches!(part_class, PartClass::Helper);
 
             let mut part_indices = Vec::with_capacity(geo.faces.len() * 3);
@@ -1971,7 +2069,11 @@ fn build_cpu_scene_from_scn(
                     PartClass::Solid
                 };
 
-                let line_color = [120.0 / 255.0, 220.0 / 255.0, 1.0, 1.0];
+                let line_color = if is_selected {
+                    selected_scene_tint_color()
+                } else {
+                    [120.0 / 255.0, 220.0 / 255.0, 1.0, 1.0]
+                };
                 let draw_wire = !matches!(part_class, PartClass::Helper);
 
                 let start = (subset.start / 3) as usize;
@@ -2043,6 +2145,12 @@ fn build_cpu_scene_from_scn(
                 });
             }
         }
+
+        pick_targets.push(ScenePickTarget {
+            selection: SceneSelection::Node(node.index),
+            center: instance_center,
+            radius: instance_radius,
+        });
     }
 
     if !have_bounds {
@@ -2088,6 +2196,7 @@ fn append_scn_chunk_mesh<F: FnMut([f32; 3])>(
     chunk_index: usize,
     chunk: &ScnMeshChunk,
     embedded_textures: &HashMap<String, DdsPreview>,
+    is_selected: bool,
     vertices: &mut Vec<MeshVertex>,
     parts: &mut Vec<CpuPart>,
     wire_lines: &mut Vec<LineVertex>,
@@ -2105,7 +2214,11 @@ fn append_scn_chunk_mesh<F: FnMut([f32; 3])>(
         PartClass::Solid
     };
 
-    let line_color = [185.0 / 255.0, 185.0 / 255.0, 195.0 / 255.0, 1.0];
+    let line_color = if is_selected {
+        selected_scene_tint_color()
+    } else {
+        [185.0 / 255.0, 185.0 / 255.0, 195.0 / 255.0, 1.0]
+    };
     let draw_wire = !matches!(part_class, PartClass::Helper);
 
     let base_vertex = vertices.len() as u32;
@@ -2130,20 +2243,12 @@ fn append_scn_chunk_mesh<F: FnMut([f32; 3])>(
         vertices.push(MeshVertex {
             position: view_pos,
             normal: view_normal,
-            color: [1.0, 1.0, 1.0, 1.0],
+            color: scene_vertex_color(is_selected),
             uv: vertex.uv,
         });
 
         chunk_positions.push(view_pos);
         update_bounds(view_pos);
-    }
-
-    if let Some((chunk_center, chunk_radius)) = bounds_from_points(&chunk_positions) {
-        pick_targets.push(ScenePickTarget {
-            selection: SceneSelection::MeshChunk(chunk_index),
-            center: chunk_center,
-            radius: chunk_radius.max(35.0),
-        });
     }
 
     let mut part_indices = Vec::with_capacity(chunk.indices.len());
@@ -2193,6 +2298,14 @@ fn append_scn_chunk_mesh<F: FnMut([f32; 3])>(
                 color: line_color,
             });
         }
+    }
+
+    if let Some((chunk_center, chunk_radius)) = bounds_from_points(&chunk_positions) {
+        pick_targets.push(ScenePickTarget {
+            selection: SceneSelection::MeshChunk(chunk_index),
+            center: chunk_center,
+            radius: chunk_radius.max(35.0),
+        });
     }
 
     if !part_indices.is_empty() {
@@ -2362,11 +2475,7 @@ fn scn_min_max(scn: &ScnFile) -> Option<([f32; 3], [f32; 3])> {
         }
     }
 
-    if have_bounds {
-        Some((min, max))
-    } else {
-        None
-    }
+    if have_bounds { Some((min, max)) } else { None }
 }
 
 fn extent_dimensions(min: [f32; 3], max: [f32; 3]) -> [f32; 3] {
@@ -2493,13 +2602,6 @@ fn bounds_from_points(points: &[[f32; 3]]) -> Option<([f32; 3], f32)> {
     Some((center, radius.max(1.0)))
 }
 
-fn scene_pick_target(scene: &CpuScene, selection: SceneSelection) -> Option<&ScenePickTarget> {
-    scene
-        .pick_targets
-        .iter()
-        .find(|target| target.selection == selection)
-}
-
 fn project_scene_point(rect: Rect, view_proj: Mat4, point: [f32; 3]) -> Option<(egui::Pos2, f32)> {
     let clip = view_proj * Vec3::from_array(point).extend(1.0);
     if clip.w <= 1.0e-6 {
@@ -2592,40 +2694,720 @@ fn pick_scene_target(
     best.map(|(_, _, _, selection)| selection)
 }
 
-fn paint_scene_selection_overlay(
+fn visibility_set_hash(indices: &BTreeSet<usize>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    indices.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn scene_selection_cache_tag(selected: Option<SceneSelection>) -> String {
+    match selected {
+        Some(SceneSelection::Node(index)) => format!("node:{index}"),
+        Some(SceneSelection::MeshChunk(index)) => format!("chunk:{index}"),
+        None => "none".to_owned(),
+    }
+}
+
+fn scene_vertex_color(is_selected: bool) -> [f32; 4] {
+    [1.0, 1.0, 1.0, if is_selected { 1.0 } else { 0.0 }]
+}
+
+fn selected_scene_tint_color() -> [f32; 4] {
+    [90.0 / 255.0, 175.0 / 255.0, 1.0, 1.0]
+}
+
+fn selected_scene_is_visible(
+    selected: Option<SceneSelection>,
+    hidden_nodes: &BTreeSet<usize>,
+    hidden_chunks: &BTreeSet<usize>,
+) -> bool {
+    match selected {
+        Some(SceneSelection::Node(index)) => !hidden_nodes.contains(&index),
+        Some(SceneSelection::MeshChunk(index)) => !hidden_chunks.contains(&index),
+        None => false,
+    }
+}
+
+fn scene_transform_axis_color(axis: GizmoAxis) -> Color32 {
+    match axis {
+        GizmoAxis::X => Color32::from_rgb(230, 96, 96),
+        GizmoAxis::Y => Color32::from_rgb(102, 214, 114),
+        GizmoAxis::Z => Color32::from_rgb(96, 166, 255),
+    }
+}
+
+fn scene_transform_axis_basis(axis: GizmoAxis) -> Vec3 {
+    match axis {
+        GizmoAxis::X => Vec3::X,
+        GizmoAxis::Y => Vec3::Y,
+        GizmoAxis::Z => Vec3::Z,
+    }
+}
+
+fn scene_node_transform(node: &ScnNode) -> (Vec3, Quat, Vec3) {
+    let matrix = mat4_from_arr(node.transform);
+    let (scale, rotation, translation) = matrix.to_scale_rotation_translation();
+
+    let sanitized_scale = Vec3::new(
+        scale.x.abs().max(0.05),
+        scale.y.abs().max(0.05),
+        scale.z.abs().max(0.05),
+    );
+    let sanitized_rotation = if rotation.length_squared() > 1.0e-8 {
+        rotation.normalize()
+    } else {
+        Quat::IDENTITY
+    };
+    let sanitized_translation = if translation.is_finite() {
+        translation
+    } else {
+        Vec3::from_array(node.translation)
+    };
+
+    (sanitized_translation, sanitized_rotation, sanitized_scale)
+}
+
+fn write_scene_node_transform(node: &mut ScnNode, translation: Vec3, rotation: Quat, scale: Vec3) {
+    let scale = Vec3::new(
+        scale.x.abs().max(0.05),
+        scale.y.abs().max(0.05),
+        scale.z.abs().max(0.05),
+    );
+    let rotation = if rotation.length_squared() > 1.0e-8 {
+        rotation.normalize()
+    } else {
+        Quat::IDENTITY
+    };
+    let matrix = Mat4::from_scale_rotation_translation(scale, rotation, translation);
+    node.transform = matrix.to_cols_array();
+    node.translation = translation.to_array();
+}
+
+fn scene_chunk_center(chunk: &ScnMeshChunk) -> Option<Vec3> {
+    if chunk.vertices.is_empty() {
+        return None;
+    }
+
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+
+    for vertex in &chunk.vertices {
+        let pos = if let Some(transform) = &chunk.transform {
+            arr_to_vec3(apply_transform_point(transform, vertex.position))
+        } else {
+            arr_to_vec3(vertex.position)
+        };
+
+        min = min.min(pos);
+        max = max.max(pos);
+    }
+
+    Some((min + max) * 0.5)
+}
+
+fn scene_chunk_transform(chunk: &ScnMeshChunk) -> Option<(Vec3, Quat, Vec3)> {
+    let matrix = if let Some(transform) = chunk.transform {
+        mat4_from_arr(transform)
+    } else {
+        Mat4::from_translation(scene_chunk_center(chunk)?)
+    };
+
+    let (scale, rotation, translation) = matrix.to_scale_rotation_translation();
+    let sanitized_scale = Vec3::new(
+        scale.x.abs().max(0.05),
+        scale.y.abs().max(0.05),
+        scale.z.abs().max(0.05),
+    );
+    let sanitized_rotation = if rotation.length_squared() > 1.0e-8 {
+        rotation.normalize()
+    } else {
+        Quat::IDENTITY
+    };
+
+    Some((translation, sanitized_rotation, sanitized_scale))
+}
+
+fn ensure_scene_chunk_transform(chunk: &mut ScnMeshChunk) -> Option<()> {
+    if chunk.transform.is_some() {
+        return Some(());
+    }
+
+    let center = scene_chunk_center(chunk)?;
+    for vertex in &mut chunk.vertices {
+        let pos = arr_to_vec3(vertex.position) - center;
+        vertex.position = pos.to_array();
+    }
+
+    chunk.transform = Some(Mat4::from_translation(center).to_cols_array());
+    Some(())
+}
+
+fn write_scene_chunk_transform(
+    chunk: &mut ScnMeshChunk,
+    translation: Vec3,
+    rotation: Quat,
+    scale: Vec3,
+) {
+    let scale = Vec3::new(
+        scale.x.abs().max(0.05),
+        scale.y.abs().max(0.05),
+        scale.z.abs().max(0.05),
+    );
+    let rotation = if rotation.length_squared() > 1.0e-8 {
+        rotation.normalize()
+    } else {
+        Quat::IDENTITY
+    };
+    let matrix = Mat4::from_scale_rotation_translation(scale, rotation, translation);
+    chunk.transform = Some(matrix.to_cols_array());
+}
+
+fn selected_scene_transform(
+    scn: &ScnFile,
+    selected: Option<SceneSelection>,
+    hidden_nodes: &BTreeSet<usize>,
+    hidden_chunks: &BTreeSet<usize>,
+) -> Option<(Vec3, Quat, Vec3)> {
+    match selected {
+        Some(SceneSelection::Node(index)) if !hidden_nodes.contains(&index) => {
+            scn.nodes.get(index).map(scene_node_transform)
+        }
+        Some(SceneSelection::MeshChunk(index)) if !hidden_chunks.contains(&index) => {
+            scn.mesh_chunks.get(index).and_then(scene_chunk_transform)
+        }
+        _ => None,
+    }
+}
+
+fn write_selected_scene_transform(
+    scn: &mut ScnFile,
+    selected: SceneSelection,
+    translation: Vec3,
+    rotation: Quat,
+    scale: Vec3,
+) -> bool {
+    match selected {
+        SceneSelection::Node(index) => {
+            let Some(node) = scn.nodes.get_mut(index) else {
+                return false;
+            };
+            write_scene_node_transform(node, translation, rotation, scale);
+            true
+        }
+        SceneSelection::MeshChunk(index) => {
+            let Some(chunk) = scn.mesh_chunks.get_mut(index) else {
+                return false;
+            };
+            if ensure_scene_chunk_transform(chunk).is_none() {
+                return false;
+            }
+            write_scene_chunk_transform(chunk, translation, rotation, scale);
+            true
+        }
+    }
+}
+
+fn scene_gizmo_handle_world_len(eye: [f32; 3], center_view: [f32; 3], scene_radius: f32) -> f32 {
+    let distance = (arr_to_vec3(eye) - arr_to_vec3(center_view)).length();
+    (distance * 0.18)
+        .clamp(scene_radius.max(10.0) * 0.03, scene_radius.max(10.0) * 0.30)
+        .max(8.0)
+}
+
+fn project_gizmo_axis(
+    rect: Rect,
+    view_proj: Mat4,
+    translation: Vec3,
+    axis_world: Vec3,
+    handle_world_len: f32,
+) -> Option<(egui::Pos2, egui::Pos2)> {
+    let center_view = to_view_space(translation.to_array());
+    let end_view = to_view_space((translation + axis_world * handle_world_len).to_array());
+    let (start, _) = project_scene_point(rect, view_proj, center_view)?;
+    let (end, _) = project_scene_point(rect, view_proj, end_view)?;
+    Some((start, end))
+}
+
+fn closest_distance_to_segment(point: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
+    let ab = b - a;
+    let ab_len_sq = ab.length_sq();
+    if ab_len_sq <= 1.0e-6 {
+        return point.distance(a);
+    }
+
+    let t = ((point - a).dot(ab) / ab_len_sq).clamp(0.0, 1.0);
+    let closest = a + ab * t;
+    point.distance(closest)
+}
+
+fn signed_angle_2d(a: Vec2, b: Vec2) -> f32 {
+    let cross = a.x * b.y - a.y * b.x;
+    let dot = a.dot(b);
+    cross.atan2(dot)
+}
+
+fn scene_rotation_ring_basis(rotation: Quat, axis: GizmoAxis) -> (Vec3, Vec3) {
+    match axis {
+        GizmoAxis::X => (rotation * Vec3::Y, rotation * Vec3::Z),
+        GizmoAxis::Y => (rotation * Vec3::Z, rotation * Vec3::X),
+        GizmoAxis::Z => (rotation * Vec3::X, rotation * Vec3::Y),
+    }
+}
+
+fn scene_rotation_ring_hit_distance(
+    rect: Rect,
+    view_proj: Mat4,
+    translation: Vec3,
+    rotation: Quat,
+    axis: GizmoAxis,
+    ring_radius: f32,
+    pointer: egui::Pos2,
+) -> Option<f32> {
+    let (u, v) = scene_rotation_ring_basis(rotation, axis);
+    let mut best: Option<f32> = None;
+    let mut previous: Option<egui::Pos2> = None;
+    const SEGMENTS: usize = 48;
+
+    for step in 0..=SEGMENTS {
+        let t = step as f32 / SEGMENTS as f32;
+        let angle = t * std::f32::consts::TAU;
+        let world = translation + (u * angle.cos() + v * angle.sin()) * ring_radius;
+        let projected = project_scene_point(rect, view_proj, to_view_space(world.to_array()))
+            .map(|(pos, _)| pos);
+
+        if let (Some(prev), Some(curr)) = (previous, projected) {
+            let distance = closest_distance_to_segment(pointer, prev, curr);
+            best = Some(best.map(|value| value.min(distance)).unwrap_or(distance));
+        }
+
+        previous = projected;
+    }
+
+    best
+}
+
+fn scene_gizmo_axis_drag(
+    mode: SceneTransformMode,
+    pointer_pos: egui::Pos2,
+    translation: Vec3,
+    rotation: Quat,
+    handle_world_len: f32,
+    center_screen: egui::Pos2,
+    rect: Rect,
+    view_proj: Mat4,
+) -> Option<SceneGizmoDrag> {
+    let mut best: Option<(f32, SceneGizmoDrag)> = None;
+
+    for axis in [GizmoAxis::X, GizmoAxis::Y, GizmoAxis::Z] {
+        let axis_world = rotation * scene_transform_axis_basis(axis);
+        match mode {
+            SceneTransformMode::Translate | SceneTransformMode::Scale => {
+                let Some((start, end)) =
+                    project_gizmo_axis(rect, view_proj, translation, axis_world, handle_world_len)
+                else {
+                    continue;
+                };
+                let axis_screen = end - start;
+                let distance = match mode {
+                    SceneTransformMode::Translate => {
+                        closest_distance_to_segment(pointer_pos, start, end)
+                    }
+                    SceneTransformMode::Scale => pointer_pos.distance(end),
+                    SceneTransformMode::Rotate => unreachable!(),
+                };
+                let threshold = if matches!(mode, SceneTransformMode::Translate) {
+                    10.0
+                } else {
+                    12.0
+                };
+                if distance <= threshold {
+                    let drag = SceneGizmoDrag {
+                        mode,
+                        axis,
+                        start_pointer: pointer_pos,
+                        start_translation: translation,
+                        start_rotation: rotation,
+                        start_scale: Vec3::ONE,
+                        start_pointer_vec: Vec2::ZERO,
+                        axis_world: if axis_world.length_squared() > 1.0e-8 {
+                            axis_world.normalize()
+                        } else {
+                            axis_world
+                        },
+                        axis_screen_dir: axis_screen,
+                        handle_world_len,
+                        screen_origin: center_screen,
+                    };
+                    let best_distance = best
+                        .as_ref()
+                        .map(|(best_distance, _)| *best_distance)
+                        .unwrap_or(f32::MAX);
+                    if distance < best_distance {
+                        best = Some((distance, drag));
+                    }
+                }
+            }
+            SceneTransformMode::Rotate => {
+                let Some(distance) = scene_rotation_ring_hit_distance(
+                    rect,
+                    view_proj,
+                    translation,
+                    rotation,
+                    axis,
+                    handle_world_len * 0.9,
+                    pointer_pos,
+                ) else {
+                    continue;
+                };
+                if distance <= 10.0 {
+                    let start_pointer_vec = pointer_pos - center_screen;
+                    if start_pointer_vec.length_sq() <= 1.0 {
+                        continue;
+                    }
+                    let drag = SceneGizmoDrag {
+                        mode,
+                        axis,
+                        start_pointer: pointer_pos,
+                        start_translation: translation,
+                        start_rotation: rotation,
+                        start_scale: Vec3::ONE,
+                        start_pointer_vec,
+                        axis_world: axis_world.normalize_or_zero(),
+                        axis_screen_dir: Vec2::ZERO,
+                        handle_world_len,
+                        screen_origin: center_screen,
+                    };
+                    let best_distance = best
+                        .as_ref()
+                        .map(|(best_distance, _)| *best_distance)
+                        .unwrap_or(f32::MAX);
+                    if distance < best_distance {
+                        best = Some((distance, drag));
+                    }
+                }
+            }
+        }
+    }
+
+    best.map(|(_, drag)| drag)
+}
+
+fn scene_gizmo_toolbar_button_rects(rect: Rect) -> [Rect; 3] {
+    let button_size = egui::vec2(46.0, 24.0);
+    let gap = 4.0;
+    let padding = 8.0;
+    let total_width = button_size.x * 3.0 + gap * 2.0;
+    let frame_rect = Rect::from_min_size(
+        egui::pos2(
+            rect.right() - total_width - padding * 2.0,
+            rect.top() + padding,
+        ),
+        egui::vec2(total_width + padding, button_size.y + padding),
+    );
+
+    std::array::from_fn(|index| {
+        let min = egui::pos2(
+            frame_rect.left() + padding * 0.5 + index as f32 * (button_size.x + gap),
+            frame_rect.top() + padding * 0.5,
+        );
+        Rect::from_min_size(min, button_size)
+    })
+}
+
+fn interact_scene_gizmo_toolbar(ui: &mut egui::Ui, rect: Rect, state: &mut GeoViewerState) -> bool {
+    let mut consumed = false;
+    for (index, (mode, label)) in [
+        (SceneTransformMode::Translate, "Move"),
+        (SceneTransformMode::Rotate, "Rotate"),
+        (SceneTransformMode::Scale, "Scale"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let button_rect = scene_gizmo_toolbar_button_rects(rect)[index];
+        let response = ui.interact(
+            button_rect,
+            ui.id().with(("scene_transform_mode", label)),
+            Sense::click(),
+        );
+
+        if response.clicked() {
+            state.scene_transform_mode = mode;
+            state.scene_gizmo_drag = None;
+            ui.ctx().request_repaint();
+            consumed = true;
+        }
+
+        if response.hovered() && ui.input(|i| i.pointer.primary_down()) {
+            consumed = true;
+        }
+    }
+
+    consumed
+}
+
+fn paint_scene_gizmo_toolbar(painter: &egui::Painter, rect: Rect, state: &GeoViewerState) {
+    let button_rects = scene_gizmo_toolbar_button_rects(rect);
+    let outer = button_rects
+        .iter()
+        .copied()
+        .reduce(|a, b| a.union(b))
+        .unwrap_or(rect);
+    let frame_rect = outer.expand2(egui::vec2(4.0, 4.0));
+    painter.rect_filled(frame_rect, 6.0, Color32::from_black_alpha(150));
+
+    for (index, (mode, label)) in [
+        (SceneTransformMode::Translate, "Move"),
+        (SceneTransformMode::Rotate, "Rotate"),
+        (SceneTransformMode::Scale, "Scale"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let button_rect = button_rects[index];
+        let fill = if state.scene_transform_mode == mode {
+            Color32::from_rgb(52, 96, 148)
+        } else {
+            Color32::from_gray(42)
+        };
+
+        painter.rect_filled(button_rect, 4.0, fill);
+        painter.text(
+            button_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(12.0),
+            Color32::WHITE,
+        );
+    }
+}
+
+fn handle_scene_gizmo_interaction(
+    ui: &mut egui::Ui,
+    response: &egui::Response,
+    rect: Rect,
+    view_proj: Mat4,
+    scn: &mut ScnFile,
+    state: &mut GeoViewerState,
+    selected: Option<SceneSelection>,
+    hidden_nodes: &BTreeSet<usize>,
+    hidden_chunks: &BTreeSet<usize>,
+    scene_radius: f32,
+) -> bool {
+    let Some(selected_item) = selected else {
+        state.scene_gizmo_drag = None;
+        return false;
+    };
+    if !selected_scene_is_visible(Some(selected_item), hidden_nodes, hidden_chunks) {
+        state.scene_gizmo_drag = None;
+        return false;
+    }
+
+    let Some((translation, rotation, scale)) =
+        selected_scene_transform(scn, Some(selected_item), hidden_nodes, hidden_chunks)
+    else {
+        state.scene_gizmo_drag = None;
+        return false;
+    };
+
+    let center_view = to_view_space(translation.to_array());
+    let Some((center_screen, _)) = project_scene_point(rect, view_proj, center_view) else {
+        state.scene_gizmo_drag = None;
+        return false;
+    };
+    let handle_world_len = scene_gizmo_handle_world_len(state.eye, center_view, scene_radius);
+
+    if let Some(drag) = state.scene_gizmo_drag {
+        if !ui.input(|i| i.pointer.primary_down()) {
+            state.scene_gizmo_drag = None;
+            return false;
+        }
+
+        let Some(pointer_pos) = ui.input(|i| i.pointer.interact_pos()) else {
+            return true;
+        };
+
+        let mut new_translation = drag.start_translation;
+        let mut new_rotation = drag.start_rotation;
+        let mut new_scale = drag.start_scale;
+
+        match drag.mode {
+            SceneTransformMode::Translate => {
+                let axis_len = drag.axis_screen_dir.length().max(8.0);
+                let axis_dir = if drag.axis_screen_dir.length_sq() > 1.0e-6 {
+                    drag.axis_screen_dir / axis_len
+                } else {
+                    Vec2::ZERO
+                };
+                let delta_pixels = (pointer_pos - drag.start_pointer).dot(axis_dir);
+                let world_delta =
+                    drag.axis_world * (delta_pixels * drag.handle_world_len / axis_len);
+                new_translation = drag.start_translation + world_delta;
+            }
+            SceneTransformMode::Rotate => {
+                let current_vec = pointer_pos - drag.screen_origin;
+                if current_vec.length_sq() > 1.0 {
+                    let angle = signed_angle_2d(drag.start_pointer_vec, current_vec);
+                    new_rotation = (drag.start_rotation
+                        * Quat::from_axis_angle(scene_transform_axis_basis(drag.axis), angle))
+                    .normalize();
+                }
+            }
+            SceneTransformMode::Scale => {
+                let axis_len = drag.axis_screen_dir.length().max(16.0);
+                let axis_dir = if drag.axis_screen_dir.length_sq() > 1.0e-6 {
+                    drag.axis_screen_dir / axis_len
+                } else {
+                    Vec2::ZERO
+                };
+                let delta_pixels = (pointer_pos - drag.start_pointer).dot(axis_dir);
+                let scale_factor = (1.0 + delta_pixels / 120.0).max(0.05);
+                new_scale = drag.start_scale;
+                match drag.axis {
+                    GizmoAxis::X => new_scale.x = (drag.start_scale.x * scale_factor).max(0.05),
+                    GizmoAxis::Y => new_scale.y = (drag.start_scale.y * scale_factor).max(0.05),
+                    GizmoAxis::Z => new_scale.z = (drag.start_scale.z * scale_factor).max(0.05),
+                }
+            }
+        }
+
+        if !write_selected_scene_transform(
+            scn,
+            selected_item,
+            new_translation,
+            new_rotation,
+            new_scale,
+        ) {
+            state.scene_gizmo_drag = None;
+            return false;
+        }
+
+        state.scene_edit_revision = state.scene_edit_revision.wrapping_add(1);
+        state.scene_key = None;
+        ui.ctx().request_repaint();
+        return true;
+    }
+
+    let wants_drag = response.drag_started_by(egui::PointerButton::Primary)
+        || (response.hovered() && ui.input(|i| i.pointer.primary_pressed()));
+
+    if !wants_drag || ui.input(|i| i.modifiers.ctrl) {
+        return false;
+    }
+
+    let Some(pointer_pos) = ui
+        .input(|i| i.pointer.interact_pos())
+        .or_else(|| response.interact_pointer_pos())
+    else {
+        return false;
+    };
+
+    let Some(mut drag) = scene_gizmo_axis_drag(
+        state.scene_transform_mode,
+        pointer_pos,
+        translation,
+        rotation,
+        handle_world_len,
+        center_screen,
+        rect,
+        view_proj,
+    ) else {
+        return false;
+    };
+    drag.start_scale = scale;
+    state.scene_gizmo_drag = Some(drag);
+    ui.ctx().request_repaint();
+    true
+}
+
+fn paint_scene_gizmo(
     painter: &egui::Painter,
     rect: Rect,
     view_proj: Mat4,
-    eye: [f32; 3],
-    scene: &CpuScene,
-    selection: SceneSelection,
+    scn: &ScnFile,
+    state: &GeoViewerState,
+    selected: Option<SceneSelection>,
+    hidden_nodes: &BTreeSet<usize>,
+    hidden_chunks: &BTreeSet<usize>,
+    scene_radius: f32,
 ) {
-    let Some(target) = scene_pick_target(scene, selection) else {
+    if !selected_scene_is_visible(selected, hidden_nodes, hidden_chunks) {
         return;
     };
-    let Some((screen_pos, _depth)) = project_scene_point(rect, view_proj, target.center) else {
+    let Some((translation, rotation, _)) =
+        selected_scene_transform(scn, selected, hidden_nodes, hidden_chunks)
+    else {
         return;
     };
 
-    let highlight_color = match selection {
-        SceneSelection::Node(_) => Color32::from_rgb(255, 214, 92),
-        SceneSelection::MeshChunk(_) => Color32::from_rgb(116, 220, 255),
+    let center_view = to_view_space(translation.to_array());
+    let Some((center_screen, _)) = project_scene_point(rect, view_proj, center_view) else {
+        return;
     };
-    let world_distance = (arr_to_vec3(target.center) - arr_to_vec3(eye)).length();
-    let screen_radius =
-        projected_pick_radius(rect, world_distance, target.radius, selection).clamp(10.0, 48.0);
+    let handle_world_len = scene_gizmo_handle_world_len(state.eye, center_view, scene_radius);
+    let active_axis = state.scene_gizmo_drag.map(|drag| drag.axis);
 
-    painter.circle_stroke(
-        screen_pos,
-        screen_radius,
-        egui::Stroke::new(2.5, highlight_color),
+    painter.circle_filled(
+        center_screen,
+        4.0,
+        Color32::from_rgba_unmultiplied(235, 240, 248, 210),
     );
-    painter.circle_stroke(
-        screen_pos,
-        screen_radius + 4.0,
-        egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 180)),
-    );
-    painter.circle_filled(screen_pos, 3.0, highlight_color);
+
+    match state.scene_transform_mode {
+        SceneTransformMode::Translate | SceneTransformMode::Scale => {
+            for axis in [GizmoAxis::X, GizmoAxis::Y, GizmoAxis::Z] {
+                let axis_world = rotation * scene_transform_axis_basis(axis);
+                let Some((start, end)) =
+                    project_gizmo_axis(rect, view_proj, translation, axis_world, handle_world_len)
+                else {
+                    continue;
+                };
+
+                let mut color = scene_transform_axis_color(axis);
+                if active_axis == Some(axis) {
+                    color = color.gamma_multiply(1.35);
+                }
+                let stroke =
+                    egui::Stroke::new(if active_axis == Some(axis) { 3.5 } else { 2.4 }, color);
+                painter.line_segment([start, end], stroke);
+
+                if matches!(state.scene_transform_mode, SceneTransformMode::Scale) {
+                    let end_rect = Rect::from_center_size(end, egui::vec2(8.0, 8.0));
+                    painter.rect_filled(end_rect, 1.5, color);
+                } else {
+                    painter.circle_filled(end, 4.0, color);
+                }
+            }
+        }
+        SceneTransformMode::Rotate => {
+            for axis in [GizmoAxis::X, GizmoAxis::Y, GizmoAxis::Z] {
+                let mut color = scene_transform_axis_color(axis);
+                if active_axis == Some(axis) {
+                    color = color.gamma_multiply(1.35);
+                }
+                let stroke =
+                    egui::Stroke::new(if active_axis == Some(axis) { 3.2 } else { 2.0 }, color);
+                let (u, v) = scene_rotation_ring_basis(rotation, axis);
+                let mut previous: Option<egui::Pos2> = None;
+                const SEGMENTS: usize = 48;
+
+                for step in 0..=SEGMENTS {
+                    let t = step as f32 / SEGMENTS as f32;
+                    let angle = t * std::f32::consts::TAU;
+                    let world = translation
+                        + (u * angle.cos() + v * angle.sin()) * (handle_world_len * 0.9);
+                    let current =
+                        project_scene_point(rect, view_proj, to_view_space(world.to_array()))
+                            .map(|(pos, _)| pos);
+
+                    if let (Some(prev), Some(curr)) = (previous, current) {
+                        painter.line_segment([prev, curr], stroke);
+                    }
+                    previous = current;
+                }
+            }
+        }
+    }
 }
 
 fn build_ground_lines_for_bounds(center: [f32; 3], _radius: f32, ground_y: f32) -> Vec<LineVertex> {
@@ -3204,6 +3986,7 @@ fn sample_scn_layers(uv: vec2<f32>, vcolor: vec4<f32>) -> vec4<f32> {
 @fragment
 fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
     let textured = globals.render_opts.x > 0.5;
+    let selection_mix = clamp(v.color.a, 0.0, 1.0) * 0.62;
 
     var base_rgb : vec3<f32>;
     var out_alpha : f32;
@@ -3222,9 +4005,14 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
         out_alpha = 1.0;
     }
 
+    let selected_rgb = min(
+        base_rgb * vec3<f32>(0.55, 0.86, 1.30) + vec3<f32>(0.08, 0.11, 0.18),
+        vec3<f32>(1.0, 1.0, 1.0)
+    );
+    let display_rgb = mix(base_rgb, selected_rgb, selection_mix);
     let ndotl = abs(dot(normalize(v.normal), normalize(globals.light_dir.xyz)));
     let shade = (0.45 + 0.55 * ndotl) * globals.render_opts.y;
-    let lit_rgb = min(base_rgb * shade, vec3<f32>(1.0, 1.0, 1.0));
+    let lit_rgb = min(display_rgb * shade, vec3<f32>(1.0, 1.0, 1.0));
 
     return vec4<f32>(lit_rgb, out_alpha);
 }
