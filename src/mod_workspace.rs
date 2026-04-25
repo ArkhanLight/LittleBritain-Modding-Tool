@@ -96,6 +96,39 @@ pub fn create_lua_mod(game_root: &Path, requested_name: &str) -> Result<ModPacka
     load_mod(&mod_dir)
 }
 
+pub fn create_lua_script(mod_dir: &Path, requested_name: &str) -> Result<PathBuf> {
+    let scripts_dir = mod_dir.join("scripts");
+    fs::create_dir_all(&scripts_dir)
+        .with_context(|| format!("Creating {}", scripts_dir.display()))?;
+
+    let mut safe_name = sanitize_mod_name(requested_name);
+    if !safe_name.to_ascii_lowercase().ends_with(".lua") {
+        safe_name.push_str(".lua");
+    }
+
+    let mut script_path = scripts_dir.join(&safe_name);
+    if script_path.exists() {
+        let stem = safe_name.trim_end_matches(".lua");
+        for index in 2..1000 {
+            let candidate = scripts_dir.join(format!("{}_{}.lua", stem, index));
+            if !candidate.exists() {
+                script_path = candidate;
+                break;
+            }
+        }
+    }
+
+    let script_name = script_path
+        .file_stem()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "script".to_owned());
+
+    fs::write(&script_path, lua_script_template(&script_name))
+        .with_context(|| format!("Writing {}", script_path.display()))?;
+
+    Ok(script_path)
+}
+
 pub fn read_text_file(path: &Path) -> Result<String> {
     let bytes = fs::read(path).with_context(|| format!("Reading {}", path.display()))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
@@ -359,6 +392,29 @@ on_mod_loaded()
 "#,
         mod_name = mod_name,
         version = version,
+    )
+}
+
+fn lua_script_template(script_name: &str) -> String {
+    format!(
+        r#"-- Little Britain Lua Script
+-- Script: {script_name}
+
+local M = {{}}
+
+function M.on_level_loaded(level_name)
+    if lb and lb.log then
+        lb.log("{script_name}: level loaded " .. tostring(level_name))
+    end
+end
+
+function M.on_update(delta_time)
+    -- Add per-frame behavior here once runtime scripting is wired.
+end
+
+return M
+"#,
+        script_name = script_name,
     )
 }
 

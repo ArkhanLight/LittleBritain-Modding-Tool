@@ -12,9 +12,10 @@ use crate::{
         GeoViewerState, SceneGeoModel, SceneSelection, draw_geo_viewer, draw_scene_viewer,
         focus_scene_viewer_on_point, reset_geo_viewer, reset_scene_viewer,
     },
-    mod_workspace::{ModPackage, create_lua_mod, read_text_file, scan_mods, write_text_file},
+    mod_workspace::{
+        ModPackage, create_lua_mod, create_lua_script, read_text_file, scan_mods, write_text_file,
+    },
     scn::{ScnFile, ScnMeshChunk, load_scn},
-    script_engine::ScriptEngine,
 };
 use eframe::egui;
 use std::{
@@ -89,6 +90,55 @@ struct TexturePreviewWindow {
     open: bool,
 }
 
+struct AudioPreviewWindow {
+    id: u64,
+    title: String,
+    path: PathBuf,
+    open: bool,
+}
+
+struct BnkPreviewWindow {
+    id: u64,
+    title: String,
+    path: PathBuf,
+    bnk_file: Option<BnkFile>,
+    error: Option<String>,
+    selected_entry: Option<usize>,
+    open: bool,
+}
+
+struct GeoPreviewWindow {
+    id: u64,
+    title: String,
+    path: PathBuf,
+    geo_file: Option<GeoFile>,
+    error: Option<String>,
+    material_previews: Vec<Option<DdsPreview>>,
+    material_error: Option<String>,
+    texture_refs: Vec<ModelTextureRef>,
+    animation_groups: Vec<(String, Vec<PathBuf>)>,
+    viewer: GeoViewerState,
+    viewer_height: f32,
+    active_animation: Option<PathBuf>,
+    active_animation_file: Option<AnmFile>,
+    active_animation_error: Option<String>,
+    active_animation_playing: bool,
+    active_animation_loop: bool,
+    active_animation_time: f32,
+    active_animation_speed: f32,
+    open: bool,
+}
+
+#[derive(Debug)]
+enum AudioWindowCommand {
+    PlayFile(PathBuf),
+    PlayData { label: String, wav_bytes: Vec<u8> },
+    PauseResume,
+    Stop,
+    Seek(f32),
+    SetVolume(f32),
+}
+
 pub struct ModToolApp {
     game_root: Option<PathBuf>,
     tree: Vec<FileNode>,
@@ -103,6 +153,12 @@ pub struct ModToolApp {
     dds_view_height: f32,
     texture_preview_windows: Vec<TexturePreviewWindow>,
     next_texture_preview_window_id: u64,
+    audio_preview_windows: Vec<AudioPreviewWindow>,
+    next_audio_preview_window_id: u64,
+    bnk_preview_windows: Vec<BnkPreviewWindow>,
+    next_bnk_preview_window_id: u64,
+    geo_preview_windows: Vec<GeoPreviewWindow>,
+    next_geo_preview_window_id: u64,
 
     bnk_file: Option<BnkFile>,
     bnk_loaded_path: Option<PathBuf>,
@@ -155,11 +211,14 @@ pub struct ModToolApp {
     mods: Vec<ModPackage>,
     mods_error: Option<String>,
     new_mod_name: String,
+    new_script_name: String,
     selected_mod_index: Option<usize>,
     mod_script_path: Option<PathBuf>,
     mod_script_text: String,
     mod_script_dirty: bool,
+    mod_script_window_open: bool,
     mod_script_error: Option<String>,
+    content_browser_folder: Option<PathBuf>,
     geo_animation_groups_path: Option<PathBuf>,
     geo_animation_groups: Vec<(String, Vec<PathBuf>)>,
 
@@ -186,9 +245,6 @@ pub struct ModToolApp {
     bik_clock_started_at: Option<Instant>,
     bik_clock_start_secs: f32,
     bik_decoder_finished: bool,
-
-    script_path: String,
-    script_logs: Vec<String>,
 }
 
 impl ModToolApp {
@@ -208,6 +264,12 @@ impl ModToolApp {
             dds_view_height: 420.0,
             texture_preview_windows: Vec::new(),
             next_texture_preview_window_id: 1,
+            audio_preview_windows: Vec::new(),
+            next_audio_preview_window_id: 1,
+            bnk_preview_windows: Vec::new(),
+            next_bnk_preview_window_id: 1,
+            geo_preview_windows: Vec::new(),
+            next_geo_preview_window_id: 1,
 
             bnk_file: None,
             bnk_loaded_path: None,
@@ -248,11 +310,14 @@ impl ModToolApp {
             mods: Vec::new(),
             mods_error: None,
             new_mod_name: "MyLuaMod".to_owned(),
+            new_script_name: "new_script".to_owned(),
             selected_mod_index: None,
             mod_script_path: None,
             mod_script_text: String::new(),
             mod_script_dirty: false,
+            mod_script_window_open: false,
             mod_script_error: None,
+            content_browser_folder: None,
             geo_animation_groups_path: None,
             geo_animation_groups: Vec::new(),
 
@@ -291,9 +356,6 @@ impl ModToolApp {
             bik_clock_started_at: None,
             bik_clock_start_secs: 0.0,
             bik_decoder_finished: false,
-
-            script_path: String::new(),
-            script_logs: Vec::new(),
         }
     }
 
@@ -309,6 +371,7 @@ impl ModToolApp {
                     self.geo_animation_groups_path = None;
                     self.geo_animation_groups.clear();
                     self.selected_file = None;
+                    self.content_browser_folder = None;
                     self.dds_preview = None;
                     self.dds_preview_path = None;
                     self.dds_error = None;
@@ -371,6 +434,14 @@ impl ModToolApp {
                     self.asset_links = self.build_asset_links();
                     self.geo_animation_groups_path = None;
                     self.geo_animation_groups.clear();
+                    if self
+                        .content_browser_folder
+                        .as_ref()
+                        .map(|path| !path.is_dir())
+                        .unwrap_or(false)
+                    {
+                        self.content_browser_folder = None;
+                    }
 
                     self.dds_preview = None;
                     self.dds_preview_path = None;
@@ -476,14 +547,43 @@ impl ModToolApp {
         }
     }
 
+    fn create_new_lua_script_for_selected_mod(&mut self) {
+        let Some(index) = self.selected_mod_index else {
+            self.mods_error = Some("Select a mod before adding a script.".to_owned());
+            return;
+        };
+
+        let Some(package) = self.mods.get(index).cloned() else {
+            self.mods_error = Some("Selected mod no longer exists. Refresh mods.".to_owned());
+            return;
+        };
+
+        match create_lua_script(&package.path, &self.new_script_name) {
+            Ok(script_path) => {
+                self.status = format!(
+                    "Created script: {}",
+                    script_path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                );
+                self.refresh_mod_workspace();
+                self.open_mod_script(script_path);
+            }
+            Err(err) => {
+                self.mods_error = Some(err.to_string());
+            }
+        }
+    }
+
     fn open_mod_script(&mut self, path: PathBuf) {
         match read_text_file(&path) {
             Ok(text) => {
                 self.mod_script_path = Some(path);
                 self.mod_script_text = text;
                 self.mod_script_dirty = false;
+                self.mod_script_window_open = true;
                 self.mod_script_error = None;
-                self.selected_file = None;
             }
             Err(err) => {
                 self.mod_script_error = Some(err.to_string());
@@ -598,6 +698,310 @@ impl ModToolApp {
                     });
             }
         }
+    }
+
+    fn find_file_node<'a>(nodes: &'a [FileNode], path: &Path) -> Option<&'a FileNode> {
+        for node in nodes {
+            if node.path == path {
+                return Some(node);
+            }
+
+            if node.kind == NodeKind::Folder {
+                if let Some(found) = Self::find_file_node(&node.children, path) {
+                    return Some(found);
+                }
+            }
+        }
+
+        None
+    }
+
+    fn content_browser_entries(&self) -> Vec<FileNode> {
+        let Some(folder) = self.content_browser_folder.as_ref() else {
+            return self.tree.clone();
+        };
+
+        Self::find_file_node(&self.tree, folder)
+            .map(|node| node.children.clone())
+            .unwrap_or_else(|| self.tree.clone())
+    }
+
+    fn content_browser_path_label(&self) -> String {
+        let Some(folder) = self.content_browser_folder.as_ref() else {
+            return "Data".to_owned();
+        };
+
+        let Some(root) = self.game_root.as_ref() else {
+            return folder.display().to_string();
+        };
+
+        folder
+            .strip_prefix(root.join("Data"))
+            .map(|path| {
+                let suffix = path.display().to_string();
+                if suffix.is_empty() {
+                    "Data".to_owned()
+                } else {
+                    format!("Data\\{}", suffix)
+                }
+            })
+            .unwrap_or_else(|_| folder.display().to_string())
+    }
+
+    fn asset_category_display_order() -> [AssetCategory; 11] {
+        [
+            AssetCategory::Scene,
+            AssetCategory::Model,
+            AssetCategory::Animation,
+            AssetCategory::Texture,
+            AssetCategory::AudioStream,
+            AssetCategory::AudioBank,
+            AssetCategory::Video,
+            AssetCategory::Lighting,
+            AssetCategory::Particle,
+            AssetCategory::Log,
+            AssetCategory::Unknown,
+        ]
+    }
+
+    fn asset_category_sort_order(category: AssetCategory) -> u8 {
+        match category {
+            AssetCategory::Scene => 0,
+            AssetCategory::Model => 1,
+            AssetCategory::Animation => 2,
+            AssetCategory::Texture => 3,
+            AssetCategory::AudioStream => 4,
+            AssetCategory::AudioBank => 5,
+            AssetCategory::Video => 6,
+            AssetCategory::Lighting => 7,
+            AssetCategory::Particle => 8,
+            AssetCategory::Log => 9,
+            AssetCategory::Unknown => 10,
+        }
+    }
+
+    fn asset_category_browser_title(category: AssetCategory) -> &'static str {
+        match category {
+            AssetCategory::Scene => "Levels / Scenes",
+            AssetCategory::Model => "Models",
+            AssetCategory::Animation => "Animations",
+            AssetCategory::Texture => "Textures",
+            AssetCategory::AudioStream => "Audio Files",
+            AssetCategory::AudioBank => "Audio Banks",
+            AssetCategory::Video => "Videos",
+            AssetCategory::Lighting => "Lighting",
+            AssetCategory::Particle => "Particles",
+            AssetCategory::Log => "Logs",
+            AssetCategory::Unknown => "Other Files",
+        }
+    }
+
+    fn asset_badge(category: Option<AssetCategory>) -> &'static str {
+        match category.unwrap_or(AssetCategory::Unknown) {
+            AssetCategory::Texture => "DDS",
+            AssetCategory::Model => "GEO",
+            AssetCategory::Animation => "ANM",
+            AssetCategory::Particle => "FX",
+            AssetCategory::AudioStream => "AUD",
+            AssetCategory::AudioBank => "BNK",
+            AssetCategory::Video => "BIK",
+            AssetCategory::Lighting => "LGT",
+            AssetCategory::Scene => "SCN",
+            AssetCategory::Log => "LOG",
+            AssetCategory::Unknown => "FILE",
+        }
+    }
+
+    fn show_content_browser(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_height(280.0);
+
+        ui.horizontal(|ui| {
+            ui.heading("Content Browser");
+            ui.separator();
+            ui.label(self.content_browser_path_label());
+
+            if self.content_browser_folder.is_some() && ui.button("Data").clicked() {
+                self.content_browser_folder = None;
+            }
+
+            if ui.button("Refresh").clicked() {
+                self.rescan();
+            }
+        });
+
+        ui.separator();
+
+        if self.tree.is_empty() {
+            ui.label("Open the game folder to browse Data assets.");
+            return;
+        }
+
+        let entries = self.content_browser_entries();
+        let mut folders = entries
+            .iter()
+            .filter(|node| node.kind == NodeKind::Folder)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut files = entries
+            .into_iter()
+            .filter(|node| node.kind == NodeKind::File)
+            .collect::<Vec<_>>();
+
+        folders.sort_by_key(|node| node.name.to_ascii_lowercase());
+        files.sort_by_key(|node| {
+            (
+                Self::asset_category_sort_order(node.category.unwrap_or(AssetCategory::Unknown)),
+                node.name.to_ascii_lowercase(),
+            )
+        });
+
+        let body_height = ui.available_height().max(220.0);
+        let body_width = ui.available_width();
+
+        ui.allocate_ui_with_layout(
+            egui::vec2(body_width, body_height),
+            egui::Layout::left_to_right(egui::Align::Min),
+            |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(220.0, body_height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.label("Folders");
+                        egui::ScrollArea::vertical()
+                            .id_salt("content_browser_folders")
+                            .max_height((body_height - 26.0).max(180.0))
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_width(200.0);
+                                ui.vertical(|ui| {
+                                    if let Some(current) = self.content_browser_folder.clone() {
+                                        if let Some(parent) = current.parent() {
+                                            let data_root = self.game_root.as_ref().map(|root| root.join("Data"));
+                                            if data_root.as_ref() == Some(&current) {
+                                                self.content_browser_folder = None;
+                                            } else if ui.button(".. Data").clicked() {
+                                                if data_root.as_ref() == Some(&parent.to_path_buf()) {
+                                                    self.content_browser_folder = None;
+                                                } else {
+                                                    self.content_browser_folder = Some(parent.to_path_buf());
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    for folder in &folders {
+                                        if ui
+                                            .add_sized(
+                                                [ui.available_width(), 22.0],
+                                                egui::Button::new(format!("[DIR] {}", folder.name)),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.content_browser_folder = Some(folder.path.clone());
+                                        }
+                                    }
+                                });
+                            });
+                    },
+                );
+
+                ui.separator();
+
+                let asset_width = ui.available_width().max(260.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(asset_width, body_height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Assets ({})", files.len()));
+                            ui.separator();
+                            ui.small("Grouped by file type. GEO, DDS, audio, and BNK open in their own windows.");
+                        });
+
+                        egui::ScrollArea::vertical()
+                            .id_salt("content_browser_assets")
+                            .max_height((body_height - 26.0).max(180.0))
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for category in Self::asset_category_display_order() {
+                                    let category_files = files
+                                        .iter()
+                                        .filter(|file| file.category.unwrap_or(AssetCategory::Unknown) == category)
+                                        .collect::<Vec<_>>();
+
+                                    if category_files.is_empty() {
+                                        continue;
+                                    }
+
+                                    let default_open = matches!(
+                                        category,
+                                        AssetCategory::Scene
+                                            | AssetCategory::Model
+                                            | AssetCategory::Texture
+                                            | AssetCategory::AudioStream
+                                            | AssetCategory::AudioBank
+                                    );
+
+                                    egui::CollapsingHeader::new(format!(
+                                        "{} ({})",
+                                        Self::asset_category_browser_title(category),
+                                        category_files.len()
+                                    ))
+                                    .id_salt(format!("content_category_{category:?}"))
+                                    .default_open(default_open)
+                                    .show(ui, |ui| {
+                                        let card_width = 154.0;
+                                        let columns = ((ui.available_width() / card_width).floor() as usize).max(1);
+
+                                        egui::Grid::new(format!("content_browser_asset_grid_{category:?}"))
+                                            .num_columns(columns)
+                                            .min_col_width(card_width)
+                                            .spacing([8.0, 8.0])
+                                            .show(ui, |ui| {
+                                                for (index, file) in category_files.iter().enumerate() {
+                                                    let selected = self.selected_file.as_ref() == Some(&file.path);
+                                                    let frame = egui::Frame::group(ui.style()).fill(if selected {
+                                                        egui::Color32::from_rgb(28, 54, 84)
+                                                    } else {
+                                                        egui::Color32::from_rgb(28, 28, 28)
+                                                    });
+
+                                                    frame.show(ui, |ui| {
+                                                        ui.set_min_size(egui::vec2(card_width - 16.0, 64.0));
+                                                        ui.vertical_centered(|ui| {
+                                                            ui.label(
+                                                                egui::RichText::new(Self::asset_badge(file.category))
+                                                                    .monospace()
+                                                                    .strong(),
+                                                            );
+
+                                                            let clicked = ui
+                                                                .selectable_label(selected, &file.name)
+                                                                .on_hover_text(file.path.display().to_string())
+                                                                .clicked();
+
+                                                            if clicked {
+                                                                self.open_content_browser_asset(ui.ctx(), file);
+                                                            }
+
+                                                            if let Some(size) = file.size {
+                                                                ui.small(format!("{} KB", (size + 1023) / 1024));
+                                                            }
+                                                        });
+                                                    });
+
+                                                    if (index + 1) % columns == 0 {
+                                                        ui.end_row();
+                                                    }
+                                                }
+                                            });
+                                    });
+                                }
+                            });
+                    },
+                );
+            },
+        );
     }
 
     fn stop_bik_audio(&mut self) {
@@ -1030,6 +1434,888 @@ impl ModToolApp {
             Err(err) => {
                 self.status = format!("Texture preview error: {}", err);
             }
+        }
+    }
+
+    fn path_title(path: &Path) -> String {
+        path.file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string())
+    }
+
+    fn open_audio_preview_window(&mut self, path: &Path) {
+        if let Some(window) = self
+            .audio_preview_windows
+            .iter_mut()
+            .find(|window| window.path.as_path() == path)
+        {
+            window.open = true;
+            self.status = format!("Opened audio preview: {}", path.display());
+            return;
+        }
+
+        let id = self.next_audio_preview_window_id;
+        self.next_audio_preview_window_id = self.next_audio_preview_window_id.wrapping_add(1);
+
+        self.audio_preview_windows.push(AudioPreviewWindow {
+            id,
+            title: format!("Audio - {}", Self::path_title(path)),
+            path: path.to_path_buf(),
+            open: true,
+        });
+        self.status = format!("Opened audio preview: {}", path.display());
+    }
+
+    fn open_bnk_preview_window(&mut self, path: &Path) {
+        if let Some(window) = self
+            .bnk_preview_windows
+            .iter_mut()
+            .find(|window| window.path.as_path() == path)
+        {
+            window.open = true;
+            self.status = format!("Opened BNK preview: {}", path.display());
+            return;
+        }
+
+        let (bnk_file, selected_entry, error) = match load_bnk(path) {
+            Ok(bnk) => {
+                let selected_entry = if bnk.entries.is_empty() { None } else { Some(0) };
+                (Some(bnk), selected_entry, None)
+            }
+            Err(err) => (None, None, Some(err.to_string())),
+        };
+
+        let id = self.next_bnk_preview_window_id;
+        self.next_bnk_preview_window_id = self.next_bnk_preview_window_id.wrapping_add(1);
+
+        self.bnk_preview_windows.push(BnkPreviewWindow {
+            id,
+            title: format!("Audio Bank - {}", Self::path_title(path)),
+            path: path.to_path_buf(),
+            bnk_file,
+            error,
+            selected_entry,
+            open: true,
+        });
+        self.status = format!("Opened BNK preview: {}", path.display());
+    }
+
+    fn open_content_browser_asset(&mut self, ctx: &egui::Context, file: &FileNode) {
+        match file.category.unwrap_or(AssetCategory::Unknown) {
+            AssetCategory::Texture => self.open_texture_path_preview_window(ctx, &file.path),
+            AssetCategory::AudioStream => self.open_audio_preview_window(&file.path),
+            AssetCategory::AudioBank => self.open_bnk_preview_window(&file.path),
+            AssetCategory::Model => self.open_geo_preview_window(ctx, &file.path),
+            _ => {
+                self.selected_file = Some(file.path.clone());
+            }
+        }
+    }
+
+    fn model_texture_refs_for_geo(&self, geo_path: &Path, geo: &GeoFile) -> Vec<ModelTextureRef> {
+        if let Some(texture_refs) = self.asset_links.model_to_textures.get(geo_path) {
+            return texture_refs.clone();
+        }
+
+        geo.texture_names
+            .iter()
+            .map(|name| ModelTextureRef {
+                name: name.clone(),
+                resolved_path: Self::guess_geo_texture_path(geo_path, name),
+            })
+            .collect()
+    }
+
+    fn open_geo_preview_window(&mut self, ctx: &egui::Context, path: &Path) {
+        if let Some(window) = self
+            .geo_preview_windows
+            .iter_mut()
+            .find(|window| window.path.as_path() == path)
+        {
+            window.open = true;
+            self.status = format!("Opened GEO preview: {}", path.display());
+            return;
+        }
+
+        let id = self.next_geo_preview_window_id;
+        self.next_geo_preview_window_id = self.next_geo_preview_window_id.wrapping_add(1);
+
+        let mut viewer = GeoViewerState::default();
+        let mut geo_file = None;
+        let mut error = None;
+        let mut material_previews = Vec::new();
+        let mut material_errors = Vec::new();
+        let mut texture_refs = Vec::new();
+        let mut animation_groups = Vec::new();
+
+        match load_geo(path) {
+            Ok(geo) => {
+                reset_geo_viewer(&mut viewer, &geo);
+
+                for texture_name in &geo.texture_names {
+                    let preview = if let Some(tex_path) = Self::guess_geo_texture_path(path, texture_name) {
+                        match load_dds_preview(ctx, &tex_path) {
+                            Ok(preview) => Some(preview),
+                            Err(err) => {
+                                material_errors.push(format!("{}: {}", tex_path.display(), err));
+                                None
+                            }
+                        }
+                    } else {
+                        material_errors.push(format!("{}: missing", texture_name));
+                        None
+                    };
+
+                    material_previews.push(preview);
+                }
+
+                texture_refs = self.model_texture_refs_for_geo(path, &geo);
+
+                if geo.skeleton.is_some()
+                    && matches!(geo.asset_type, GeoAssetType::SkinnedMesh | GeoAssetType::RigidProp)
+                {
+                    animation_groups = self.animations_for_geo_grouped(path);
+                }
+
+                geo_file = Some(geo);
+            }
+            Err(err) => {
+                error = Some(err.to_string());
+            }
+        }
+
+        self.geo_preview_windows.push(GeoPreviewWindow {
+            id,
+            title: format!("Model - {}", Self::path_title(path)),
+            path: path.to_path_buf(),
+            geo_file,
+            error,
+            material_previews,
+            material_error: if material_errors.is_empty() {
+                None
+            } else {
+                Some(material_errors.join(" | "))
+            },
+            texture_refs,
+            animation_groups,
+            viewer,
+            viewer_height: 420.0,
+            active_animation: None,
+            active_animation_file: None,
+            active_animation_error: None,
+            active_animation_playing: false,
+            active_animation_loop: true,
+            active_animation_time: 0.0,
+            active_animation_speed: 1.0,
+            open: true,
+        });
+
+        self.status = format!("Opened GEO preview: {}", path.display());
+    }
+
+    fn set_geo_window_animation(window: &mut GeoPreviewWindow, path: PathBuf) {
+        window.active_animation = Some(path.clone());
+        window.active_animation_file = None;
+        window.active_animation_error = None;
+        window.active_animation_time = 0.0;
+        window.active_animation_playing = false;
+
+        match load_anm(&path) {
+            Ok(anm) => {
+                window.active_animation_playing = anm.rigid_clip.is_some();
+                window.active_animation_file = Some(anm);
+            }
+            Err(err) => {
+                window.active_animation_error = Some(err.to_string());
+            }
+        }
+    }
+
+    fn update_geo_preview_window_animation_clock(ctx: &egui::Context, window: &mut GeoPreviewWindow) {
+        if !window.active_animation_playing {
+            return;
+        }
+
+        let Some(anm) = window.active_animation_file.as_ref() else {
+            return;
+        };
+
+        let Some(clip) = anm.rigid_clip.as_ref() else {
+            return;
+        };
+
+        let dt = ctx.input(|i| i.unstable_dt).max(1.0 / 240.0);
+        window.active_animation_time += dt * window.active_animation_speed.max(0.05);
+
+        let duration = clip.duration_seconds.max(1.0 / clip.sample_rate.max(1.0));
+
+        if window.active_animation_time > duration {
+            if window.active_animation_loop {
+                window.active_animation_time %= duration;
+            } else {
+                window.active_animation_time = duration;
+                window.active_animation_playing = false;
+            }
+        }
+
+        ctx.request_repaint();
+    }
+
+    fn show_geo_model_and_subset_panel(
+        ui: &mut egui::Ui,
+        geo: &GeoFile,
+        window_path: &Path,
+        texture_refs: &[ModelTextureRef],
+        pending_texture_preview_paths: &mut Vec<PathBuf>,
+    ) {
+        ui.heading("Model");
+        ui.separator();
+        ui.label(Self::path_title(window_path));
+        ui.small(format!("Type: {}", geo.asset_type.as_str()));
+        ui.small(format!(
+            "Vertices: {}  |  Faces: {}  |  Subsets: {}",
+            geo.vertex_count,
+            geo.faces.len(),
+            geo.subsets.len()
+        ));
+
+        ui.separator();
+        ui.heading("Textures");
+        ui.separator();
+
+        if texture_refs.is_empty() {
+            ui.label("(none found)");
+        } else {
+            egui::ScrollArea::vertical()
+                .id_salt(format!("geo_window_textures:{}", window_path.display()))
+                .max_height(120.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for tex in texture_refs {
+                        match &tex.resolved_path {
+                            Some(path) => {
+                                if ui.button(&tex.name).clicked() {
+                                    pending_texture_preview_paths.push(path.clone());
+                                }
+                            }
+                            None => {
+                                ui.colored_label(
+                                    egui::Color32::RED,
+                                    format!("{} (missing)", tex.name),
+                                );
+                            }
+                        }
+                    }
+                });
+        }
+
+        ui.separator();
+        ui.heading("Subsets");
+        ui.separator();
+
+        if geo.subsets.is_empty() {
+            ui.label("(none found)");
+        } else {
+            egui::ScrollArea::vertical()
+                .id_salt(format!("geo_window_subsets:{}", window_path.display()))
+                .max_height(220.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for (i, subset) in geo.subsets.iter().enumerate() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(format!(
+                                "#{:02}  material={}  flags={}  start={}  count={}",
+                                i, subset.material, subset.flags, subset.start, subset.count
+                            ));
+
+                            if let Some(tex_name) = geo.texture_names.get(subset.material) {
+                                ui.label(" -> ");
+
+                                if let Some(tex_ref) = texture_refs.iter().find(|t| t.name == *tex_name) {
+                                    match &tex_ref.resolved_path {
+                                        Some(path) => {
+                                            if ui.small_button(tex_name).clicked() {
+                                                pending_texture_preview_paths.push(path.clone());
+                                            }
+                                        }
+                                        None => {
+                                            ui.colored_label(
+                                                egui::Color32::RED,
+                                                format!("{} (missing)", tex_name),
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    ui.label(tex_name);
+                                }
+                            }
+                        });
+                    }
+                });
+        }
+    }
+
+    fn show_geo_skeleton_panel(ui: &mut egui::Ui, geo: &GeoFile, window_path: &Path) {
+        ui.heading("Skeleton / Bones");
+        ui.separator();
+
+        if let Some(skeleton) = &geo.skeleton {
+            ui.label(format!("Bone count: {}", skeleton.bone_count));
+            ui.separator();
+
+            egui::ScrollArea::vertical()
+                .id_salt(format!("geo_window_bones:{}", window_path.display()))
+                .max_height(390.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for (i, name) in skeleton.names.iter().enumerate() {
+                        let parent_text = match skeleton.parent.get(i).and_then(|p| *p) {
+                            Some(parent) => parent.to_string(),
+                            None => "-".to_owned(),
+                        };
+
+                        ui.label(format!("#{:03}  parent={}  {}", i, parent_text, name));
+                    }
+                });
+        } else {
+            ui.label("No skeleton detected.");
+        }
+    }
+
+    fn show_geo_animation_panel(
+        ui: &mut egui::Ui,
+        window: &mut GeoPreviewWindow,
+        animation_groups: &[(String, Vec<PathBuf>)],
+        active_animation: &Option<PathBuf>,
+        geo_stem: &str,
+    ) -> Option<PathBuf> {
+        let mut pending_animation = None;
+
+        ui.heading("Animations");
+        ui.separator();
+
+        if let Some(anm_path) = active_animation {
+            let label = anm_path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| anm_path.display().to_string());
+            ui.label(format!("Selected: {}", label));
+
+            if let Some(anm) = &window.active_animation_file {
+                ui.small(format!(
+                    "Rig bones: {}  |  Duration hint: {:.2}s",
+                    anm.rig_bone_count, anm.duration_hint_seconds
+                ));
+
+                if let Some(clip) = &anm.rigid_clip {
+                    ui.small(format!(
+                        "Rigid clip: {:.2}s at {:.1} fps",
+                        clip.duration_seconds, clip.sample_rate
+                    ));
+                } else {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "This ANM has no decoded rigid-prop clip yet.",
+                    );
+                }
+            }
+
+            ui.horizontal(|ui| {
+                let play_label = if window.active_animation_playing { "Pause" } else { "Play" };
+                if ui.button(play_label).clicked() {
+                    window.active_animation_playing = !window.active_animation_playing;
+                }
+
+                if ui.button("Stop").clicked() {
+                    window.active_animation_playing = false;
+                    window.active_animation_time = 0.0;
+                }
+            });
+
+            ui.checkbox(&mut window.active_animation_loop, "Loop");
+            ui.add(
+                egui::Slider::new(&mut window.active_animation_speed, 0.1..=4.0)
+                    .logarithmic(true)
+                    .text("Speed"),
+            );
+            ui.label(format!("Time: {:.2}s", window.active_animation_time));
+            ui.separator();
+        }
+
+        if let Some(err) = &window.active_animation_error {
+            ui.colored_label(egui::Color32::RED, format!("Animation error: {}", err));
+            ui.separator();
+        }
+
+        if animation_groups.is_empty() {
+            ui.label("No animations found beside this GEO.");
+            return pending_animation;
+        }
+
+        egui::ScrollArea::vertical()
+            .id_salt(format!("geo_window_anims:{}", window.path.display()))
+            .max_height(390.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (group_name, paths) in animation_groups {
+                    egui::CollapsingHeader::new(group_name.as_str())
+                        .id_salt(format!(
+                            "geo_window_anim_group:{}:{}",
+                            window.id, group_name
+                        ))
+                        .default_open(group_name == geo_stem)
+                        .show(ui, |ui| {
+                            for anm_path in paths {
+                                let label = anm_path
+                                    .file_name()
+                                    .map(|name| name.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| anm_path.display().to_string());
+
+                                let is_selected = active_animation.as_ref() == Some(anm_path);
+
+                                if ui.selectable_label(is_selected, label).clicked() {
+                                    pending_animation = Some(anm_path.clone());
+                                }
+                            }
+                        });
+                }
+            });
+
+        pending_animation
+    }
+
+    fn draw_geo_preview_windows(&mut self, ctx: &egui::Context) {
+        let mut pending_texture_preview_paths = Vec::new();
+
+        for window in &mut self.geo_preview_windows {
+            Self::update_geo_preview_window_animation_clock(ctx, window);
+
+            let mut open = window.open;
+            egui::Window::new(window.title.clone())
+                .id(egui::Id::new(("geo_preview_window", window.id)))
+                .open(&mut open)
+                .resizable(true)
+                .default_size(egui::vec2(1020.0, 780.0))
+                .show(ctx, |ui| {
+                    ui.label(window.path.display().to_string());
+                    ui.separator();
+
+                    if let Some(err) = &window.error {
+                        ui.colored_label(egui::Color32::RED, format!("Could not read GEO: {}", err));
+                        return;
+                    }
+
+                    let Some(geo) = window.geo_file.clone() else {
+                        ui.label("GEO selected, but no GEO info is loaded.");
+                        return;
+                    };
+                    let window_path = window.path.clone();
+
+                    let active_rigid_tag = window
+                        .active_animation
+                        .as_ref()
+                        .and_then(|path| path.file_name())
+                        .map(|name| name.to_string_lossy().to_string());
+
+                    {
+                        let active_rigid_clip = window
+                            .active_animation_file
+                            .as_ref()
+                            .and_then(|anm| anm.rigid_clip.as_ref());
+
+                        draw_geo_viewer(
+                            ui,
+                            &geo,
+                            &window.material_previews,
+                            active_rigid_clip,
+                            window.active_animation_time,
+                            active_rigid_tag.as_deref(),
+                            &mut window.viewer,
+                            window.viewer_height,
+                        );
+                    }
+
+                    let (resize_rect, resize_response) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 12.0),
+                        egui::Sense::drag(),
+                    );
+
+                    let resize_response =
+                        resize_response.on_hover_cursor(egui::CursorIcon::ResizeVertical);
+
+                    ui.painter().hline(
+                        resize_rect.x_range(),
+                        resize_rect.center().y,
+                        egui::Stroke::new(1.5, egui::Color32::GRAY),
+                    );
+
+                    if resize_response.dragged() {
+                        let delta = ui.ctx().input(|i| i.pointer.delta()).y;
+                        window.viewer_height = (window.viewer_height + delta).clamp(260.0, 900.0);
+                        ui.ctx().request_repaint();
+                    }
+
+                    if let Some(err) = &window.material_error {
+                        ui.colored_label(egui::Color32::YELLOW, format!("Texture load warning: {}", err));
+                    }
+
+                    ui.separator();
+
+                    let texture_refs = window.texture_refs.clone();
+                    let animation_groups = window.animation_groups.clone();
+                    let active_animation = window.active_animation.clone();
+                    let geo_stem = Self::asset_stem_lower(&window_path);
+                    let mut pending_animation = None;
+
+                    ui.columns(3, |columns| {
+                        let (left_cols, rest) = columns.split_at_mut(1);
+                        let left = &mut left_cols[0];
+                        let (middle_cols, right_cols) = rest.split_at_mut(1);
+                        let middle = &mut middle_cols[0];
+                        let right = &mut right_cols[0];
+
+                        Self::show_geo_model_and_subset_panel(
+                            left,
+                            &geo,
+                            &window_path,
+                            &texture_refs,
+                            &mut pending_texture_preview_paths,
+                        );
+                        Self::show_geo_skeleton_panel(middle, &geo, &window_path);
+                        pending_animation = Self::show_geo_animation_panel(
+                            right,
+                            window,
+                            &animation_groups,
+                            &active_animation,
+                            &geo_stem,
+                        );
+                    });
+
+                    if let Some(anm_path) = pending_animation {
+                        Self::set_geo_window_animation(window, anm_path);
+                    }
+                });
+
+            window.open = open;
+        }
+
+        self.geo_preview_windows.retain(|window| window.open);
+
+        for path in pending_texture_preview_paths {
+            self.open_texture_path_preview_window(ctx, &path);
+        }
+    }
+
+    fn execute_audio_window_command(&mut self, command: AudioWindowCommand) {
+        match command {
+            AudioWindowCommand::PlayFile(path) => self.play_audio_file_path(path),
+            AudioWindowCommand::PlayData { label, wav_bytes } => {
+                self.play_audio_bytes(label, wav_bytes);
+            }
+            AudioWindowCommand::PauseResume => self.pause_or_resume_audio(),
+            AudioWindowCommand::Stop => self.stop_audio(),
+            AudioWindowCommand::Seek(seconds) => self.seek_audio(seconds),
+            AudioWindowCommand::SetVolume(volume) => {
+                if let Some(player) = self.audio_player.as_ref() {
+                    player.set_volume(volume);
+                }
+            }
+        }
+    }
+
+    fn play_audio_file_path(&mut self, path: PathBuf) {
+        if !self.ensure_audio_player() {
+            return;
+        }
+
+        if let Some(player) = self.audio_player.as_mut() {
+            match player.play_file(&path) {
+                Ok(()) => {
+                    self.audio_error = None;
+                    self.bik_audio_active = false;
+                    self.status = format!("Playing {}", path.display());
+                }
+                Err(err) => {
+                    self.audio_error = Some(err.to_string());
+                }
+            }
+        }
+    }
+
+    fn play_audio_bytes(&mut self, label: String, wav_bytes: Vec<u8>) {
+        if !self.ensure_audio_player() {
+            return;
+        }
+
+        if let Some(player) = self.audio_player.as_mut() {
+            match player.play_data(label.clone(), wav_bytes) {
+                Ok(()) => {
+                    self.audio_error = None;
+                    self.bik_audio_active = false;
+                    self.status = format!("Playing {label}");
+                }
+                Err(err) => {
+                    self.audio_error = Some(err.to_string());
+                }
+            }
+        }
+    }
+
+    fn audio_snapshot(&self) -> (bool, bool, f32, f32, Option<f32>, Option<String>) {
+        if let Some(player) = self.audio_player.as_ref() {
+            (
+                player.is_paused(),
+                player.is_empty(),
+                player.volume(),
+                player.position().as_secs_f32(),
+                player.duration().map(|duration| duration.as_secs_f32()),
+                player.current_path().map(|path| path.to_owned()),
+            )
+        } else {
+            (false, true, 1.0, 0.0, None, None)
+        }
+    }
+
+    fn show_audio_transport_snapshot(
+        ui: &mut egui::Ui,
+        commands: &mut Vec<AudioWindowCommand>,
+        is_paused: bool,
+        is_empty: bool,
+        volume: f32,
+        position_secs: f32,
+        duration_secs: Option<f32>,
+        now_playing: &Option<String>,
+    ) {
+        if let Some(path) = now_playing {
+            ui.small(format!("Now playing: {path}"));
+        }
+
+        if is_empty {
+            ui.small("State: idle");
+        } else if is_paused {
+            ui.small("State: paused");
+        } else {
+            ui.small("State: playing");
+        }
+
+        ui.horizontal(|ui| {
+            let pause_label = if is_paused { "Resume" } else { "Pause" };
+            if ui.button(pause_label).clicked() {
+                commands.push(AudioWindowCommand::PauseResume);
+            }
+
+            if ui.button("Stop").clicked() {
+                commands.push(AudioWindowCommand::Stop);
+            }
+
+            ui.separator();
+
+            let mut new_volume = volume;
+            if ui
+                .add(egui::Slider::new(&mut new_volume, 0.0..=2.0).text("Volume"))
+                .changed()
+            {
+                commands.push(AudioWindowCommand::SetVolume(new_volume));
+            }
+        });
+
+        let max_secs = duration_secs.unwrap_or(position_secs.max(1.0));
+        let mut timeline_secs = position_secs.min(max_secs);
+
+        let response = ui.add_sized(
+            [ui.available_width(), 18.0],
+            egui::Slider::new(&mut timeline_secs, 0.0..=max_secs).show_value(false),
+        );
+
+        if response.changed() {
+            commands.push(AudioWindowCommand::Seek(timeline_secs));
+        }
+
+        ui.horizontal(|ui| {
+            ui.label(Self::format_time(timeline_secs));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    duration_secs
+                        .map(Self::format_time)
+                        .unwrap_or_else(|| "--:--".to_owned()),
+                );
+            });
+        });
+    }
+
+    fn draw_audio_preview_windows(&mut self, ctx: &egui::Context) {
+        let (is_paused, is_empty, volume, position_secs, duration_secs, now_playing) =
+            self.audio_snapshot();
+        let mut commands = Vec::new();
+
+        for window in &mut self.audio_preview_windows {
+            let mut open = window.open;
+            egui::Window::new(window.title.clone())
+                .id(egui::Id::new(("audio_preview_window", window.id)))
+                .open(&mut open)
+                .resizable(true)
+                .default_size(egui::vec2(460.0, 210.0))
+                .show(ctx, |ui| {
+                    ui.label(window.path.display().to_string());
+                    ui.separator();
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Play").clicked() {
+                            commands.push(AudioWindowCommand::PlayFile(window.path.clone()));
+                        }
+                    });
+
+                    Self::show_audio_transport_snapshot(
+                        ui,
+                        &mut commands,
+                        is_paused,
+                        is_empty,
+                        volume,
+                        position_secs,
+                        duration_secs,
+                        &now_playing,
+                    );
+                });
+
+            window.open = open;
+        }
+
+        self.audio_preview_windows.retain(|window| window.open);
+
+        for command in commands {
+            self.execute_audio_window_command(command);
+        }
+    }
+
+    fn draw_bnk_preview_windows(&mut self, ctx: &egui::Context) {
+        let (is_paused, is_empty, volume, position_secs, duration_secs, now_playing) =
+            self.audio_snapshot();
+        let mut commands = Vec::new();
+
+        for window in &mut self.bnk_preview_windows {
+            let mut open = window.open;
+            egui::Window::new(window.title.clone())
+                .id(egui::Id::new(("bnk_preview_window", window.id)))
+                .open(&mut open)
+                .resizable(true)
+                .default_size(egui::vec2(620.0, 520.0))
+                .show(ctx, |ui| {
+                    ui.label(window.path.display().to_string());
+                    ui.separator();
+
+                    if let Some(bnk) = &window.bnk_file {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Entries: {}", bnk.entry_count));
+                            ui.separator();
+                            ui.label(format!("Bank size: {} bytes", bnk.file_size));
+                        });
+
+                        if let Some(index) = window.selected_entry {
+                            if let Some(entry) = bnk.entries.get(index) {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(format!("Selected: #{:03}", entry.index));
+                                    ui.separator();
+                                    ui.label(format!("{} Hz", entry.sample_rate));
+                                    ui.separator();
+                                    ui.label(format!("{} bytes", entry.byte_len));
+                                    ui.separator();
+                                    ui.label(format!("Format: {}", format_name(entry.format_word)));
+                                    if let Some(seconds) = entry.estimated_duration_seconds() {
+                                        ui.separator();
+                                        ui.label(format!("{seconds:.2}s"));
+                                    }
+                                });
+                            }
+                        }
+
+                        ui.horizontal(|ui| {
+                            if ui.button("Play selected entry").clicked() {
+                                if let Some(index) = window.selected_entry {
+                                    let file_name = bnk
+                                        .path
+                                        .file_name()
+                                        .and_then(|name| name.to_str())
+                                        .unwrap_or("bank.bnk");
+                                    let label = format!("{file_name} [entry {index:03}]");
+
+                                    match bnk.entry_wav_bytes(index) {
+                                        Ok(wav_bytes) => {
+                                            window.error = None;
+                                            commands.push(AudioWindowCommand::PlayData {
+                                                label,
+                                                wav_bytes,
+                                            });
+                                        }
+                                        Err(err) => {
+                                            window.error = Some(err.to_string());
+                                        }
+                                    }
+                                } else {
+                                    window.error = Some("Select a BNK entry first.".to_owned());
+                                }
+                            }
+                        });
+
+                        Self::show_audio_transport_snapshot(
+                            ui,
+                            &mut commands,
+                            is_paused,
+                            is_empty,
+                            volume,
+                            position_secs,
+                            duration_secs,
+                            &now_playing,
+                        );
+
+                        ui.separator();
+                        ui.heading(format!("Entries ({})", bnk.entry_count));
+                        ui.separator();
+
+                        egui::ScrollArea::vertical()
+                            .id_salt(format!("bnk_window_entries:{}", window.id))
+                            .max_height(260.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for entry in &bnk.entries {
+                                    let duration_text = entry
+                                        .estimated_duration_seconds()
+                                        .map(|seconds| format!("{seconds:.2}s"))
+                                        .unwrap_or_else(|| "?".to_owned());
+
+                                    let label = format!(
+                                        "#{:03}   {} Hz   {} bytes   {}",
+                                        entry.index,
+                                        entry.sample_rate,
+                                        entry.byte_len,
+                                        duration_text
+                                    );
+
+                                    let is_selected = window.selected_entry == Some(entry.index);
+
+                                    if ui.selectable_label(is_selected, label).clicked() {
+                                        window.selected_entry = Some(entry.index);
+                                    }
+                                }
+                            });
+                    } else if let Some(err) = &window.error {
+                        ui.colored_label(egui::Color32::RED, format!("Could not read BNK: {err}"));
+                    } else {
+                        ui.label("BNK selected, but no bank info is loaded.");
+                    }
+
+                    if let Some(err) = &window.error {
+                        ui.separator();
+                        ui.colored_label(egui::Color32::RED, format!("BNK/audio error: {err}"));
+                    }
+                });
+
+            window.open = open;
+        }
+
+        self.bnk_preview_windows.retain(|window| window.open);
+
+        for command in commands {
+            self.execute_audio_window_command(command);
         }
     }
 
@@ -2094,6 +3380,48 @@ impl ModToolApp {
         summary
     }
 
+    fn show_scn_quick_summary(&self, ui: &mut egui::Ui, scn: &ScnFile) {
+        let marker_summary = Self::summarize_scn_markers(scn);
+
+        ui.heading("Level Summary");
+        ui.separator();
+
+        ui.label(format!("Nodes: {}", scn.nodes.len()));
+        ui.label(format!("Renderable nodes: {}", scn.renderable_count()));
+        ui.label(format!("Marker nodes: {}", scn.marker_count()));
+        ui.label(format!("Embedded chunks: {}", scn.embedded_mesh_chunk_count()));
+        ui.label(format!("Embedded tris: {}", scn.embedded_triangle_count()));
+        ui.label(format!("Resolved GEOs: {}", self.scn_scene_models.len()));
+        ui.label(format!("Missing archetypes: {}", self.scn_scene_unresolved.len()));
+        ui.label(format!("Hidden nodes: {}", self.hidden_scn_nodes.len()));
+        ui.label(format!("Hidden chunks: {}", self.hidden_scn_chunks.len()));
+
+        if scn.marker_count() > 0 {
+            ui.separator();
+            ui.heading("Marker Groups");
+            ui.separator();
+
+            let rows = [
+                ("Actor-like", marker_summary.actor_like),
+                ("Player starts", marker_summary.player_starts),
+                ("Player ends", marker_summary.player_ends),
+                ("Spawns", marker_summary.spawns),
+                ("Cameras", marker_summary.cameras),
+                ("Checkpoints", marker_summary.checkpoints),
+                ("Route markers", marker_summary.path_nodes),
+                ("Gameplay targets", marker_summary.gameplay_targets),
+                ("Traffic markers", marker_summary.traffic),
+                ("Other markers", marker_summary.other),
+            ];
+
+            for (label, count) in rows {
+                if count > 0 {
+                    ui.label(format!("{label}: {count}"));
+                }
+            }
+        }
+    }
+
     fn extract_ascii_strings(data: &[u8], min_len: usize) -> Vec<String> {
         let mut out = Vec::new();
         let mut current = Vec::new();
@@ -2628,6 +3956,19 @@ impl ModToolApp {
                     self.create_new_lua_mod();
                 }
 
+                if self.selected_mod_index.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.label("Script:");
+                        ui.text_edit_singleline(&mut self.new_script_name);
+                    });
+
+                    if ui.button("Add Script To Selected Mod").clicked() {
+                        self.create_new_lua_script_for_selected_mod();
+                    }
+                } else {
+                    ui.small("Select a mod to add more Lua scripts.");
+                }
+
                 if let Some(err) = &self.mods_error {
                     ui.colored_label(egui::Color32::RED, err);
                 }
@@ -2717,6 +4058,7 @@ impl ModToolApp {
                 self.mod_script_path = None;
                 self.mod_script_text.clear();
                 self.mod_script_dirty = false;
+                self.mod_script_window_open = false;
                 self.mod_script_error = None;
             }
         });
@@ -2740,6 +4082,23 @@ impl ModToolApp {
         }
 
         ui.small("Ctrl+S saves this script while it is open.");
+    }
+
+    fn show_mod_script_editor_window(&mut self, ctx: &egui::Context) {
+        if self.mod_script_path.is_none() || !self.mod_script_window_open {
+            return;
+        }
+
+        let mut open = self.mod_script_window_open;
+        egui::Window::new("Lua Script Editor")
+            .id(egui::Id::new("lua_script_editor_window"))
+            .open(&mut open)
+            .resizable(true)
+            .default_size(egui::vec2(760.0, 620.0))
+            .show(ctx, |ui| {
+                self.show_mod_script_editor(ui);
+            });
+        self.mod_script_window_open = open;
     }
 
     fn current_scn_selection(
@@ -3326,6 +4685,15 @@ impl ModToolApp {
                                 Self::scn_marker_kind(&node.name)
                             ));
                         }
+
+                        ui.separator();
+                        ui.heading("Logic / scripts");
+                        ui.small(
+                            "No standalone script file is attached to this SCN object. The game appears to use compiled C++ logic and node/marker names as lookup anchors.",
+                        );
+                        ui.small(
+                            "Once the runtime Lua modloader is wired, we can add our own scripts that target this name or marker kind.",
+                        );
                     }
                 }
                 SceneSelection::MeshChunk(selected_chunk_index) => {
@@ -3500,7 +4868,7 @@ impl eframe::App for ModToolApp {
             .ctx()
             .input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::S))
         {
-            if self.mod_script_path.is_some() {
+            if self.mod_script_window_open && self.mod_script_path.is_some() {
                 self.save_mod_script();
             } else if let (Some(scn), Some(path)) = (&self.scn_file, &self.scn_loaded_path) {
                 match scn.save_scn(path) {
@@ -3525,6 +4893,8 @@ impl eframe::App for ModToolApp {
                 ui.ctx().request_repaint();
             }
         }
+
+        self.show_mod_script_editor_window(ui.ctx());
 
         egui::Panel::top("top_bar").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
@@ -3573,24 +4943,6 @@ impl eframe::App for ModToolApp {
             });
         });
 
-        egui::Panel::left("file_tree")
-            .resizable(true)
-            .default_size(320.0)
-            .show_inside(ui, |ui| {
-                ui.heading("Data");
-                ui.separator();
-
-                if self.tree.is_empty() {
-                    ui.label("No game folder loaded.");
-                } else {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        for node in &self.tree {
-                            Self::ui_node(ui, node, &mut self.selected_file);
-                        }
-                    });
-                }
-            });
-
         egui::Panel::right("inspector")
             .resizable(true)
             .default_size(340.0)
@@ -3602,6 +4954,13 @@ impl eframe::App for ModToolApp {
                     .id_salt("inspector_scroll")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
+                        if matches!(self.selected_extension().as_deref(), Some("scn")) {
+                            if let Some(scn) = self.scn_file.as_ref() {
+                                self.show_scn_quick_summary(ui, scn);
+                                ui.separator();
+                            }
+                        }
+
                         self.show_mod_workspace(ui);
                         ui.separator();
 
@@ -3620,79 +4979,6 @@ impl eframe::App for ModToolApp {
 
                             ui.separator();
                             Self::show_game_code_map(ui, &self.game_code_map, Some(path.as_path()));
-
-                            ui.separator();
-                            ui.heading("Tool scripting");
-                            ui.small(
-                                "Experimental mod-tool commands. This is separate from the game's Daffyd-only XML files.",
-                            );
-                            ui.horizontal(|ui| {
-                                ui.label("Script:");
-                                ui.text_edit_singleline(&mut self.script_path);
-                            });
-                            if ui.button("Run Script").clicked() {
-                                let script_path = PathBuf::from(&self.script_path);
-                                if script_path.exists() {
-                                    let mut engine = ScriptEngine::new();
-                                    engine.init();
-                                    match engine.run_script(&script_path) {
-                                        Ok(_) => {
-                                            // Handle queued operations BEFORE getting logs
-                                            if let Some(load_path) = engine.get_pending_load() {
-                                                self.script_logs.push(format!("[DEBUG] Loading: {}", load_path));
-                                                match load_scn(Path::new(&load_path)) {
-                                                    Ok(scn) => {
-                                                        self.scn_file = Some(scn);
-                                                        self.scn_loaded_path = Some(PathBuf::from(&load_path));
-                                                        self.script_logs.push(format!("[OK] Loaded: {} nodes", self.scn_file.as_ref().map(|s| s.nodes.len()).unwrap_or(0)));
-                                                    }
-                                                    Err(e) => {
-                                                        self.script_logs.push(format!("[ERR] Load failed: {}", e));
-                                                    }
-                                                }
-                                            }
-
-                                            if let Some(save_path) = engine.get_pending_save() {
-                                                self.script_logs.push(format!("[DEBUG] Saving to: {}", save_path));
-                                                if let Some(ref scn) = self.scn_file {
-                                                    match scn.save_scn(Path::new(&save_path)) {
-                                                        Ok(_) => {
-                                                            self.script_logs.push(format!("[OK] Saved: {}", save_path));
-                                                        }
-                                                        Err(e) => {
-                                                            self.script_logs.push(format!("[ERR] Save failed: {}", e));
-                                                        }
-                                                    }
-                                                } else {
-                                                    self.script_logs.push("[ERR] No SCN loaded to save".to_string());
-                                                }
-                                            }
-
-                                            // Append script logs
-                                            for msg in engine.get_logs() {
-                                                self.script_logs.push(msg.clone());
-                                            }
-                                            self.status = "Script executed".to_owned();
-                                        }
-                                        Err(e) => {
-                                            self.script_logs.push(format!("Error: {}", e));
-                                        }
-                                    }
-                                } else {
-                                    self.script_logs.push("Script file not found".to_string());
-                                }
-                            }
-                            if ui.button("Clear Logs").clicked() {
-                                self.script_logs.clear();
-                            }
-                            egui::ScrollArea::both()
-                                .auto_shrink([false, false])
-                                .stick_to_bottom(true)
-                                .show(ui, |ui| {
-                                    for msg in &self.script_logs {
-                                        ui.label(msg);
-                                    }
-                                });
 
                             ui.separator();
 
@@ -4035,13 +5321,18 @@ impl eframe::App for ModToolApp {
                                 }
                             }
                         } else {
-                            if self.mod_script_path.is_some() {
-                                self.show_mod_script_editor(ui);
-                            } else {
-                                ui.label("Select a file or create a Lua mod.");
-                            }
+                            ui.label("Select a file or create a Lua mod.");
                         }
                     });
+            });
+
+        egui::Panel::bottom("content_browser")
+            .resizable(true)
+            .default_size(340.0)
+            .min_size(280.0)
+            .max_size(720.0)
+            .show_inside(ui, |ui| {
+                self.show_content_browser(ui);
             });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
@@ -4430,6 +5721,9 @@ impl eframe::App for ModToolApp {
                                 self.selected_scn_chunk,
                             );
 
+                            let max_scene_view_height = (ui.available_height() - 72.0).clamp(180.0, 900.0);
+                            self.scn_view_height = self.scn_view_height.clamp(180.0, max_scene_view_height);
+
                             if let Some(picked_item) = draw_scene_viewer(
                                 ui,
                                 scn,
@@ -4465,112 +5759,16 @@ impl eframe::App for ModToolApp {
                             if resize_response.dragged() {
                                 let delta = ui.ctx().input(|i| i.pointer.delta()).y;
                                 self.scn_view_height =
-                                    (self.scn_view_height + delta).clamp(260.0, 900.0);
+                                    (self.scn_view_height + delta).clamp(180.0, max_scene_view_height);
                                 ui.ctx().request_repaint();
                             }
 
                             ui.separator();
-
-                            let marker_summary = Self::summarize_scn_markers(scn);
-
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(format!("Nodes: {}", scn.nodes.len()));
-                                ui.separator();
-                                ui.label(format!("Renderable: {}", scn.renderable_count()));
-                                ui.separator();
-                                ui.label(format!("Markers: {}", scn.marker_count()));
-                                ui.separator();
-                                ui.label(format!(
-                                    "Embedded chunks: {}",
-                                    scn.embedded_mesh_chunk_count()
-                                ));
-                                ui.separator();
-                                ui.label(format!(
-                                    "Embedded tris: {}",
-                                    scn.embedded_triangle_count()
-                                ));
-                                ui.separator();
-                                ui.label(format!("Resolved GEOs: {}", self.scn_scene_models.len()));
-                                ui.separator();
-                                ui.label(format!(
-                                    "Missing archetypes: {}",
-                                    self.scn_scene_unresolved.len()
-                                ));
-                            });
-
-                            if scn.marker_count() > 0 {
-                                ui.horizontal_wrapped(|ui| {
-                                    if marker_summary.actor_like > 0 {
-                                        ui.label(format!(
-                                            "Actor-like markers: {}",
-                                            marker_summary.actor_like
-                                        ));
-                                        ui.separator();
-                                    }
-                                    if marker_summary.player_starts > 0 {
-                                        ui.label(format!(
-                                            "Player starts: {}",
-                                            marker_summary.player_starts
-                                        ));
-                                        ui.separator();
-                                    }
-                                    if marker_summary.player_ends > 0 {
-                                        ui.label(format!(
-                                            "Player ends: {}",
-                                            marker_summary.player_ends
-                                        ));
-                                        ui.separator();
-                                    }
-                                    if marker_summary.spawns > 0 {
-                                        ui.label(format!("Spawns: {}", marker_summary.spawns));
-                                        ui.separator();
-                                    }
-                                    if marker_summary.cameras > 0 {
-                                        ui.label(format!("Cameras: {}", marker_summary.cameras));
-                                        ui.separator();
-                                    }
-                                    if marker_summary.checkpoints > 0 {
-                                        ui.label(format!(
-                                            "Checkpoints: {}",
-                                            marker_summary.checkpoints
-                                        ));
-                                        ui.separator();
-                                    }
-                                    if marker_summary.path_nodes > 0 {
-                                        ui.label(format!(
-                                            "Route markers: {}",
-                                            marker_summary.path_nodes
-                                        ));
-                                        ui.separator();
-                                    }
-                                    if marker_summary.gameplay_targets > 0 {
-                                        ui.label(format!(
-                                            "Gameplay targets: {}",
-                                            marker_summary.gameplay_targets
-                                        ));
-                                        ui.separator();
-                                    }
-                                    if marker_summary.traffic > 0 {
-                                        ui.label(format!(
-                                            "Traffic markers: {}",
-                                            marker_summary.traffic
-                                        ));
-                                        ui.separator();
-                                    }
-                                    if marker_summary.other > 0 {
-                                        ui.label(format!("Other markers: {}", marker_summary.other));
-                                    }
-                                });
-                            }
-
-                            ui.small(
-                                "This 3D view draws embedded SCN mesh plus any placed GEO props. Marker groups now separate actors, starts, cameras, checkpoints, routes, traffic, and gameplay targets.",
-                            );
                             ui.small(
                                 "Click markers, prop instances, or embedded map chunks in the 3D view to inspect them. Press Esc to clear the selection.",
                             );
                             ui.small(
-                                "Scene items, selection details, and visibility toggles are in the Inspector panel on the right. Move/Rotate/Scale mode lives in the viewport's top-right corner.",
+                                "Level stats, marker groups, selection details, and visibility toggles are now at the top of the Inspector panel.",
                             );
 
                             if let Some(err) = &self.scn_scene_error {
@@ -5102,6 +6300,9 @@ impl eframe::App for ModToolApp {
         }
 
         self.draw_texture_preview_windows(ui.ctx());
+        self.draw_audio_preview_windows(ui.ctx());
+        self.draw_bnk_preview_windows(ui.ctx());
+        self.draw_geo_preview_windows(ui.ctx());
 
         if let Some(path) = pending_jump {
             self.jump_to_file(path);
