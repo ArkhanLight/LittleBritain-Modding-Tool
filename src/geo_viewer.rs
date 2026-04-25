@@ -297,7 +297,7 @@ pub fn draw_geo_viewer(
         );
 
         ui.separator();
-        ui.small("GPU viewport: RMB look | Ctrl+LMB orbit model | MMB pan | wheel zoom | WASD fly | Q/E up/down");
+        ui.small("GPU viewport: RMB look | MMB orbit model | wheel zoom | WASD fly | Q/E up/down");
     });
 
     let desired_height = viewer_height.clamp(260.0, 900.0);
@@ -420,7 +420,7 @@ pub fn draw_scene_viewer(
 
         ui.separator();
         ui.small(
-            "SCN 3D: RMB look | Ctrl+LMB look | MMB pan | wheel dolly | WASD fly | Q/E up/down | gizmo via Move/Rotate/Scale",
+            "SCN 3D: RMB look | MMB orbit selected/scene | wheel dolly | WASD fly | Q/E up/down | gizmo via Move/Rotate/Scale",
         );
     });
 
@@ -560,6 +560,15 @@ pub fn draw_scene_viewer(
         scene_radius,
     );
     paint_scene_gizmo_toolbar(&painter, rect, state);
+
+    let help_pos = rect.left_top() + egui::vec2(8.0, 8.0);
+    painter.text(
+        help_pos,
+        egui::Align2::LEFT_TOP,
+        "Click markers, prop instances, or embedded map chunks in the 3D view to inspect them. Press Esc to clear the selection.\nLevel stats, marker groups, selection details, and visibility toggles are now at the top of the Inspector panel.",
+        egui::FontId::proportional(11.0),
+        egui::Color32::from_gray(210),
+    );
 
     pointer_pick
 }
@@ -3627,9 +3636,7 @@ fn apply_viewer_input(
     _max_distance: f32,
     orbit_center: Option<[f32; 3]>,
 ) {
-    let ctrl_held = ui.input(|i| i.modifiers.ctrl);
-
-    if ctrl_held && response.dragged_by(egui::PointerButton::Primary) {
+    if response.dragged_by(egui::PointerButton::Middle) {
         let delta = ui.input(|i| i.pointer.delta());
 
         if let Some(center) = orbit_center {
@@ -3644,20 +3651,6 @@ fn apply_viewer_input(
         let delta = ui.input(|i| i.pointer.delta());
         state.yaw -= delta.x * 0.01;
         state.pitch = (state.pitch - delta.y * 0.01).clamp(-1.10, 1.10);
-        ui.ctx().request_repaint();
-    }
-
-    if response.dragged_by(egui::PointerButton::Middle) {
-        let delta = ui.input(|i| i.pointer.delta());
-        let (_, right, up) = camera_axes(state.yaw, state.pitch);
-
-        // Keep pan speed independent from fly speed.
-        let pan_scale = (scene_radius * 0.00008).clamp(0.5, 1.0);
-
-        let eye =
-            arr_to_vec3(state.eye) + right * (-delta.x * pan_scale) + up * (delta.y * pan_scale);
-
-        state.eye = vec3_to_arr(eye);
         ui.ctx().request_repaint();
     }
 

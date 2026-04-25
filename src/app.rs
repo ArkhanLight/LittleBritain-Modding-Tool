@@ -129,13 +129,29 @@ struct GeoPreviewWindow {
     open: bool,
 }
 
+struct FilePreviewWindow {
+    id: u64,
+    title: String,
+    path: PathBuf,
+    open: bool,
+    preview_text: Option<String>,
+    preview_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AudioWindowKey {
+    Main,
+    Audio(u64),
+    Bnk(u64),
+}
+
 #[derive(Debug)]
 enum AudioWindowCommand {
-    PlayFile(PathBuf),
-    PlayData { label: String, wav_bytes: Vec<u8> },
-    PauseResume,
-    Stop,
-    Seek(f32),
+    PlayFile { path: PathBuf, source: AudioWindowKey },
+    PlayData { label: String, wav_bytes: Vec<u8>, source: AudioWindowKey },
+    PauseResume(AudioWindowKey),
+    Stop(AudioWindowKey),
+    Seek { seconds: f32, source: AudioWindowKey },
     SetVolume(f32),
 }
 
@@ -159,6 +175,10 @@ pub struct ModToolApp {
     next_bnk_preview_window_id: u64,
     geo_preview_windows: Vec<GeoPreviewWindow>,
     next_geo_preview_window_id: u64,
+    file_preview_windows: Vec<FilePreviewWindow>,
+    next_file_preview_window_id: u64,
+
+    active_audio_window: Option<AudioWindowKey>,
 
     bnk_file: Option<BnkFile>,
     bnk_loaded_path: Option<PathBuf>,
@@ -270,6 +290,10 @@ impl ModToolApp {
             next_bnk_preview_window_id: 1,
             geo_preview_windows: Vec::new(),
             next_geo_preview_window_id: 1,
+            file_preview_windows: Vec::new(),
+            next_file_preview_window_id: 1,
+
+            active_audio_window: None,
 
             bnk_file: None,
             bnk_loaded_path: None,
@@ -380,6 +404,7 @@ impl ModToolApp {
                     self.bnk_loaded_path = None;
                     self.bnk_error = None;
                     self.selected_bnk_entry = None;
+                    self.active_audio_window = None;
                     self.anm_file = None;
                     self.anm_loaded_path = None;
                     self.anm_error = None;
@@ -453,6 +478,7 @@ impl ModToolApp {
                     self.bnk_loaded_path = None;
                     self.bnk_error = None;
                     self.selected_bnk_entry = None;
+                    self.active_audio_window = None;
 
                     self.anm_file = None;
                     self.anm_loaded_path = None;
@@ -915,7 +941,7 @@ impl ModToolApp {
                         ui.horizontal(|ui| {
                             ui.label(format!("Assets ({})", files.len()));
                             ui.separator();
-                            ui.small("Grouped by file type. GEO, DDS, audio, and BNK open in their own windows.");
+                            ui.small("Grouped by file type. All non-SCN files open in their own windows.");
                         });
 
                         egui::ScrollArea::vertical()
@@ -933,14 +959,7 @@ impl ModToolApp {
                                         continue;
                                     }
 
-                                    let default_open = matches!(
-                                        category,
-                                        AssetCategory::Scene
-                                            | AssetCategory::Model
-                                            | AssetCategory::Texture
-                                            | AssetCategory::AudioStream
-                                            | AssetCategory::AudioBank
-                                    );
+                                    let default_open = false;
 
                                     egui::CollapsingHeader::new(format!(
                                         "{} ({})",
@@ -1079,6 +1098,7 @@ impl ModToolApp {
             match player.play_data(label.clone(), wav_bytes) {
                 Ok(()) => {
                     player.seek(Duration::from_secs_f32(start_seconds.max(0.0)));
+                    self.active_audio_window = None;
                     self.bik_audio_error = None;
                     self.bik_audio_active = true;
                     self.status = format!("Playing {label}");
@@ -1500,15 +1520,119 @@ impl ModToolApp {
         self.status = format!("Opened BNK preview: {}", path.display());
     }
 
-    fn open_content_browser_asset(&mut self, ctx: &egui::Context, file: &FileNode) {
-        match file.category.unwrap_or(AssetCategory::Unknown) {
-            AssetCategory::Texture => self.open_texture_path_preview_window(ctx, &file.path),
-            AssetCategory::AudioStream => self.open_audio_preview_window(&file.path),
-            AssetCategory::AudioBank => self.open_bnk_preview_window(&file.path),
-            AssetCategory::Model => self.open_geo_preview_window(ctx, &file.path),
-            _ => {
-                self.selected_file = Some(file.path.clone());
+    fn preview_text_for_file(path: &Path) -> (Option<String>, Option<String>) {
+        const MAX_PREVIEW_BYTES: usize = 4096;
+
+        let data = match fs::read(path) {
+            Ok(data) => data,
+            Err(err) => return (None, Some(err.to_string())),
+        };
+
+        if data.is_empty() {
+            return (Some("(empty file)".to_owned()), None);
+        }
+
+        let preview_len = data.len().min(MAX_PREVIEW_BYTES);
+        let sample = &data[..preview_len];
+        let looks_text = sample.iter().all(|byte| {
+            matches!(*byte, b'\n' | b'\r' | b'\t') || (*byte >= 0x20 && *byte < 0x7F)
+        });
+
+        if looks_text {
+            let mut text = String::from_utf8_lossy(sample).to_string();
+            if data.len() > preview_len {
+                text.push_str("\n\n... preview truncated ...");
             }
+            return (Some(text), None);
+        }
+
+        let mut text = String::new();
+        for (row, chunk) in sample.chunks(16).enumerate() {
+            text.push_str(&format!("{:08X}: ", row * 16));
+            for byte in chunk {
+                text.push_str(&format!("{:02X} ", byte));
+            }
+            for _ in chunk.len()..16 {
+                text.push_str("   ");
+            }
+            text.push_str("  ");
+            for byte in chunk {
+                let ch = if *byte >= 0x20 && *byte < 0x7F {
+                    *byte as char
+                } else {
+                    '.'
+                };
+                text.push(ch);
+            }
+            text.push('\n');
+        }
+
+        if data.len() > preview_len {
+            text.push_str("\n... preview truncated ...\n");
+        }
+
+        (Some(text), None)
+    }
+
+    fn open_file_preview_window(&mut self, path: &Path) {
+        if let Some(window) = self
+            .file_preview_windows
+            .iter_mut()
+            .find(|window| window.path.as_path() == path)
+        {
+            window.open = true;
+            self.status = format!("Opened file preview: {}", path.display());
+            return;
+        }
+
+        let id = self.next_file_preview_window_id;
+        self.next_file_preview_window_id = self.next_file_preview_window_id.wrapping_add(1);
+        let (preview_text, preview_error) = Self::preview_text_for_file(path);
+
+        self.file_preview_windows.push(FilePreviewWindow {
+            id,
+            title: format!("File - {}", Self::path_title(path)),
+            path: path.to_path_buf(),
+            open: true,
+            preview_text,
+            preview_error,
+        });
+        self.status = format!("Opened file preview: {}", path.display());
+    }
+
+    fn should_open_in_main_preview(path: &Path, category: AssetCategory) -> bool {
+        category == AssetCategory::Scene
+            || path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("scn"))
+                .unwrap_or(false)
+    }
+
+    fn open_content_browser_asset(&mut self, ctx: &egui::Context, file: &FileNode) {
+        let category = file.category.unwrap_or_else(|| classify_path(&file.path));
+
+        if Self::should_open_in_main_preview(&file.path, category) {
+            self.selected_file = Some(file.path.clone());
+            return;
+        }
+
+        self.open_asset_preview_window(ctx, &file.path, category);
+    }
+
+    fn open_asset_preview_window(
+        &mut self,
+        ctx: &egui::Context,
+        path: &Path,
+        category: AssetCategory,
+    ) {
+        match category {
+            AssetCategory::Texture => self.open_texture_path_preview_window(ctx, path),
+            AssetCategory::AudioStream => self.open_audio_preview_window(path),
+            AssetCategory::AudioBank => self.open_bnk_preview_window(path),
+            AssetCategory::Model => self.open_geo_preview_window(ctx, path),
+            AssetCategory::Scene => self.selected_file = Some(path.to_path_buf()),
+            _ => self.open_file_preview_window(path),
         }
     }
 
@@ -2008,13 +2132,29 @@ impl ModToolApp {
 
     fn execute_audio_window_command(&mut self, command: AudioWindowCommand) {
         match command {
-            AudioWindowCommand::PlayFile(path) => self.play_audio_file_path(path),
-            AudioWindowCommand::PlayData { label, wav_bytes } => {
-                self.play_audio_bytes(label, wav_bytes);
+            AudioWindowCommand::PlayFile { path, source } => self.play_audio_file_path(path, source),
+            AudioWindowCommand::PlayData {
+                label,
+                wav_bytes,
+                source,
+            } => {
+                self.play_audio_bytes(label, wav_bytes, source);
             }
-            AudioWindowCommand::PauseResume => self.pause_or_resume_audio(),
-            AudioWindowCommand::Stop => self.stop_audio(),
-            AudioWindowCommand::Seek(seconds) => self.seek_audio(seconds),
+            AudioWindowCommand::PauseResume(source) => {
+                if self.active_audio_window == Some(source) {
+                    self.pause_or_resume_audio();
+                }
+            }
+            AudioWindowCommand::Stop(source) => {
+                if self.active_audio_window == Some(source) {
+                    self.stop_audio();
+                }
+            }
+            AudioWindowCommand::Seek { seconds, source } => {
+                if self.active_audio_window == Some(source) {
+                    self.seek_audio(seconds);
+                }
+            }
             AudioWindowCommand::SetVolume(volume) => {
                 if let Some(player) = self.audio_player.as_ref() {
                     player.set_volume(volume);
@@ -2023,7 +2163,7 @@ impl ModToolApp {
         }
     }
 
-    fn play_audio_file_path(&mut self, path: PathBuf) {
+    fn play_audio_file_path(&mut self, path: PathBuf, source: AudioWindowKey) {
         if !self.ensure_audio_player() {
             return;
         }
@@ -2031,6 +2171,7 @@ impl ModToolApp {
         if let Some(player) = self.audio_player.as_mut() {
             match player.play_file(&path) {
                 Ok(()) => {
+                    self.active_audio_window = Some(source);
                     self.audio_error = None;
                     self.bik_audio_active = false;
                     self.status = format!("Playing {}", path.display());
@@ -2042,7 +2183,7 @@ impl ModToolApp {
         }
     }
 
-    fn play_audio_bytes(&mut self, label: String, wav_bytes: Vec<u8>) {
+    fn play_audio_bytes(&mut self, label: String, wav_bytes: Vec<u8>, source: AudioWindowKey) {
         if !self.ensure_audio_player() {
             return;
         }
@@ -2050,6 +2191,7 @@ impl ModToolApp {
         if let Some(player) = self.audio_player.as_mut() {
             match player.play_data(label.clone(), wav_bytes) {
                 Ok(()) => {
+                    self.active_audio_window = Some(source);
                     self.audio_error = None;
                     self.bik_audio_active = false;
                     self.status = format!("Playing {label}");
@@ -2079,6 +2221,8 @@ impl ModToolApp {
     fn show_audio_transport_snapshot(
         ui: &mut egui::Ui,
         commands: &mut Vec<AudioWindowCommand>,
+        source: AudioWindowKey,
+        is_active: bool,
         is_paused: bool,
         is_empty: bool,
         volume: f32,
@@ -2086,11 +2230,15 @@ impl ModToolApp {
         duration_secs: Option<f32>,
         now_playing: &Option<String>,
     ) {
-        if let Some(path) = now_playing {
-            ui.small(format!("Now playing: {path}"));
+        let has_active_audio = is_active && !is_empty;
+
+        if has_active_audio {
+            if let Some(path) = now_playing {
+                ui.small(format!("Now playing: {path}"));
+            }
         }
 
-        if is_empty {
+        if !has_active_audio {
             ui.small("State: idle");
         } else if is_paused {
             ui.small("State: paused");
@@ -2100,12 +2248,18 @@ impl ModToolApp {
 
         ui.horizontal(|ui| {
             let pause_label = if is_paused { "Resume" } else { "Pause" };
-            if ui.button(pause_label).clicked() {
-                commands.push(AudioWindowCommand::PauseResume);
+            if ui
+                .add_enabled(has_active_audio, egui::Button::new(pause_label))
+                .clicked()
+            {
+                commands.push(AudioWindowCommand::PauseResume(source));
             }
 
-            if ui.button("Stop").clicked() {
-                commands.push(AudioWindowCommand::Stop);
+            if ui
+                .add_enabled(has_active_audio, egui::Button::new("Stop"))
+                .clicked()
+            {
+                commands.push(AudioWindowCommand::Stop(source));
             }
 
             ui.separator();
@@ -2119,23 +2273,28 @@ impl ModToolApp {
             }
         });
 
-        let max_secs = duration_secs.unwrap_or(position_secs.max(1.0));
-        let mut timeline_secs = position_secs.min(max_secs);
+        let shown_position_secs = if has_active_audio { position_secs } else { 0.0 };
+        let shown_duration_secs = if has_active_audio { duration_secs } else { None };
+        let max_secs = shown_duration_secs.unwrap_or(shown_position_secs.max(1.0));
+        let mut timeline_secs = shown_position_secs.min(max_secs);
 
-        let response = ui.add_sized(
-            [ui.available_width(), 18.0],
+        let response = ui.add_enabled(
+            has_active_audio,
             egui::Slider::new(&mut timeline_secs, 0.0..=max_secs).show_value(false),
         );
 
         if response.changed() {
-            commands.push(AudioWindowCommand::Seek(timeline_secs));
+            commands.push(AudioWindowCommand::Seek {
+                seconds: timeline_secs,
+                source,
+            });
         }
 
         ui.horizontal(|ui| {
             ui.label(Self::format_time(timeline_secs));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
-                    duration_secs
+                    shown_duration_secs
                         .map(Self::format_time)
                         .unwrap_or_else(|| "--:--".to_owned()),
                 );
@@ -2146,6 +2305,7 @@ impl ModToolApp {
     fn draw_audio_preview_windows(&mut self, ctx: &egui::Context) {
         let (is_paused, is_empty, volume, position_secs, duration_secs, now_playing) =
             self.audio_snapshot();
+        let active_audio_window = self.active_audio_window;
         let mut commands = Vec::new();
 
         for window in &mut self.audio_preview_windows {
@@ -2161,13 +2321,20 @@ impl ModToolApp {
 
                     ui.horizontal(|ui| {
                         if ui.button("Play").clicked() {
-                            commands.push(AudioWindowCommand::PlayFile(window.path.clone()));
+                            commands.push(AudioWindowCommand::PlayFile {
+                                path: window.path.clone(),
+                                source: AudioWindowKey::Audio(window.id),
+                            });
                         }
                     });
 
+                    let source = AudioWindowKey::Audio(window.id);
+                    let is_active = active_audio_window == Some(source);
                     Self::show_audio_transport_snapshot(
                         ui,
                         &mut commands,
+                        source,
+                        is_active,
                         is_paused,
                         is_empty,
                         volume,
@@ -2190,6 +2357,7 @@ impl ModToolApp {
     fn draw_bnk_preview_windows(&mut self, ctx: &egui::Context) {
         let (is_paused, is_empty, volume, position_secs, duration_secs, now_playing) =
             self.audio_snapshot();
+        let active_audio_window = self.active_audio_window;
         let mut commands = Vec::new();
 
         for window in &mut self.bnk_preview_windows {
@@ -2244,6 +2412,7 @@ impl ModToolApp {
                                             commands.push(AudioWindowCommand::PlayData {
                                                 label,
                                                 wav_bytes,
+                                                source: AudioWindowKey::Bnk(window.id),
                                             });
                                         }
                                         Err(err) => {
@@ -2256,9 +2425,13 @@ impl ModToolApp {
                             }
                         });
 
+                        let source = AudioWindowKey::Bnk(window.id);
+                        let is_active = active_audio_window == Some(source);
                         Self::show_audio_transport_snapshot(
                             ui,
                             &mut commands,
+                            source,
+                            is_active,
                             is_paused,
                             is_empty,
                             volume,
@@ -2317,6 +2490,58 @@ impl ModToolApp {
         for command in commands {
             self.execute_audio_window_command(command);
         }
+    }
+
+    fn draw_file_preview_windows(&mut self, ctx: &egui::Context) {
+        for window in &mut self.file_preview_windows {
+            let mut open = window.open;
+            egui::Window::new(window.title.clone())
+                .id(egui::Id::new(("file_preview_window", window.id)))
+                .open(&mut open)
+                .resizable(true)
+                .default_size(egui::vec2(560.0, 420.0))
+                .show(ctx, |ui| {
+                    ui.label(window.path.display().to_string());
+                    ui.separator();
+
+                    let ext = window
+                        .path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .unwrap_or("(none)");
+                    let category = classify_path(&window.path);
+                    let size = fs::metadata(&window.path).ok().map(|m| m.len()).unwrap_or(0);
+
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(format!("Extension: {ext}"));
+                        ui.separator();
+                        ui.label(format!("Category: {}", category_name(category)));
+                        ui.separator();
+                        ui.label(format!("Size: {size} bytes"));
+                    });
+
+                    ui.separator();
+                    ui.heading("Preview");
+                    ui.separator();
+
+                    if let Some(err) = &window.preview_error {
+                        ui.colored_label(egui::Color32::RED, format!("Preview error: {err}"));
+                    } else if let Some(text) = &window.preview_text {
+                        egui::ScrollArea::both()
+                            .id_salt(format!("file_window_preview:{}", window.id))
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.monospace(text.as_str());
+                            });
+                    } else {
+                        ui.label("No preview available for this file yet.");
+                    }
+                });
+
+            window.open = open;
+        }
+
+        self.file_preview_windows.retain(|window| window.open);
     }
 
     fn draw_texture_preview_windows(&mut self, ctx: &egui::Context) {
@@ -3078,6 +3303,7 @@ impl ModToolApp {
         if let Some(player) = self.audio_player.as_mut() {
             match player.play_file(&path) {
                 Ok(()) => {
+                    self.active_audio_window = Some(AudioWindowKey::Main);
                     self.audio_error = None;
                     self.bik_audio_active = false;
                     self.status = format!("Playing {}", path.display());
@@ -3125,6 +3351,7 @@ impl ModToolApp {
         if let Some(player) = self.audio_player.as_mut() {
             match player.play_data(label.clone(), wav_bytes) {
                 Ok(()) => {
+                    self.active_audio_window = Some(AudioWindowKey::Main);
                     self.audio_error = None;
                     self.bik_audio_active = false;
                     self.status = format!("Playing {label}");
@@ -3149,6 +3376,7 @@ impl ModToolApp {
     fn stop_audio(&mut self) {
         if let Some(player) = self.audio_player.as_ref() {
             player.stop();
+            self.active_audio_window = None;
             self.bik_audio_active = false;
             self.status = "Stopped audio.".to_owned();
         }
@@ -4957,6 +5185,20 @@ impl eframe::App for ModToolApp {
                         if matches!(self.selected_extension().as_deref(), Some("scn")) {
                             if let Some(scn) = self.scn_file.as_ref() {
                                 self.show_scn_quick_summary(ui, scn);
+
+                                Self::show_scn_scene_items_inspector(
+                                    ui,
+                                    scn,
+                                    &self.scn_scene_unresolved,
+                                    &mut self.selected_scn_node,
+                                    &mut self.selected_scn_chunk,
+                                    &mut self.hidden_scn_nodes,
+                                    &mut self.hidden_scn_chunks,
+                                    &mut self.scn_viewer,
+                                    &self.scn_embedded_texture_previews,
+                                    &mut pending_embedded_texture_preview,
+                                );
+
                                 ui.separator();
                             }
                         }
@@ -5159,19 +5401,6 @@ impl eframe::App for ModToolApp {
                                         "Hidden chunks: {}",
                                         self.hidden_scn_chunks.len()
                                     ));
-
-                                    Self::show_scn_scene_items_inspector(
-                                        ui,
-                                        scn,
-                                        &self.scn_scene_unresolved,
-                                        &mut self.selected_scn_node,
-                                        &mut self.selected_scn_chunk,
-                                        &mut self.hidden_scn_nodes,
-                                        &mut self.hidden_scn_chunks,
-                                        &mut self.scn_viewer,
-                                        &self.scn_embedded_texture_previews,
-                                        &mut pending_embedded_texture_preview,
-                                    );
 
                                     ui.separator();
                                     ui.heading("Header");
@@ -5721,8 +5950,11 @@ impl eframe::App for ModToolApp {
                                 self.selected_scn_chunk,
                             );
 
-                            let max_scene_view_height = (ui.available_height() - 72.0).clamp(180.0, 900.0);
-                            self.scn_view_height = self.scn_view_height.clamp(180.0, max_scene_view_height);
+                            // Fill the remaining preview panel with the SCN viewport.
+                            // The old draggable resize strip/text field was removed, so a fixed
+                            // stored height would leave an empty area above the content browser.
+                            let scn_view_height = ui.available_height().max(180.0);
+                            self.scn_view_height = scn_view_height;
 
                             if let Some(picked_item) = draw_scene_viewer(
                                 ui,
@@ -5730,7 +5962,7 @@ impl eframe::App for ModToolApp {
                                 &self.scn_scene_models,
                                 &self.scn_embedded_texture_previews,
                                 &mut self.scn_viewer,
-                                self.scn_view_height,
+                                scn_view_height,
                                 selected_scene_item,
                                 &self.hidden_scn_nodes,
                                 &self.hidden_scn_chunks,
@@ -5742,34 +5974,6 @@ impl eframe::App for ModToolApp {
                                 );
                                 ui.ctx().request_repaint();
                             }
-                            let (resize_rect, resize_response) = ui.allocate_exact_size(
-                                egui::vec2(ui.available_width(), 12.0),
-                                egui::Sense::drag(),
-                            );
-
-                            let resize_response =
-                                resize_response.on_hover_cursor(egui::CursorIcon::ResizeVertical);
-
-                            ui.painter().hline(
-                                resize_rect.x_range(),
-                                resize_rect.center().y,
-                                egui::Stroke::new(1.5, egui::Color32::GRAY),
-                            );
-
-                            if resize_response.dragged() {
-                                let delta = ui.ctx().input(|i| i.pointer.delta()).y;
-                                self.scn_view_height =
-                                    (self.scn_view_height + delta).clamp(180.0, max_scene_view_height);
-                                ui.ctx().request_repaint();
-                            }
-
-                            ui.separator();
-                            ui.small(
-                                "Click markers, prop instances, or embedded map chunks in the 3D view to inspect them. Press Esc to clear the selection.",
-                            );
-                            ui.small(
-                                "Level stats, marker groups, selection details, and visibility toggles are now at the top of the Inspector panel.",
-                            );
 
                             if let Some(err) = &self.scn_scene_error {
                                 ui.colored_label(
@@ -6299,6 +6503,7 @@ impl eframe::App for ModToolApp {
             self.open_texture_path_preview_window(ui.ctx(), &path);
         }
 
+        self.draw_file_preview_windows(ui.ctx());
         self.draw_texture_preview_windows(ui.ctx());
         self.draw_audio_preview_windows(ui.ctx());
         self.draw_bnk_preview_windows(ui.ctx());
