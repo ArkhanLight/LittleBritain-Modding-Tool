@@ -35,16 +35,17 @@ V0.3
 - Included playback slider, audio slider and zoom functionality in the bik viewer window
 - Overall stability improvements
 
-
 V0.2
 - Cross reference: models -> textures, textures -> models with clickable buttons
 - Display missing textures
 - Toggles in the 3d model viewer now include: faces, textures, wireframe, culling
 - Improved the overall custom shader in the viewport
 - You can now zoom inside models without the camera bumping into the 3d model
-- Added a 3D ground plane
+- Added a ground plane
 
 V0.1
-- Able to load all game files into the tool
-- Displaying the dss files
-- Inspecting the GEO files
+- categorization of the files
+- reading dds files
+- reading all naked audio files
+- reading the bnk files
+- reading geo files fully -> both rigged and static geo's
