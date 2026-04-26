@@ -11,7 +11,7 @@ use eframe::{
 };
 use glam::{Mat4, Quat, Vec3};
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque, hash_map::DefaultHasher},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -22,8 +22,16 @@ const NEAR_PLANE: f32 = 0.05;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
+const CAMERA_ICON_BYTES: &[u8] = include_bytes!("Icons/Camera.png");
+const CAMERA_TARGET_ICON_BYTES: &[u8] = include_bytes!("Icons/CameraTarget.png");
+const ROUTE_ICON_BYTES: &[u8] = include_bytes!("Icons/Route.png");
+const GAMEPLAY_ICON_BYTES: &[u8] = include_bytes!("Icons/Gameplay.png"); 
+const GENERIC_ICON_BYTES: &[u8] = include_bytes!("Icons/Generic.png");
+const ACTOR_ICON_BYTES: &[u8] = include_bytes!("Icons/Actor.png");
+
 const MAX_MATERIAL_LAYERS: usize = 8;
 const MAX_CACHED_GPU_SCENES: usize = 24;
+const MAX_GPU_HIDDEN_OBJECTS: usize = 256;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -49,10 +57,21 @@ pub struct GeoViewerState {
     scene_transform_mode: SceneTransformMode,
     scene_gizmo_drag: Option<SceneGizmoDrag>,
     scene_edit_revision: u64,
+    scene_static_dirty: bool,
+    scene_static_dirty_selection: Option<SceneSelection>,
 
     scene_key: Option<String>,
     cpu_scene: Option<Arc<CpuScene>>,
+    scene_preview_cache: BTreeMap<SceneSelection, CachedScenePreview>,
+    scene_gpu_dirty_selections: BTreeSet<SceneSelection>,
     frame_targets: Arc<Mutex<Option<FrameTargets>>>,
+
+    camera_icon_texture: Option<egui::TextureHandle>,
+    camera_target_icon_texture: Option<egui::TextureHandle>,
+    route_icon_texture: Option<egui::TextureHandle>,
+    gameplay_icon_texture: Option<egui::TextureHandle>,
+    generic_icon_texture: Option<egui::TextureHandle>,
+    actor_icon_texture: Option<egui::TextureHandle>,
 }
 
 impl Default for GeoViewerState {
@@ -73,9 +92,19 @@ impl Default for GeoViewerState {
             scene_transform_mode: SceneTransformMode::Translate,
             scene_gizmo_drag: None,
             scene_edit_revision: 0,
+            scene_static_dirty: false,
+            scene_static_dirty_selection: None,
             scene_key: None,
             cpu_scene: None,
+            scene_preview_cache: BTreeMap::new(),
+            scene_gpu_dirty_selections: BTreeSet::new(),
             frame_targets: Arc::new(Mutex::new(None)),
+            camera_icon_texture: None,
+            camera_target_icon_texture: None,
+            route_icon_texture: None,
+            gameplay_icon_texture: None,
+            generic_icon_texture: None,
+            actor_icon_texture: None,
         }
     }
 }
@@ -96,6 +125,7 @@ struct MeshVertex {
     normal: [f32; 3],
     color: [f32; 4],
     uv: [f32; 2],
+    object_id: f32,
 }
 
 #[repr(C)]
@@ -109,8 +139,9 @@ struct LineVertex {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Globals {
     view_proj: [[f32; 4]; 4],
+    model: [[f32; 4]; 4],
     light_dir: [f32; 4],
-    render_opts: [f32; 4], // x = textures on/off, y = brightness multiplier
+    render_opts: [f32; 4], // x = textures on/off, y = brightness multiplier, z = hidden SCN object id
 }
 
 #[derive(Clone)]
@@ -126,8 +157,17 @@ enum PartClass {
     Helper,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct InstanceRaw {
+    model: [[f32; 4]; 4],
+    data: [f32; 4], // x = object id, y = selected tint, z/w reserved
+}
+
+#[derive(Clone)]
 struct CpuPart {
     indices: Vec<u32>,
+    instances: Vec<InstanceRaw>,
     textures: Vec<CpuTexture>,
     class: PartClass,
     record_kind: u32,
@@ -162,10 +202,21 @@ struct SceneGizmoDrag {
     screen_origin: egui::Pos2,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SceneSelection {
     Node(usize),
     MeshChunk(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SceneMarkerIconKind {
+    None,
+    Camera,
+    CameraTarget,
+    Route,
+    Gameplay,
+    Generic,
+    Actor,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -175,11 +226,36 @@ struct ScenePickTarget {
     radius: f32,
 }
 
+struct CachedScenePreview {
+    key: String,
+    scene: Arc<CpuScene>,
+}
+
+struct SceneOverlayDraw {
+    selection: SceneSelection,
+    scene: Arc<CpuScene>,
+    model: [[f32; 4]; 4],
+    selected_tint: bool,
+}
+
+#[derive(Clone)]
+struct SceneInstanceBinding {
+    selection: SceneSelection,
+    part_index: usize,
+    instance_index: usize,
+    local_center: [f32; 3],
+    local_radius: f32,
+    pick_target_index: Option<usize>,
+}
+
 #[allow(dead_code)]
+#[derive(Clone)]
 struct CpuScene {
     key: String,
+    transient: bool,
     vertices: Vec<MeshVertex>,
     parts: Vec<CpuPart>,
+    instance_bindings: Vec<SceneInstanceBinding>,
     ground_lines: Vec<LineVertex>,
     wire_lines: Vec<LineVertex>,
     helper_wire_lines: Vec<LineVertex>,
@@ -192,6 +268,8 @@ struct CpuScene {
 struct GpuPart {
     index_buffer: wgpu::Buffer,
     index_count: u32,
+    instance_buffer: wgpu::Buffer,
+    instance_count: u32,
     bind_group: wgpu::BindGroup,
     class: PartClass,
     _material_buffer: wgpu::Buffer,
@@ -206,6 +284,7 @@ struct GpuLines {
 struct GpuScene {
     vertex_buffer: wgpu::Buffer,
     globals_buffer: wgpu::Buffer,
+    hidden_ids_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
     parts: Vec<GpuPart>,
     ground_lines: Option<GpuLines>,
@@ -227,6 +306,8 @@ struct FrameTargets {
 struct GpuShared {
     face_pipeline_cull: wgpu::RenderPipeline,
     face_pipeline_no_cull: wgpu::RenderPipeline,
+    face_pipeline_overlay_cull: wgpu::RenderPipeline,
+    face_pipeline_overlay_no_cull: wgpu::RenderPipeline,
     line_pipeline_overlay: wgpu::RenderPipeline,
     bone_pipeline_overlay: wgpu::RenderPipeline,
     blit_pipeline: wgpu::RenderPipeline,
@@ -243,6 +324,9 @@ struct GpuShared {
 struct GeoGpuCallback {
     rect: Rect,
     scene: Arc<CpuScene>,
+    overlays: Vec<SceneOverlayDraw>,
+    scene_radius: f32,
+    hidden_object_ids: Vec<f32>,
     yaw: f32,
     pitch: f32,
     eye: [f32; 3],
@@ -349,6 +433,9 @@ pub fn draw_geo_viewer(
         GeoGpuCallback {
             rect,
             scene: scene.clone(),
+            overlays: Vec::new(),
+            scene_radius: scene.radius,
+            hidden_object_ids: Vec::new(),
             yaw: state.yaw,
             pitch: state.pitch,
             eye: state.eye,
@@ -378,8 +465,12 @@ pub fn reset_scene_viewer(state: &mut GeoViewerState, scn: &ScnFile) {
     state.show_bones = true;
     state.cull_backfaces = false;
     state.scene_gizmo_drag = None;
+    state.scene_static_dirty = false;
+    state.scene_static_dirty_selection = None;
     state.scene_key = None;
     state.cpu_scene = None;
+    state.scene_preview_cache.clear();
+    state.scene_gpu_dirty_selections.clear();
 }
 
 pub fn focus_scene_viewer_on_point(state: &mut GeoViewerState, world_pos: [f32; 3]) {
@@ -400,6 +491,7 @@ pub fn draw_scene_viewer(
     hidden_nodes: &BTreeSet<usize>,
     hidden_chunks: &BTreeSet<usize>,
     marker_geo_overrides: &HashMap<usize, String>,
+    scene_marker_kinds: &BTreeMap<usize, &'static str>,
 ) -> Option<SceneSelection> {
     ui.horizontal(|ui| {
         if ui.button("Reset view").clicked() {
@@ -433,53 +525,78 @@ pub fn draw_scene_viewer(
         state.scene_gizmo_drag = None;
     }
 
-    let scene_radius = scn_bounds(scn).1;
-    let min_distance = 5.0;
-    let max_distance = (scene_radius * 8.0).max(600.0);
     let model_texture_state: usize = models
         .iter()
         .map(|m| m.textures.iter().filter(|t| t.is_some()).count())
         .sum();
 
-    let scene_key = format!(
-        "scn:{}#nodes:{}#models:{}#embtex:{}#mdltex:{}#hidden_nodes:{:016x}#hidden_chunks:{:016x}#marker_geos:{}#selection:{}#edit:{}",
+    // Instanced SCN path: the level is stored as reusable local mesh buffers plus
+    // per-object GPU instance transforms. Editing a node updates its instance
+    // matrix instead of rebaking CPU world-space vertex buffers.
+
+    let static_scene_key = format!(
+        "scn:{}#nodes:{}#chunks:{}#models:{}#embtex:{}#mdltex:{}#hidden_nodes:{:016x}#hidden_chunks:{:016x}#marker_geos:{}#wire:{}#static_instanced_gpu_v1",
         scn.path.display(),
         scn.nodes.len(),
+        scn.mesh_chunks.len(),
         models.len(),
         embedded_textures.len(),
         model_texture_state,
         visibility_set_hash(hidden_nodes),
         visibility_set_hash(hidden_chunks),
         marker_geo_overrides.len(),
-        scene_selection_cache_tag(selected),
-        state.scene_edit_revision,
+        state.show_wireframe,
     );
 
-    if state.scene_key.as_deref() != Some(scene_key.as_str()) {
+    if state.scene_key.as_deref() != Some(static_scene_key.as_str()) {
         state.cpu_scene = Some(build_cpu_scene_from_scn(
             scn,
             models,
             embedded_textures,
             hidden_nodes,
             hidden_chunks,
-            selected,
-            scene_key.clone(),
+            None,
+            static_scene_key.clone(),
             marker_geo_overrides,
+            scene_marker_kinds,
+            false,
+            false,
+            state.show_wireframe,
+            true,
+            false,
+            false,
+            false,
         ));
-        state.scene_key = Some(scene_key);
+        // A full static rebuild already absorbed all committed transforms, so old
+        // overlay entries are no longer needed except for the current selection.
+        state.scene_static_dirty = false;
+        state.scene_static_dirty_selection = None;
+        state.scene_gpu_dirty_selections.clear();
+        state.scene_preview_cache.clear();
+        state.scene_key = Some(static_scene_key);
     }
 
-    let Some(scene) = state.cpu_scene.clone() else {
-        return None;
-    };
+    let selected_for_scene = selected.filter(|selection| {
+        selected_scene_is_visible(Some(*selection), hidden_nodes, hidden_chunks)
+    });
+    if let Some(scene) = state.cpu_scene.as_mut() {
+        sync_instanced_scene_from_scn(Arc::make_mut(scene), scn, selected_for_scene);
+    }
 
-    let mut pick_view_proj = make_view_proj(
+    let scene_radius = state
+        .cpu_scene
+        .as_ref()
+        .map(|scene| scene.radius)
+        .unwrap_or(100.0);
+    let min_distance = 5.0;
+
+    let mut pick_view_proj = make_view_proj_for_radius(
         rect.width().round().max(1.0) as u32,
         rect.height().round().max(1.0) as u32,
         state.yaw,
         state.pitch,
         state.eye,
-        &scene,
+        scene_radius,
     );
 
     let toolbar_consumed = interact_scene_gizmo_toolbar(ui, rect, state);
@@ -495,6 +612,18 @@ pub fn draw_scene_viewer(
         hidden_chunks,
         scene_radius,
     );
+
+    if let Some(scene) = state.cpu_scene.as_mut() {
+        sync_instanced_scene_from_scn(Arc::make_mut(scene), scn, selected_for_scene);
+    }
+    let Some(scene) = state.cpu_scene.clone() else {
+        return None;
+    };
+    let overlays: Vec<SceneOverlayDraw> = Vec::new();
+    let hidden_object_ids: Vec<f32> = Vec::new();
+    let overlay_selections: BTreeSet<SceneSelection> = BTreeSet::new();
+
+    let max_distance = (scene_radius * 8.0).max(600.0);
     let block_viewer_input = toolbar_consumed || gizmo_consumed || state.scene_gizmo_drag.is_some();
 
     let pointer_pick = if !block_viewer_input
@@ -502,7 +631,17 @@ pub fn draw_scene_viewer(
         && response.clicked_by(egui::PointerButton::Primary)
     {
         response.interact_pointer_pos().and_then(|pointer_pos| {
-            pick_scene_target(&scene, rect, pick_view_proj, state.eye, pointer_pos)
+            pick_scene_overlay_target(&overlays, rect, pick_view_proj, state.eye, pointer_pos)
+                .or_else(|| {
+                    pick_scene_target(
+                        &scene,
+                        rect,
+                        pick_view_proj,
+                        state.eye,
+                        pointer_pos,
+                        &overlay_selections,
+                    )
+                })
         })
     } else {
         None
@@ -519,13 +658,13 @@ pub fn draw_scene_viewer(
             None,
         );
 
-        pick_view_proj = make_view_proj(
+        pick_view_proj = make_view_proj_for_radius(
             rect.width().round().max(1.0) as u32,
             rect.height().round().max(1.0) as u32,
             state.yaw,
             state.pitch,
             state.eye,
-            &scene,
+            scene_radius,
         );
     }
 
@@ -534,6 +673,9 @@ pub fn draw_scene_viewer(
         GeoGpuCallback {
             rect,
             scene: scene.clone(),
+            overlays,
+            scene_radius,
+            hidden_object_ids,
             yaw: state.yaw,
             pitch: state.pitch,
             eye: state.eye,
@@ -546,6 +688,8 @@ pub fn draw_scene_viewer(
             frame_targets: state.frame_targets.clone(),
         },
     );
+
+    ensure_scene_marker_icon_textures(ui.ctx(), state);
 
     painter.add(callback);
     paint_scene_gizmo(
@@ -560,6 +704,18 @@ pub fn draw_scene_viewer(
         scene_radius,
     );
     paint_scene_gizmo_toolbar(&painter, rect, state);
+
+    paint_scene_marker_icons(
+        ui,
+        rect,
+        pick_view_proj,
+        scn,
+        state,
+        hidden_nodes,
+        selected,
+        scene_marker_kinds,
+        true,
+    );
 
     let help_pos = rect.left_top() + egui::vec2(8.0, 8.0);
     painter.text(
@@ -595,31 +751,17 @@ impl egui_wgpu::CallbackTrait for GeoGpuCallback {
             .get_mut::<GpuShared>()
             .expect("GpuShared should exist");
 
-        let gpu_scene = if let Some(scene) = shared.scenes.get(&self.scene.key) {
-            if let Some(index) = shared
-                .scene_lru
-                .iter()
-                .position(|key| key == &self.scene.key)
-            {
-                shared.scene_lru.remove(index);
-            }
-            shared.scene_lru.push_back(self.scene.key.clone());
-            scene.clone()
-        } else {
-            while shared.scenes.len() >= MAX_CACHED_GPU_SCENES {
-                let Some(evicted) = shared.scene_lru.pop_front() else {
-                    break;
-                };
-                shared.scenes.remove(&evicted);
-            }
-
-            let uploaded = Arc::new(upload_scene(device, queue, shared, &self.scene));
-            shared
-                .scenes
-                .insert(self.scene.key.clone(), uploaded.clone());
-            shared.scene_lru.push_back(self.scene.key.clone());
-            uploaded
-        };
+        let gpu_scene = get_or_upload_gpu_scene(device, queue, shared, &self.scene);
+        update_gpu_scene_instances(queue, gpu_scene.as_ref(), self.scene.as_ref());
+        let overlay_gpu_scenes: Vec<(&SceneOverlayDraw, Arc<GpuScene>)> = self
+            .overlays
+            .iter()
+            .map(|overlay| {
+                let uploaded = get_or_upload_gpu_scene(device, queue, shared, &overlay.scene);
+                update_gpu_scene_instances(queue, uploaded.as_ref(), overlay.scene.as_ref());
+                (overlay, uploaded)
+            })
+            .collect();
 
         let width = (self.rect.width() * screen_descriptor.pixels_per_point)
             .round()
@@ -641,18 +783,41 @@ impl egui_wgpu::CallbackTrait for GeoGpuCallback {
         }
         let frame = frame_guard.as_ref().expect("frame targets should exist");
 
-        let view_proj = make_view_proj(width, height, self.yaw, self.pitch, self.eye, &self.scene);
-        let globals = Globals {
+        let view_proj = make_view_proj_for_radius(width, height, self.yaw, self.pitch, self.eye, self.scene_radius);
+        let hidden_count = self.hidden_object_ids.len().min(MAX_GPU_HIDDEN_OBJECTS);
+        let static_globals = Globals {
             view_proj: view_proj.to_cols_array_2d(),
+            model: Mat4::IDENTITY.to_cols_array_2d(),
             light_dir: normalize4([-0.20, 0.90, -0.35, 0.0]),
             render_opts: [
                 if self.show_textures { 1.0 } else { 0.0 },
                 2.0, // brightness multiplier
-                0.0,
+                hidden_count as f32,
                 0.0,
             ],
         };
-        queue.write_buffer(&gpu_scene.globals_buffer, 0, bytemuck::bytes_of(&globals));
+        queue.write_buffer(&gpu_scene.globals_buffer, 0, bytemuck::bytes_of(&static_globals));
+        write_hidden_object_ids(queue, gpu_scene.as_ref(), &self.hidden_object_ids);
+
+        for (overlay, overlay_gpu_scene) in &overlay_gpu_scenes {
+            let overlay_globals = Globals {
+                view_proj: view_proj.to_cols_array_2d(),
+                model: overlay.model,
+                light_dir: normalize4([-0.20, 0.90, -0.35, 0.0]),
+                render_opts: [
+                    if self.show_textures { 1.0 } else { 0.0 },
+                    2.0, // brightness multiplier
+                    0.0,
+                    if overlay.selected_tint { 1.0 } else { 0.0 },
+                ],
+            };
+            queue.write_buffer(
+                &overlay_gpu_scene.globals_buffer,
+                0,
+                bytemuck::bytes_of(&overlay_globals),
+            );
+            write_hidden_object_ids(queue, overlay_gpu_scene.as_ref(), &[]);
+        }
 
         {
             let mut pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -684,59 +849,29 @@ impl egui_wgpu::CallbackTrait for GeoGpuCallback {
                 multiview_mask: None,
             });
 
-            if self.show_faces && !gpu_scene.parts.is_empty() {
-                let pipeline = if self.cull_backfaces {
-                    &shared.face_pipeline_cull
-                } else {
-                    &shared.face_pipeline_no_cull
-                };
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, &gpu_scene.globals_bind_group, &[]);
-                pass.set_vertex_buffer(0, gpu_scene.vertex_buffer.slice(..));
-
-                for part in &gpu_scene.parts {
-                    if !self.show_helpers && matches!(part.class, PartClass::Helper) {
-                        continue;
-                    }
-
-                    pass.set_bind_group(1, &part.bind_group, &[]);
-                    pass.set_index_buffer(part.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..part.index_count, 0, 0..1);
-                }
-            }
-
-            if self.show_wireframe {
-                if let Some(wire) = &gpu_scene.wire_lines {
-                    pass.set_pipeline(&shared.line_pipeline_overlay);
-                    pass.set_bind_group(0, &gpu_scene.globals_bind_group, &[]);
-                    pass.set_vertex_buffer(0, wire.buffer.slice(..));
-                    pass.draw(0..wire.vertex_count, 0..1);
-                }
-            }
-
-            if self.show_helpers {
-                if let Some(wire) = &gpu_scene.helper_wire_lines {
-                    pass.set_pipeline(&shared.line_pipeline_overlay);
-                    pass.set_bind_group(0, &gpu_scene.globals_bind_group, &[]);
-                    pass.set_vertex_buffer(0, wire.buffer.slice(..));
-                    pass.draw(0..wire.vertex_count, 0..1);
-                }
-            }
-
-            if self.show_bones {
-                if let Some(bones) = &gpu_scene.bone_lines {
-                    pass.set_pipeline(&shared.bone_pipeline_overlay);
-                    pass.set_bind_group(0, &gpu_scene.globals_bind_group, &[]);
-                    pass.set_vertex_buffer(0, bones.buffer.slice(..));
-                    pass.draw(0..bones.vertex_count, 0..1);
-                }
-            }
-
-            if let Some(ground) = &gpu_scene.ground_lines {
-                pass.set_pipeline(&shared.line_pipeline_overlay);
-                pass.set_bind_group(0, &gpu_scene.globals_bind_group, &[]);
-                pass.set_vertex_buffer(0, ground.buffer.slice(..));
-                pass.draw(0..ground.vertex_count, 0..1);
+            draw_gpu_scene(
+                &mut pass,
+                shared,
+                gpu_scene.as_ref(),
+                self.show_faces,
+                self.show_wireframe,
+                self.show_bones,
+                self.show_helpers,
+                self.cull_backfaces,
+                false,
+            );
+            for (_, overlay_gpu_scene) in &overlay_gpu_scenes {
+                draw_gpu_scene(
+                    &mut pass,
+                    shared,
+                    overlay_gpu_scene.as_ref(),
+                    self.show_faces,
+                    self.show_wireframe,
+                    self.show_bones,
+                    self.show_helpers,
+                    self.cull_backfaces,
+                    false,
+                );
             }
         }
 
@@ -765,20 +900,156 @@ impl egui_wgpu::CallbackTrait for GeoGpuCallback {
     }
 }
 
+fn get_or_upload_gpu_scene(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    shared: &mut GpuShared,
+    scene: &Arc<CpuScene>,
+) -> Arc<GpuScene> {
+    if scene.transient {
+        return Arc::new(upload_scene(device, queue, shared, scene.as_ref()));
+    }
+
+    if let Some(uploaded) = shared.scenes.get(&scene.key) {
+        if let Some(index) = shared.scene_lru.iter().position(|key| key == &scene.key) {
+            shared.scene_lru.remove(index);
+        }
+        shared.scene_lru.push_back(scene.key.clone());
+        return uploaded.clone();
+    }
+
+    while shared.scenes.len() >= MAX_CACHED_GPU_SCENES {
+        let Some(evicted) = shared.scene_lru.pop_front() else {
+            break;
+        };
+        shared.scenes.remove(&evicted);
+    }
+
+    let uploaded = Arc::new(upload_scene(device, queue, shared, scene.as_ref()));
+    shared.scenes.insert(scene.key.clone(), uploaded.clone());
+    shared.scene_lru.push_back(scene.key.clone());
+    uploaded
+}
+
+fn update_gpu_scene_instances(queue: &wgpu::Queue, gpu_scene: &GpuScene, scene: &CpuScene) {
+    for (gpu_part, cpu_part) in gpu_scene.parts.iter().zip(scene.parts.iter()) {
+        if cpu_part.instances.is_empty() || gpu_part.instance_count == 0 {
+            continue;
+        }
+        queue.write_buffer(
+            &gpu_part.instance_buffer,
+            0,
+            bytemuck::cast_slice(&cpu_part.instances),
+        );
+    }
+}
+
+fn write_hidden_object_ids(queue: &wgpu::Queue, gpu_scene: &GpuScene, object_ids: &[f32]) {
+    let mut ids = [0.0f32; MAX_GPU_HIDDEN_OBJECTS];
+    let count = object_ids.len().min(MAX_GPU_HIDDEN_OBJECTS);
+    ids[..count].copy_from_slice(&object_ids[..count]);
+    queue.write_buffer(&gpu_scene.hidden_ids_buffer, 0, bytemuck::cast_slice(&ids));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_gpu_scene<'a>(
+    pass: &mut wgpu::RenderPass<'a>,
+    shared: &'a GpuShared,
+    gpu_scene: &'a GpuScene,
+    show_faces: bool,
+    show_wireframe: bool,
+    show_bones: bool,
+    show_helpers: bool,
+    cull_backfaces: bool,
+    overlay_faces: bool,
+) {
+    if show_faces && !gpu_scene.parts.is_empty() {
+        let pipeline = match (overlay_faces, cull_backfaces) {
+            (true, true) => &shared.face_pipeline_overlay_cull,
+            (true, false) => &shared.face_pipeline_overlay_no_cull,
+            (false, true) => &shared.face_pipeline_cull,
+            (false, false) => &shared.face_pipeline_no_cull,
+        };
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &gpu_scene.globals_bind_group, &[]);
+        pass.set_vertex_buffer(0, gpu_scene.vertex_buffer.slice(..));
+
+        for part in &gpu_scene.parts {
+            if part.instance_count == 0 {
+                continue;
+            }
+            if !show_helpers && matches!(part.class, PartClass::Helper) {
+                continue;
+            }
+
+            pass.set_vertex_buffer(1, part.instance_buffer.slice(..));
+            pass.set_bind_group(1, &part.bind_group, &[]);
+            pass.set_index_buffer(part.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..part.index_count, 0, 0..part.instance_count);
+        }
+    }
+
+    if show_wireframe {
+        if let Some(wire) = &gpu_scene.wire_lines {
+            pass.set_pipeline(&shared.line_pipeline_overlay);
+            pass.set_bind_group(0, &gpu_scene.globals_bind_group, &[]);
+            pass.set_vertex_buffer(0, wire.buffer.slice(..));
+            pass.draw(0..wire.vertex_count, 0..1);
+        }
+    }
+
+    if show_helpers {
+        if let Some(wire) = &gpu_scene.helper_wire_lines {
+            pass.set_pipeline(&shared.line_pipeline_overlay);
+            pass.set_bind_group(0, &gpu_scene.globals_bind_group, &[]);
+            pass.set_vertex_buffer(0, wire.buffer.slice(..));
+            pass.draw(0..wire.vertex_count, 0..1);
+        }
+    }
+
+    if show_bones {
+        if let Some(bones) = &gpu_scene.bone_lines {
+            pass.set_pipeline(&shared.bone_pipeline_overlay);
+            pass.set_bind_group(0, &gpu_scene.globals_bind_group, &[]);
+            pass.set_vertex_buffer(0, bones.buffer.slice(..));
+            pass.draw(0..bones.vertex_count, 0..1);
+        }
+    }
+
+    if let Some(ground) = &gpu_scene.ground_lines {
+        pass.set_pipeline(&shared.line_pipeline_overlay);
+        pass.set_bind_group(0, &gpu_scene.globals_bind_group, &[]);
+        pass.set_vertex_buffer(0, ground.buffer.slice(..));
+        pass.draw(0..ground.vertex_count, 0..1);
+    }
+}
+
 impl GpuShared {
     fn new(device: &wgpu::Device, surface_format: wgpu::TextureFormat) -> Self {
         let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("geo_globals_layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
         });
 
         let mut material_entries = vec![
@@ -892,8 +1163,12 @@ impl GpuShared {
         });
 
         let face_pipeline_cull =
-            create_face_pipeline(device, &face_layout, &face_shader, Some(wgpu::Face::Back));
-        let face_pipeline_no_cull = create_face_pipeline(device, &face_layout, &face_shader, None);
+            create_face_pipeline(device, &face_layout, &face_shader, Some(wgpu::Face::Back), false);
+        let face_pipeline_no_cull = create_face_pipeline(device, &face_layout, &face_shader, None, false);
+        let face_pipeline_overlay_cull =
+            create_face_pipeline(device, &face_layout, &face_shader, Some(wgpu::Face::Back), true);
+        let face_pipeline_overlay_no_cull =
+            create_face_pipeline(device, &face_layout, &face_shader, None, true);
         let line_pipeline_overlay = create_line_pipeline(device, &line_layout, &line_shader);
         let bone_pipeline_overlay = create_bone_pipeline(device, &line_layout, &line_shader);
 
@@ -926,6 +1201,8 @@ impl GpuShared {
         Self {
             face_pipeline_cull,
             face_pipeline_no_cull,
+            face_pipeline_overlay_cull,
+            face_pipeline_overlay_no_cull,
             line_pipeline_overlay,
             bone_pipeline_overlay,
             blit_pipeline,
@@ -946,6 +1223,7 @@ fn create_face_pipeline(
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
     cull_mode: Option<wgpu::Face>,
+    overlay: bool,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("geo_face_pipeline"),
@@ -953,16 +1231,30 @@ fn create_face_pipeline(
         vertex: wgpu::VertexState {
             module: shader,
             entry_point: Some("vs_main"),
-            buffers: &[wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<MeshVertex>() as u64,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &wgpu::vertex_attr_array![
-                    0 => Float32x3,
-                    1 => Float32x3,
-                    2 => Float32x4,
-                    3 => Float32x2
-                ],
-            }],
+            buffers: &[
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<MeshVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![
+                        0 => Float32x3,
+                        1 => Float32x3,
+                        2 => Float32x4,
+                        3 => Float32x2,
+                        4 => Float32
+                    ],
+                },
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<InstanceRaw>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![
+                        5 => Float32x4,
+                        6 => Float32x4,
+                        7 => Float32x4,
+                        8 => Float32x4,
+                        9 => Float32x4
+                    ],
+                },
+            ],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -983,8 +1275,12 @@ fn create_face_pipeline(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: Some(true),
-            depth_compare: Some(wgpu::CompareFunction::Less),
+            depth_write_enabled: Some(!overlay),
+            depth_compare: Some(if overlay {
+                wgpu::CompareFunction::LessEqual
+            } else {
+                wgpu::CompareFunction::Less
+            }),
             stencil: Default::default(),
             bias: Default::default(),
         }),
@@ -1199,14 +1495,26 @@ fn upload_scene(
     shared: &mut GpuShared,
     scene: &CpuScene,
 ) -> GpuScene {
+    let vertex_upload = if scene.vertices.is_empty() {
+        vec![MeshVertex {
+            position: [0.0, 0.0, 0.0],
+            normal: [0.0, 1.0, 0.0],
+            color: [1.0, 1.0, 1.0, 0.0],
+            uv: [0.0, 0.0],
+            object_id: 0.0,
+        }]
+    } else {
+        scene.vertices.clone()
+    };
     let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("geo_mesh_vertices"),
-        contents: bytemuck::cast_slice(&scene.vertices),
+        contents: bytemuck::cast_slice(&vertex_upload),
         usage: wgpu::BufferUsages::VERTEX,
     });
 
     let globals = Globals {
         view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+        model: Mat4::IDENTITY.to_cols_array_2d(),
         light_dir: normalize4([-0.20, 0.90, -0.35, 0.0]),
         render_opts: [1.0, 2.0, 0.0, 0.0],
     };
@@ -1215,21 +1523,48 @@ fn upload_scene(
         contents: bytemuck::bytes_of(&globals),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
+    let hidden_zeroes = vec![0.0f32; MAX_GPU_HIDDEN_OBJECTS];
+    let hidden_ids_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("geo_hidden_object_ids"),
+        contents: bytemuck::cast_slice(&hidden_zeroes),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
     let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("geo_globals_bind_group"),
         layout: &shared.globals_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: globals_buffer.as_entire_binding(),
-        }],
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: globals_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: hidden_ids_buffer.as_entire_binding(),
+            },
+        ],
     });
 
     let mut parts = Vec::new();
     for part in &scene.parts {
+        let index_upload = if part.indices.is_empty() {
+            vec![0u32]
+        } else {
+            part.indices.clone()
+        };
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("geo_mesh_indices"),
-            contents: bytemuck::cast_slice(&part.indices),
+            contents: bytemuck::cast_slice(&index_upload),
             usage: wgpu::BufferUsages::INDEX,
+        });
+        let instance_upload = if part.instances.is_empty() {
+            vec![identity_instance()]
+        } else {
+            part.instances.clone()
+        };
+        let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("geo_mesh_instances"),
+            contents: bytemuck::cast_slice(&instance_upload),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
 
         let material_params = MaterialParams {
@@ -1301,6 +1636,8 @@ fn upload_scene(
         parts.push(GpuPart {
             index_buffer,
             index_count: part.indices.len() as u32,
+            instance_buffer,
+            instance_count: part.instances.len() as u32,
             bind_group,
             class: part.class,
             _material_buffer: material_buffer,
@@ -1311,6 +1648,7 @@ fn upload_scene(
     GpuScene {
         vertex_buffer,
         globals_buffer,
+        hidden_ids_buffer,
         globals_bind_group,
         parts,
         ground_lines: upload_lines(device, &scene.ground_lines, "geo_ground_lines"),
@@ -1366,6 +1704,7 @@ fn build_cpu_scene(
                 .unwrap_or([0.0, 1.0, 0.0]),
             color: scene_vertex_color(false),
             uv: geo.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
+            object_id: 0.0,
         })
         .collect();
 
@@ -1379,6 +1718,7 @@ fn build_cpu_scene(
         }
         parts.push(CpuPart {
             indices,
+            instances: vec![identity_instance()],
             textures: Vec::new(),
             class: PartClass::Solid,
             record_kind: 1,
@@ -1409,6 +1749,7 @@ fn build_cpu_scene(
 
             parts.push(CpuPart {
                 indices,
+                instances: vec![identity_instance()],
                 textures,
                 class: PartClass::Solid,
                 record_kind: 1,
@@ -1431,8 +1772,10 @@ fn build_cpu_scene(
 
     Arc::new(CpuScene {
         key,
+        transient: false,
         vertices,
         parts,
+        instance_bindings: Vec::new(),
         ground_lines,
         wire_lines,
         helper_wire_lines,
@@ -1879,6 +2222,14 @@ fn build_cpu_scene_from_scn(
     selected: Option<SceneSelection>,
     key: String,
     marker_geo_overrides: &HashMap<usize, String>,
+    scene_marker_kinds: &BTreeMap<usize, &'static str>,
+    only_selected: bool,
+    _omit_selected: bool,
+    build_wire: bool,
+    include_textures: bool,
+    transient: bool,
+    _local_selected_geometry: bool,
+    _tint_selected: bool,
 ) -> Arc<CpuScene> {
     let geo_by_archetype: HashMap<String, &SceneGeoModel> = models
         .iter()
@@ -1886,11 +2237,14 @@ fn build_cpu_scene_from_scn(
         .collect();
 
     let mut vertices = Vec::new();
-    let mut parts = Vec::new();
+    let mut parts: Vec<CpuPart> = Vec::new();
+    let mut instance_bindings = Vec::new();
     let mut wire_lines = Vec::new();
-    let mut helper_wire_lines = Vec::new();
+    let helper_wire_lines = Vec::new();
     let mut marker_lines = Vec::new();
     let mut pick_targets = Vec::new();
+    let mut geo_part_indices_by_key: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut geo_bounds_by_key: HashMap<String, ([f32; 3], f32)> = HashMap::new();
 
     let mut have_bounds = false;
     let mut min = [0.0f32; 3];
@@ -1911,23 +2265,222 @@ fn build_cpu_scene_from_scn(
         }
     };
 
+    // Upload every unique GEO archetype once in local/model space. SCN nodes then
+    // reference these meshes through GPU instance transforms instead of CPU-baked
+    // world-space vertices.
+    for (archetype_key, model) in &geo_by_archetype {
+        let geo = &model.geo;
+        let base_vertex = vertices.len() as u32;
+        let mut part_indices_for_model = Vec::new();
+
+        for (i, &pos) in geo.verts.iter().enumerate() {
+            let raw_normal = geo.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
+            vertices.push(MeshVertex {
+                position: pos,
+                normal: normalize3(raw_normal),
+                color: scene_vertex_color(false),
+                uv: geo.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
+                object_id: 0.0,
+            });
+        }
+
+        if let Some((local_center, local_radius)) = local_points_sphere(&geo.verts) {
+            geo_bounds_by_key.insert(archetype_key.clone(), (local_center, local_radius.max(45.0)));
+        }
+
+        if geo.subsets.is_empty() {
+            let mut indices = Vec::with_capacity(geo.faces.len() * 3);
+            for face in &geo.faces {
+                indices.push(base_vertex + face[0] as u32);
+                indices.push(base_vertex + face[1] as u32);
+                indices.push(base_vertex + face[2] as u32);
+            }
+
+            let part_class = if is_shadow_like_name(archetype_key)
+                || geo.texture_names.iter().any(|name| is_shadow_like_name(name))
+            {
+                PartClass::Helper
+            } else {
+                PartClass::Solid
+            };
+
+            let part_index = parts.len();
+            parts.push(CpuPart {
+                indices,
+                instances: Vec::new(),
+                textures: Vec::new(),
+                class: part_class,
+                record_kind: 1,
+            });
+            part_indices_for_model.push(part_index);
+        } else {
+            for subset in &geo.subsets {
+                let start = (subset.start / 3) as usize;
+                let count = (subset.count / 3) as usize;
+                let end = (start + count).min(geo.faces.len());
+                let mut indices = Vec::with_capacity((end - start) * 3);
+
+                for face in &geo.faces[start..end] {
+                    indices.push(base_vertex + face[0] as u32);
+                    indices.push(base_vertex + face[1] as u32);
+                    indices.push(base_vertex + face[2] as u32);
+                }
+
+                let texture_name = geo
+                    .texture_names
+                    .get(subset.material)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                let part_class = if is_shadow_like_name(archetype_key) || is_shadow_like_name(texture_name) {
+                    PartClass::Helper
+                } else {
+                    PartClass::Solid
+                };
+                let textures: Vec<CpuTexture> = if include_textures {
+                    model
+                        .textures
+                        .get(subset.material)
+                        .and_then(|t| t.as_ref())
+                        .map(cpu_texture_from_dds)
+                        .into_iter()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                let part_index = parts.len();
+                parts.push(CpuPart {
+                    indices,
+                    instances: Vec::new(),
+                    textures,
+                    class: part_class,
+                    record_kind: 1,
+                });
+                part_indices_for_model.push(part_index);
+            }
+        }
+
+        geo_part_indices_by_key.insert(archetype_key.clone(), part_indices_for_model);
+    }
+
+    // Embedded SCN mesh chunks are also kept in local/chunk space and drawn with a
+    // GPU instance transform. Most chunks are unique, but this still prevents CPU
+    // transform baking and allows edits to update only an instance matrix.
     for (chunk_index, chunk) in scn.mesh_chunks.iter().enumerate() {
         if hidden_chunks.contains(&chunk_index) {
             continue;
         }
+        let chunk_selection = SceneSelection::MeshChunk(chunk_index);
+        if only_selected && selected != Some(chunk_selection) {
+            continue;
+        }
 
-        append_scn_chunk_mesh(
-            chunk_index,
-            chunk,
-            embedded_textures,
-            selected == Some(SceneSelection::MeshChunk(chunk_index)),
-            &mut vertices,
-            &mut parts,
-            &mut wire_lines,
-            &mut helper_wire_lines,
-            &mut pick_targets,
-            &mut update_bounds,
-        );
+        let base_vertex = vertices.len() as u32;
+        let mut local_positions = Vec::with_capacity(chunk.vertices.len());
+        for vertex in &chunk.vertices {
+            vertices.push(MeshVertex {
+                position: vertex.position,
+                normal: normalize3(vertex.normal),
+                color: scene_vertex_color(false),
+                uv: vertex.uv,
+                object_id: 0.0,
+            });
+            local_positions.push(vertex.position);
+        }
+
+        let (local_center, local_radius) = local_points_sphere(&local_positions)
+            .unwrap_or(([0.0, 0.0, 0.0], 45.0));
+        let model_matrix = scene_selection_model_matrix_raw(scn, chunk_selection).unwrap_or(Mat4::IDENTITY);
+        let instance = scene_instance_raw(model_matrix, chunk_selection, selected);
+        let (pick_center, pick_radius) = transformed_sphere(model_matrix, local_center, local_radius.max(35.0));
+        include_bounds_sphere(&mut update_bounds, pick_center, pick_radius);
+
+        let pick_index = pick_targets.len();
+        pick_targets.push(ScenePickTarget {
+            selection: chunk_selection,
+            center: pick_center,
+            radius: pick_radius,
+        });
+
+        let part_class = if chunk.texture_names.iter().any(|name| is_shadow_like_name(name)) {
+            PartClass::Helper
+        } else {
+            PartClass::Solid
+        };
+
+        if chunk.texture_spans.is_empty() {
+            let indices: Vec<u32> = chunk.indices.iter().map(|idx| base_vertex + *idx).collect();
+            let part_index = parts.len();
+            parts.push(CpuPart {
+                indices,
+                instances: vec![instance],
+                textures: Vec::new(),
+                class: part_class,
+                record_kind: chunk.record_kind,
+            });
+            instance_bindings.push(SceneInstanceBinding {
+                selection: chunk_selection,
+                part_index,
+                instance_index: 0,
+                local_center,
+                local_radius,
+                pick_target_index: Some(pick_index),
+            });
+        } else {
+            for (span_i, span) in chunk.texture_spans.iter().enumerate() {
+                let end = span.index_start + span.index_count;
+                if end > chunk.indices.len() {
+                    continue;
+                }
+                let texture_name = chunk
+                    .texture_names
+                    .get(span.texture_slot)
+                    .or_else(|| chunk.texture_names.first());
+                let textures: Vec<CpuTexture> = if include_textures {
+                    texture_name
+                        .and_then(|name| embedded_textures.get(&name.to_ascii_lowercase()))
+                        .map(cpu_texture_from_dds)
+                        .into_iter()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let span_class = if texture_name.map(|name| is_shadow_like_name(name)).unwrap_or(false) {
+                    PartClass::Helper
+                } else {
+                    part_class
+                };
+                let part_index = parts.len();
+                parts.push(CpuPart {
+                    indices: chunk.indices[span.index_start..end]
+                        .iter()
+                        .map(|idx| base_vertex + *idx)
+                        .collect(),
+                    instances: vec![instance],
+                    textures,
+                    class: span_class,
+                    record_kind: chunk.record_kind,
+                });
+                instance_bindings.push(SceneInstanceBinding {
+                    selection: chunk_selection,
+                    part_index,
+                    instance_index: 0,
+                    local_center,
+                    local_radius,
+                    pick_target_index: if span_i == 0 { Some(pick_index) } else { None },
+                });
+            }
+        }
+
+        if build_wire && !matches!(part_class, PartClass::Helper) {
+            append_instanced_wire_lines(
+                &mut wire_lines,
+                &local_positions,
+                &chunk.indices,
+                model_matrix,
+                [185.0 / 255.0, 185.0 / 255.0, 195.0 / 255.0, 1.0],
+            );
+        }
     }
 
     for node in &scn.nodes {
@@ -1935,9 +2488,12 @@ fn build_cpu_scene_from_scn(
             continue;
         }
 
-        let marker_pos = to_view_space(node.translation);
-        update_bounds(marker_pos);
+        let node_selection = SceneSelection::Node(node.index);
+        if only_selected && selected != Some(node_selection) {
+            continue;
+        }
 
+        let marker_pos = to_view_space(node.translation);
         let marker_geo_key = node
             .is_marker()
             .then(|| marker_geo_overrides.get(&node.index))
@@ -1945,245 +2501,98 @@ fn build_cpu_scene_from_scn(
             .map(|stem| stem.trim().to_ascii_lowercase());
 
         if node.is_marker() && marker_geo_key.is_none() {
+            let marker_kind = scene_marker_kinds
+                .get(&node.index)
+                .copied()
+                .unwrap_or("Generic marker");
+            let icon_kind = scene_marker_icon_kind(marker_kind, &node.name);
             let (marker_color, marker_size) = scene_marker_style(&node.name);
-            let marker_color = if selected == Some(SceneSelection::Node(node.index)) {
-                selected_scene_tint_color()
-            } else {
-                marker_color
-            };
-            append_scene_marker_lines(&mut marker_lines, marker_pos, marker_size, marker_color);
 
-            pick_targets.push(ScenePickTarget {
-                selection: SceneSelection::Node(node.index),
-                center: marker_pos,
-                radius: marker_size,
-            });
-            continue;
-        }
-
-        let archetype_key =
-            marker_geo_key.unwrap_or_else(|| node.archetype.trim().to_ascii_lowercase());
-        let Some(model) = geo_by_archetype.get(&archetype_key) else {
-            if node.is_marker() {
-                let (marker_color, marker_size) = scene_marker_style(&node.name);
-                let marker_color = if selected == Some(SceneSelection::Node(node.index)) {
+            if icon_kind == SceneMarkerIconKind::None {
+                let marker_color = if selected == Some(node_selection) {
                     selected_scene_tint_color()
                 } else {
                     marker_color
                 };
                 append_scene_marker_lines(&mut marker_lines, marker_pos, marker_size, marker_color);
+            }
+            include_bounds_sphere(&mut update_bounds, marker_pos, marker_size.max(90.0));
+            pick_targets.push(ScenePickTarget {
+                selection: node_selection,
+                center: marker_pos,
+                radius: marker_size.max(90.0),
+            });
+            continue;
+        }
 
+        let archetype_key = marker_geo_key.unwrap_or_else(|| node.archetype.trim().to_ascii_lowercase());
+        let Some(part_indices_for_model) = geo_part_indices_by_key.get(&archetype_key) else {
+            if node.is_marker() {
+                let marker_kind = scene_marker_kinds
+                    .get(&node.index)
+                    .copied()
+                    .unwrap_or("Generic marker");
+                let icon_kind = scene_marker_icon_kind(marker_kind, &node.name);
+                let (marker_color, marker_size) = scene_marker_style(&node.name);
+                if icon_kind == SceneMarkerIconKind::None {
+                    let marker_color = if selected == Some(node_selection) {
+                        selected_scene_tint_color()
+                    } else {
+                        marker_color
+                    };
+                    append_scene_marker_lines(&mut marker_lines, marker_pos, marker_size, marker_color);
+                }
+                include_bounds_sphere(&mut update_bounds, marker_pos, marker_size.max(90.0));
                 pick_targets.push(ScenePickTarget {
-                    selection: SceneSelection::Node(node.index),
+                    selection: node_selection,
                     center: marker_pos,
-                    radius: marker_size,
+                    radius: marker_size.max(90.0),
                 });
             }
             continue;
         };
 
-        let geo = &model.geo;
-        let model_is_helper = is_shadow_like_name(&archetype_key);
-        let is_selected = selected == Some(SceneSelection::Node(node.index));
-
-        let base_vertex = vertices.len() as u32;
-        let mut instance_positions = Vec::with_capacity(geo.verts.len());
-
-        for (i, &pos) in geo.verts.iter().enumerate() {
-            let world_pos = apply_transform_point(&node.transform, pos);
-            let view_pos = to_view_space(world_pos);
-
-            let raw_normal = geo.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
-            let world_normal = apply_transform_direction(&node.transform, raw_normal);
-            let view_normal = normalize3(to_view_space(world_normal));
-
-            let uv = geo.uvs.get(i).copied().unwrap_or([0.0, 0.0]);
-
-            vertices.push(MeshVertex {
-                position: view_pos,
-                normal: view_normal,
-                color: scene_vertex_color(is_selected),
-                uv,
-            });
-
-            instance_positions.push(view_pos);
-            update_bounds(view_pos);
-        }
-
-        let (instance_center, instance_radius) = bounds_from_points(&instance_positions)
-            .map(|(center, radius)| (center, radius.max(45.0)))
-            .unwrap_or((marker_pos, 75.0));
-
-        if geo.subsets.is_empty() {
-            let part_class = if model_is_helper
-                || geo
-                    .texture_names
-                    .iter()
-                    .any(|name| is_shadow_like_name(name))
-            {
-                PartClass::Helper
-            } else {
-                PartClass::Solid
-            };
-
-            let line_color = if is_selected {
-                selected_scene_tint_color()
-            } else {
-                [120.0 / 255.0, 220.0 / 255.0, 1.0, 1.0]
-            };
-            let draw_wire = !matches!(part_class, PartClass::Helper);
-
-            let mut part_indices = Vec::with_capacity(geo.faces.len() * 3);
-
-            for face in &geo.faces {
-                part_indices.push(base_vertex + face[0] as u32);
-                part_indices.push(base_vertex + face[1] as u32);
-                part_indices.push(base_vertex + face[2] as u32);
-
-                let ia = face[0] as usize;
-                let ib = face[1] as usize;
-                let ic = face[2] as usize;
-
-                let Some(&a) = instance_positions.get(ia) else {
-                    continue;
-                };
-                let Some(&b) = instance_positions.get(ib) else {
-                    continue;
-                };
-                let Some(&c) = instance_positions.get(ic) else {
-                    continue;
-                };
-
-                if draw_wire {
-                    wire_lines.push(LineVertex {
-                        position: a,
-                        color: line_color,
-                    });
-                    wire_lines.push(LineVertex {
-                        position: b,
-                        color: line_color,
-                    });
-                    wire_lines.push(LineVertex {
-                        position: b,
-                        color: line_color,
-                    });
-                    wire_lines.push(LineVertex {
-                        position: c,
-                        color: line_color,
-                    });
-                    wire_lines.push(LineVertex {
-                        position: c,
-                        color: line_color,
-                    });
-                    wire_lines.push(LineVertex {
-                        position: a,
-                        color: line_color,
-                    });
-                }
-            }
-
-            parts.push(CpuPart {
-                indices: part_indices,
-                textures: Vec::new(),
-                class: part_class,
-                record_kind: 1,
-            });
-        } else {
-            for subset in &geo.subsets {
-                let texture_name = geo
-                    .texture_names
-                    .get(subset.material)
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
-
-                let part_class = if model_is_helper || is_shadow_like_name(texture_name) {
-                    PartClass::Helper
-                } else {
-                    PartClass::Solid
-                };
-
-                let line_color = if is_selected {
-                    selected_scene_tint_color()
-                } else {
-                    [120.0 / 255.0, 220.0 / 255.0, 1.0, 1.0]
-                };
-                let draw_wire = !matches!(part_class, PartClass::Helper);
-
-                let start = (subset.start / 3) as usize;
-                let count = (subset.count / 3) as usize;
-                let end = (start + count).min(geo.faces.len());
-
-                let mut part_indices = Vec::with_capacity((end - start) * 3);
-
-                for face in &geo.faces[start..end] {
-                    part_indices.push(base_vertex + face[0] as u32);
-                    part_indices.push(base_vertex + face[1] as u32);
-                    part_indices.push(base_vertex + face[2] as u32);
-
-                    let ia = face[0] as usize;
-                    let ib = face[1] as usize;
-                    let ic = face[2] as usize;
-
-                    let Some(&a) = instance_positions.get(ia) else {
-                        continue;
-                    };
-                    let Some(&b) = instance_positions.get(ib) else {
-                        continue;
-                    };
-                    let Some(&c) = instance_positions.get(ic) else {
-                        continue;
-                    };
-
-                    if draw_wire {
-                        wire_lines.push(LineVertex {
-                            position: a,
-                            color: line_color,
-                        });
-                        wire_lines.push(LineVertex {
-                            position: b,
-                            color: line_color,
-                        });
-                        wire_lines.push(LineVertex {
-                            position: b,
-                            color: line_color,
-                        });
-                        wire_lines.push(LineVertex {
-                            position: c,
-                            color: line_color,
-                        });
-                        wire_lines.push(LineVertex {
-                            position: c,
-                            color: line_color,
-                        });
-                        wire_lines.push(LineVertex {
-                            position: a,
-                            color: line_color,
-                        });
-                    }
-                }
-
-                let textures: Vec<CpuTexture> = model
-                    .textures
-                    .get(subset.material)
-                    .and_then(|t| t.as_ref())
-                    .map(cpu_texture_from_dds)
-                    .into_iter()
-                    .collect();
-
-                parts.push(CpuPart {
-                    indices: part_indices,
-                    textures,
-                    class: part_class,
-                    record_kind: 1,
-                });
-            }
-        }
-
+        let model_matrix = scene_selection_model_matrix_raw(scn, node_selection).unwrap_or(Mat4::IDENTITY);
+        let instance = scene_instance_raw(model_matrix, node_selection, selected);
+        let (local_center, local_radius) = geo_bounds_by_key
+            .get(&archetype_key)
+            .copied()
+            .unwrap_or(([0.0, 0.0, 0.0], 45.0));
+        let (pick_center, pick_radius) = transformed_sphere(model_matrix, local_center, local_radius);
+        include_bounds_sphere(&mut update_bounds, pick_center, pick_radius);
+        let pick_index = pick_targets.len();
         pick_targets.push(ScenePickTarget {
-            selection: SceneSelection::Node(node.index),
-            center: instance_center,
-            radius: instance_radius,
+            selection: node_selection,
+            center: pick_center,
+            radius: pick_radius,
         });
+
+        for (i, part_index) in part_indices_for_model.iter().copied().enumerate() {
+            let Some(part) = parts.get_mut(part_index) else {
+                continue;
+            };
+            let instance_index = part.instances.len();
+            part.instances.push(instance);
+            instance_bindings.push(SceneInstanceBinding {
+                selection: node_selection,
+                part_index,
+                instance_index,
+                local_center,
+                local_radius,
+                pick_target_index: if i == 0 { Some(pick_index) } else { None },
+            });
+        }
+
+        if build_wire {
+            if let Some(model) = geo_by_archetype.get(&archetype_key) {
+                append_instanced_geo_wire_lines(
+                    &mut wire_lines,
+                    &model.geo,
+                    model_matrix,
+                    [120.0 / 255.0, 220.0 / 255.0, 1.0, 1.0],
+                );
+            }
+        }
     }
 
     if !have_bounds {
@@ -2196,25 +2605,21 @@ fn build_cpu_scene_from_scn(
         (min[1] + max[1]) * 0.5,
         (min[2] + max[2]) * 0.5,
     ];
-
-    let mut radius: f32 = 1.0;
-    for v in &vertices {
-        radius = radius.max(length3(sub3(v.position, center)));
-    }
-    for chunk in marker_lines.chunks(2) {
-        for line in chunk {
-            radius = radius.max(length3(sub3(line.position, center)));
-        }
-    }
-    radius = radius.max(100.0);
+    let radius = length3(sub3(max, center)).max(100.0);
 
     let ground_y = min[1] - 0.02;
-    let ground_lines = build_ground_lines_for_bounds(center, radius, ground_y);
+    let ground_lines = if only_selected {
+        Vec::new()
+    } else {
+        build_ground_lines_for_bounds(center, radius, ground_y)
+    };
 
     Arc::new(CpuScene {
         key,
+        transient,
         vertices,
         parts,
+        instance_bindings,
         ground_lines,
         wire_lines,
         helper_wire_lines,
@@ -2225,11 +2630,153 @@ fn build_cpu_scene_from_scn(
     })
 }
 
+fn scene_selection_model_matrix_raw(scn: &ScnFile, selection: SceneSelection) -> Option<Mat4> {
+    match selection {
+        SceneSelection::Node(index) => scn
+            .nodes
+            .get(index)
+            .map(|node| scn_to_view_matrix() * Mat4::from_cols_array(&node.transform)),
+        SceneSelection::MeshChunk(index) => scn
+            .mesh_chunks
+            .get(index)
+            .map(|chunk| {
+                scn_to_view_matrix()
+                    * chunk
+                        .transform
+                        .map(|m| Mat4::from_cols_array(&m))
+                        .unwrap_or(Mat4::IDENTITY)
+            }),
+    }
+}
+
+fn sync_instanced_scene_from_scn(scene: &mut CpuScene, scn: &ScnFile, selected: Option<SceneSelection>) {
+    let bindings = scene.instance_bindings.clone();
+    for binding in bindings {
+        let Some(model_matrix) = scene_selection_model_matrix_raw(scn, binding.selection) else {
+            continue;
+        };
+        if let Some(part) = scene.parts.get_mut(binding.part_index) {
+            if let Some(instance) = part.instances.get_mut(binding.instance_index) {
+                *instance = scene_instance_raw(model_matrix, binding.selection, selected);
+            }
+        }
+        if let Some(pick_target_index) = binding.pick_target_index {
+            if let Some(target) = scene.pick_targets.get_mut(pick_target_index) {
+                let (center, radius) = transformed_sphere(
+                    model_matrix,
+                    binding.local_center,
+                    binding.local_radius,
+                );
+                target.center = center;
+                target.radius = radius;
+            }
+        }
+    }
+}
+
+fn local_points_sphere(points: &[[f32; 3]]) -> Option<([f32; 3], f32)> {
+    if points.is_empty() {
+        return None;
+    }
+    let mut min = points[0];
+    let mut max = points[0];
+    for &p in points.iter().skip(1) {
+        min[0] = min[0].min(p[0]);
+        min[1] = min[1].min(p[1]);
+        min[2] = min[2].min(p[2]);
+        max[0] = max[0].max(p[0]);
+        max[1] = max[1].max(p[1]);
+        max[2] = max[2].max(p[2]);
+    }
+    let center = [
+        (min[0] + max[0]) * 0.5,
+        (min[1] + max[1]) * 0.5,
+        (min[2] + max[2]) * 0.5,
+    ];
+    let mut radius: f32 = 1.0;
+    for &p in points {
+        radius = radius.max(length3(sub3(p, center)));
+    }
+    Some((center, radius))
+}
+
+fn include_bounds_sphere<F: FnMut([f32; 3])>(update_bounds: &mut F, center: [f32; 3], radius: f32) {
+    update_bounds([center[0] - radius, center[1] - radius, center[2] - radius]);
+    update_bounds([center[0] + radius, center[1] + radius, center[2] + radius]);
+}
+
+fn append_instanced_geo_wire_lines(out: &mut Vec<LineVertex>, geo: &GeoFile, model: Mat4, color: [f32; 4]) {
+    for face in &geo.faces {
+        let ia = face[0] as usize;
+        let ib = face[1] as usize;
+        let ic = face[2] as usize;
+        let (Some(&a), Some(&b), Some(&c)) = (geo.verts.get(ia), geo.verts.get(ib), geo.verts.get(ic)) else {
+            continue;
+        };
+        append_wire_triangle(out, model, a, b, c, color);
+    }
+}
+
+fn append_instanced_wire_lines(
+    out: &mut Vec<LineVertex>,
+    positions: &[[f32; 3]],
+    indices: &[u32],
+    model: Mat4,
+    color: [f32; 4],
+) {
+    for tri in indices.chunks_exact(3) {
+        let ia = tri[0] as usize;
+        let ib = tri[1] as usize;
+        let ic = tri[2] as usize;
+        let (Some(&a), Some(&b), Some(&c)) = (positions.get(ia), positions.get(ib), positions.get(ic)) else {
+            continue;
+        };
+        append_wire_triangle(out, model, a, b, c, color);
+    }
+}
+
+fn append_wire_triangle(out: &mut Vec<LineVertex>, model: Mat4, a: [f32; 3], b: [f32; 3], c: [f32; 3], color: [f32; 4]) {
+    let a = model.transform_point3(arr_to_vec3(a)).to_array();
+    let b = model.transform_point3(arr_to_vec3(b)).to_array();
+    let c = model.transform_point3(arr_to_vec3(c)).to_array();
+    out.push(LineVertex { position: a, color });
+    out.push(LineVertex { position: b, color });
+    out.push(LineVertex { position: b, color });
+    out.push(LineVertex { position: c, color });
+    out.push(LineVertex { position: c, color });
+    out.push(LineVertex { position: a, color });
+}
+
+fn include_scn_chunk_bounds<F: FnMut([f32; 3])>(chunk: &ScnMeshChunk, update_bounds: &mut F) {
+    for vertex in &chunk.vertices {
+        let world_pos = if let Some(transform) = &chunk.transform {
+            apply_transform_point(transform, vertex.position)
+        } else {
+            vertex.position
+        };
+        update_bounds(to_view_space(world_pos));
+    }
+}
+
+fn include_geo_node_bounds<F: FnMut([f32; 3])>(
+    geo: &GeoFile,
+    transform: &[f32; 16],
+    update_bounds: &mut F,
+) {
+    for &pos in &geo.verts {
+        update_bounds(to_view_space(apply_transform_point(transform, pos)));
+    }
+}
+
 fn append_scn_chunk_mesh<F: FnMut([f32; 3])>(
     chunk_index: usize,
     chunk: &ScnMeshChunk,
     embedded_textures: &HashMap<String, DdsPreview>,
     is_selected: bool,
+    build_wire: bool,
+    include_textures: bool,
+    local_space: bool,
+    object_id: f32,
     vertices: &mut Vec<MeshVertex>,
     parts: &mut Vec<CpuPart>,
     wire_lines: &mut Vec<LineVertex>,
@@ -2252,36 +2799,40 @@ fn append_scn_chunk_mesh<F: FnMut([f32; 3])>(
     } else {
         [185.0 / 255.0, 185.0 / 255.0, 195.0 / 255.0, 1.0]
     };
-    let draw_wire = !matches!(part_class, PartClass::Helper);
+    let draw_wire = build_wire && !matches!(part_class, PartClass::Helper);
 
     let base_vertex = vertices.len() as u32;
     let mut chunk_positions = Vec::with_capacity(chunk.vertices.len());
 
     for vertex in &chunk.vertices {
-        let world_pos = if let Some(transform) = &chunk.transform {
-            apply_transform_point(transform, vertex.position)
+        let (vertex_pos, vertex_normal) = if local_space {
+            (vertex.position, normalize3(vertex.normal))
         } else {
-            vertex.position
-        };
+            let world_pos = if let Some(transform) = &chunk.transform {
+                apply_transform_point(transform, vertex.position)
+            } else {
+                vertex.position
+            };
 
-        let world_normal = if let Some(transform) = &chunk.transform {
-            apply_transform_direction(transform, vertex.normal)
-        } else {
-            vertex.normal
-        };
+            let world_normal = if let Some(transform) = &chunk.transform {
+                apply_transform_direction(transform, vertex.normal)
+            } else {
+                vertex.normal
+            };
 
-        let view_pos = to_view_space(world_pos);
-        let view_normal = normalize3(to_view_space(world_normal));
+            (to_view_space(world_pos), normalize3(to_view_space(world_normal)))
+        };
 
         vertices.push(MeshVertex {
-            position: view_pos,
-            normal: view_normal,
+            position: vertex_pos,
+            normal: vertex_normal,
             color: scene_vertex_color(is_selected),
             uv: vertex.uv,
+            object_id,
         });
 
-        chunk_positions.push(view_pos);
-        update_bounds(view_pos);
+        chunk_positions.push(vertex_pos);
+        update_bounds(vertex_pos);
     }
 
     let mut part_indices = Vec::with_capacity(chunk.indices.len());
@@ -2353,11 +2904,15 @@ fn append_scn_chunk_mesh<F: FnMut([f32; 3])>(
                 .get(span.texture_slot)
                 .or_else(|| chunk.texture_names.first());
 
-            let textures: Vec<CpuTexture> = texture_name
-                .and_then(|name| embedded_textures.get(&name.to_ascii_lowercase()))
-                .map(cpu_texture_from_dds)
-                .into_iter()
-                .collect();
+            let textures: Vec<CpuTexture> = if include_textures {
+                texture_name
+                    .and_then(|name| embedded_textures.get(&name.to_ascii_lowercase()))
+                    .map(cpu_texture_from_dds)
+                    .into_iter()
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
             let span_class = if texture_name
                 .map(|name| is_shadow_like_name(name))
@@ -2373,6 +2928,7 @@ fn append_scn_chunk_mesh<F: FnMut([f32; 3])>(
                     .iter()
                     .map(|idx| base_vertex + *idx)
                     .collect(),
+                instances: vec![identity_instance()],
                 textures,
                 class: span_class,
                 record_kind: 1,
@@ -2553,6 +3109,69 @@ fn scn_frame_distance(scn: &ScnFile) -> f32 {
     }
 }
 
+fn scene_marker_icon_kind(marker_kind: &str, name: &str) -> SceneMarkerIconKind {
+    match marker_kind {
+        "Camera marker" => {
+            if name.to_ascii_lowercase().contains("target") {
+                SceneMarkerIconKind::CameraTarget
+            } else {
+                SceneMarkerIconKind::Camera
+            }
+        }
+        "Route marker" => SceneMarkerIconKind::Route,
+        "Gameplay target" => SceneMarkerIconKind::Gameplay,
+        "Generic marker" => SceneMarkerIconKind::Generic,
+        "Actor marker" => SceneMarkerIconKind::Actor,
+        _ => SceneMarkerIconKind::None,
+    }
+}
+
+fn load_png_icon_texture(
+    ctx: &egui::Context,
+    name: &str,
+    bytes: &[u8],
+) -> Option<egui::TextureHandle> {
+    let image = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    let pixels = image.into_raw();
+
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+
+    Some(ctx.load_texture(
+        name.to_owned(),
+        color_image,
+        egui::TextureOptions::LINEAR,
+    ))
+}
+
+fn ensure_scene_marker_icon_textures(ctx: &egui::Context, state: &mut GeoViewerState) {
+    if state.camera_icon_texture.is_none() {
+        state.camera_icon_texture =
+            load_png_icon_texture(ctx, "scene_camera_icon", CAMERA_ICON_BYTES);
+    }
+
+    if state.camera_target_icon_texture.is_none() {
+        state.camera_target_icon_texture =
+            load_png_icon_texture(ctx, "scene_camera_target_icon", CAMERA_TARGET_ICON_BYTES);
+    }
+
+    if state.route_icon_texture.is_none() {
+        state.route_icon_texture = load_png_icon_texture(ctx, "scene_route_icon", ROUTE_ICON_BYTES);
+    }
+
+    if state.gameplay_icon_texture.is_none() {
+        state.gameplay_icon_texture = load_png_icon_texture(ctx, "scene_gameplay_icon", GAMEPLAY_ICON_BYTES);
+    }
+
+    if state.generic_icon_texture.is_none() {
+        state.generic_icon_texture = load_png_icon_texture(ctx, "scene_generic_icon", GENERIC_ICON_BYTES);
+    }
+
+    if state.actor_icon_texture.is_none() {
+        state.actor_icon_texture = load_png_icon_texture(ctx, "scene_actor_icon", ACTOR_ICON_BYTES);
+    }
+}
+
 fn scene_marker_style(name: &str) -> ([f32; 4], f32) {
     let lower = name.trim().to_ascii_lowercase();
 
@@ -2674,8 +3293,8 @@ fn projected_pick_radius(
     }
 }
 
-fn pick_scene_target(
-    scene: &CpuScene,
+fn pick_scene_overlay_target(
+    overlays: &[SceneOverlayDraw],
     rect: Rect,
     view_proj: Mat4,
     eye: [f32; 3],
@@ -2684,7 +3303,68 @@ fn pick_scene_target(
     let eye = arr_to_vec3(eye);
     let mut best: Option<(u8, f32, f32, SceneSelection)> = None;
 
+    for overlay in overlays {
+        let model = Mat4::from_cols_array_2d(&overlay.model);
+        for target in &overlay.scene.pick_targets {
+            let transformed_center = model.transform_point3(arr_to_vec3(target.center)).to_array();
+            let Some((screen_pos, _depth)) = project_scene_point(rect, view_proj, transformed_center) else {
+                continue;
+            };
+
+            let world_distance = (arr_to_vec3(transformed_center) - eye).length();
+            let screen_radius =
+                projected_pick_radius(rect, world_distance, target.radius, overlay.selection);
+            let pointer_distance = pointer_pos.distance(screen_pos);
+
+            if pointer_distance > screen_radius {
+                continue;
+            }
+
+            let priority = match overlay.selection {
+                SceneSelection::Node(_) => 0,
+                SceneSelection::MeshChunk(_) => 1,
+            };
+            let normalized_distance = pointer_distance / screen_radius.max(1.0);
+
+            let should_replace = best
+                .map(|(best_priority, best_distance, best_norm, _)| {
+                    priority < best_priority
+                        || (priority == best_priority
+                            && (world_distance < best_distance - 0.5
+                                || ((world_distance - best_distance).abs() <= 0.5
+                                    && normalized_distance < best_norm)))
+                })
+                .unwrap_or(true);
+
+            if should_replace {
+                best = Some((
+                    priority,
+                    world_distance,
+                    normalized_distance,
+                    overlay.selection,
+                ));
+            }
+        }
+    }
+
+    best.map(|(_, _, _, selection)| selection)
+}
+
+fn pick_scene_target(
+    scene: &CpuScene,
+    rect: Rect,
+    view_proj: Mat4,
+    eye: [f32; 3],
+    pointer_pos: egui::Pos2,
+    hidden_selections: &BTreeSet<SceneSelection>,
+) -> Option<SceneSelection> {
+    let eye = arr_to_vec3(eye);
+    let mut best: Option<(u8, f32, f32, SceneSelection)> = None;
+
     for target in &scene.pick_targets {
+        if hidden_selections.contains(&target.selection) {
+            continue;
+        }
         let Some((screen_pos, _depth)) = project_scene_point(rect, view_proj, target.center) else {
             continue;
         };
@@ -2739,6 +3419,77 @@ fn scene_selection_cache_tag(selected: Option<SceneSelection>) -> String {
         Some(SceneSelection::MeshChunk(index)) => format!("chunk:{index}"),
         None => "none".to_owned(),
     }
+}
+
+fn scene_selection_object_id(selection: SceneSelection) -> f32 {
+    match selection {
+        SceneSelection::Node(index) => (index as f32) + 1.0,
+        SceneSelection::MeshChunk(index) => 1_000_000.0 + (index as f32) + 1.0,
+    }
+}
+
+fn scn_to_view_matrix() -> Mat4 {
+    Mat4::from_cols_array(&[
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, -1.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ])
+}
+
+fn selected_scene_model_matrix(
+    scn: &ScnFile,
+    selected: Option<SceneSelection>,
+    hidden_nodes: &BTreeSet<usize>,
+    hidden_chunks: &BTreeSet<usize>,
+) -> Option<Mat4> {
+    match selected {
+        Some(SceneSelection::Node(index)) if !hidden_nodes.contains(&index) => scn
+            .nodes
+            .get(index)
+            .map(|node| scn_to_view_matrix() * Mat4::from_cols_array(&node.transform)),
+        Some(SceneSelection::MeshChunk(index)) if !hidden_chunks.contains(&index) => scn
+            .mesh_chunks
+            .get(index)
+            .map(|chunk| {
+                scn_to_view_matrix()
+                    * chunk
+                        .transform
+                        .map(|m| Mat4::from_cols_array(&m))
+                        .unwrap_or(Mat4::IDENTITY)
+            }),
+        _ => None,
+    }
+}
+
+fn identity_instance() -> InstanceRaw {
+    InstanceRaw {
+        model: Mat4::IDENTITY.to_cols_array_2d(),
+        data: [0.0, 0.0, 0.0, 0.0],
+    }
+}
+
+fn scene_instance_raw(model: Mat4, selection: SceneSelection, selected: Option<SceneSelection>) -> InstanceRaw {
+    InstanceRaw {
+        model: model.to_cols_array_2d(),
+        data: [
+            scene_selection_object_id(selection),
+            if selected == Some(selection) { 1.0 } else { 0.0 },
+            0.0,
+            0.0,
+        ],
+    }
+}
+
+fn transformed_sphere(model: Mat4, local_center: [f32; 3], local_radius: f32) -> ([f32; 3], f32) {
+    let center = model.transform_point3(arr_to_vec3(local_center)).to_array();
+    let scale = model
+        .transform_vector3(Vec3::X)
+        .length()
+        .max(model.transform_vector3(Vec3::Y).length())
+        .max(model.transform_vector3(Vec3::Z).length())
+        .max(0.0001);
+    (center, (local_radius * scale).max(35.0))
 }
 
 fn scene_vertex_color(is_selected: bool) -> [f32; 4] {
@@ -3253,6 +4004,10 @@ fn handle_scene_gizmo_interaction(
     if let Some(drag) = state.scene_gizmo_drag {
         if !ui.input(|i| i.pointer.primary_down()) {
             state.scene_gizmo_drag = None;
+            state.scene_gpu_dirty_selections.insert(selected_item);
+            state.scene_static_dirty = false;
+            state.scene_static_dirty_selection = None;
+            ui.ctx().request_repaint();
             return false;
         }
 
@@ -3315,8 +4070,7 @@ fn handle_scene_gizmo_interaction(
             return false;
         }
 
-        state.scene_edit_revision = state.scene_edit_revision.wrapping_add(1);
-        state.scene_key = None;
+        state.scene_gpu_dirty_selections.insert(selected_item);
         ui.ctx().request_repaint();
         return true;
     }
@@ -3347,7 +4101,23 @@ fn handle_scene_gizmo_interaction(
     ) else {
         return false;
     };
+
+    if let SceneSelection::MeshChunk(index) = selected_item {
+        let Some(chunk) = scn.mesh_chunks.get_mut(index) else {
+            return false;
+        };
+        if chunk.transform.is_none() {
+            if ensure_scene_chunk_transform(chunk).is_none() {
+                return false;
+            }
+            state.scene_preview_cache.clear();
+            state.scene_key = None;
+            state.cpu_scene = None;
+        }
+    }
+
     drag.start_scale = scale;
+    state.scene_gpu_dirty_selections.insert(selected_item);
     state.scene_gizmo_drag = Some(drag);
     ui.ctx().request_repaint();
     true
@@ -3439,6 +4209,75 @@ fn paint_scene_gizmo(
                     previous = current;
                 }
             }
+        }
+    }
+}
+
+fn paint_scene_marker_icons(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    view_proj: Mat4,
+    scn: &ScnFile,
+    state: &GeoViewerState,
+    hidden_nodes: &BTreeSet<usize>,
+    selected: Option<SceneSelection>,
+    scene_marker_kinds: &BTreeMap<usize, &'static str>,
+    tint_selected: bool,
+) {
+    if !state.show_bones {
+        return;
+    }
+
+    let painter = ui.painter();
+
+    for node in &scn.nodes {
+        if !node.is_marker() || hidden_nodes.contains(&node.index) {
+            continue;
+        }
+
+        let marker_kind = scene_marker_kinds
+            .get(&node.index)
+            .copied()
+            .unwrap_or("Generic marker");
+        let icon_kind = scene_marker_icon_kind(marker_kind, &node.name);
+
+        let Some(texture) = (match icon_kind {
+            SceneMarkerIconKind::Camera => state.camera_icon_texture.as_ref(),
+            SceneMarkerIconKind::CameraTarget => state.camera_target_icon_texture.as_ref(),
+            SceneMarkerIconKind::Route => state.route_icon_texture.as_ref(),
+            SceneMarkerIconKind::Gameplay => state.gameplay_icon_texture.as_ref(),
+            SceneMarkerIconKind::Generic => state.generic_icon_texture.as_ref(),
+            SceneMarkerIconKind::Actor => state.actor_icon_texture.as_ref(),
+            SceneMarkerIconKind::None => None,
+        }) else {
+            continue;
+        };
+
+        let marker_pos = to_view_space(node.translation);
+        let Some((screen_pos, _depth)) = project_scene_point(rect, view_proj, marker_pos) else {
+            continue;
+        };
+
+        let is_selected = tint_selected && selected == Some(SceneSelection::Node(node.index));
+        let icon_size = if is_selected { 50.0 } else { 50.0 };
+        let icon_rect = egui::Rect::from_center_size(
+            screen_pos,
+            egui::vec2(icon_size, icon_size),
+        );
+
+        painter.image(
+            texture.id(),
+            icon_rect,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+
+        if is_selected {
+            painter.circle_stroke(
+                screen_pos,
+                icon_size * 0.58,
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 230, 80)),
+            );
         }
     }
 }
@@ -3740,6 +4579,17 @@ fn make_view_proj(
     eye: [f32; 3],
     scene: &CpuScene,
 ) -> Mat4 {
+    make_view_proj_for_radius(width, height, yaw, pitch, eye, scene.radius)
+}
+
+fn make_view_proj_for_radius(
+    width: u32,
+    height: u32,
+    yaw: f32,
+    pitch: f32,
+    eye: [f32; 3],
+    scene_radius: f32,
+) -> Mat4 {
     let pitch = pitch.clamp(-1.10, 1.10);
 
     let (forward, _right, up) = camera_axes(yaw, pitch);
@@ -3751,7 +4601,7 @@ fn make_view_proj(
         55.0_f32.to_radians(),
         aspect,
         NEAR_PLANE,
-        (scene.radius * 20.0).max(100.0),
+        (scene_radius * 20.0).max(100.0),
     );
     let view = Mat4::look_at_rh(eye, target, up);
     proj * view
@@ -3868,6 +4718,7 @@ fn is_shadow_like_name(name: &str) -> bool {
 const FACE_SHADER: &str = r#"
 struct Globals {
     view_proj : mat4x4<f32>,
+    model : mat4x4<f32>,
     light_dir : vec4<f32>,
     render_opts : vec4<f32>, // x = textures on/off, y = brightness multiplier
 };
@@ -3879,8 +4730,15 @@ struct MaterialParams {
     _pad1 : u32,
 };
 
+struct HiddenObjectIds {
+    ids : array<f32, 256>,
+};
+
 @group(0) @binding(0)
 var<uniform> globals : Globals;
+
+@group(0) @binding(1)
+var<storage, read> hidden_objects : HiddenObjectIds;
 
 @group(1) @binding(0)
 var tex_sampler : sampler;
@@ -3910,6 +4768,12 @@ struct VsIn {
     @location(1) normal   : vec3<f32>,
     @location(2) color    : vec4<f32>,
     @location(3) uv       : vec2<f32>,
+    @location(4) object_id : f32,
+    @location(5) instance_model_0 : vec4<f32>,
+    @location(6) instance_model_1 : vec4<f32>,
+    @location(7) instance_model_2 : vec4<f32>,
+    @location(8) instance_model_3 : vec4<f32>,
+    @location(9) instance_data : vec4<f32>,
 };
 
 struct VsOut {
@@ -3917,15 +4781,25 @@ struct VsOut {
     @location(0) normal : vec3<f32>,
     @location(1) uv     : vec2<f32>,
     @location(2) color  : vec4<f32>,
+    @location(3) object_id : f32,
 };
 
 @vertex
 fn vs_main(v: VsIn) -> VsOut {
     var out : VsOut;
-    out.clip_pos = globals.view_proj * vec4<f32>(v.position, 1.0);
-    out.normal = v.normal;
+    let instance_model = mat4x4<f32>(
+        v.instance_model_0,
+        v.instance_model_1,
+        v.instance_model_2,
+        v.instance_model_3
+    );
+    let model = globals.model * instance_model;
+    let model_pos = model * vec4<f32>(v.position, 1.0);
+    out.clip_pos = globals.view_proj * model_pos;
+    out.normal = normalize((model * vec4<f32>(v.normal, 0.0)).xyz);
     out.uv = v.uv;
-    out.color = v.color;
+    out.color = vec4<f32>(v.color.rgb, max(v.color.a, v.instance_data.y));
+    out.object_id = select(v.object_id, v.instance_data.x, v.instance_data.x > 0.5);
     return out;
 }
 
@@ -4002,8 +4876,15 @@ fn sample_scn_layers(uv: vec2<f32>, vcolor: vec4<f32>) -> vec4<f32> {
 
 @fragment
 fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
+    let hidden_count = min(u32(globals.render_opts.z), 256u);
+    for (var i = 0u; i < hidden_count; i = i + 1u) {
+        if (abs(v.object_id - hidden_objects.ids[i]) < 0.5) {
+            discard;
+        }
+    }
+
     let textured = globals.render_opts.x > 0.5;
-    let selection_mix = clamp(v.color.a, 0.0, 1.0) * 0.62;
+    let selection_mix = clamp(max(v.color.a, globals.render_opts.w), 0.0, 1.0) * 0.62;
 
     var base_rgb : vec3<f32>;
     var out_alpha : f32;
@@ -4038,12 +4919,20 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
 const LINE_SHADER: &str = r#"
 struct Globals {
     view_proj : mat4x4<f32>,
+    model : mat4x4<f32>,
     light_dir : vec4<f32>,
     render_opts : vec4<f32>,
 };
 
+struct HiddenObjectIds {
+    ids : array<f32, 256>,
+};
+
 @group(0) @binding(0)
 var<uniform> globals : Globals;
+
+@group(0) @binding(1)
+var<storage, read> hidden_objects : HiddenObjectIds;
 
 struct VsIn {
     @location(0) position : vec3<f32>,
@@ -4058,7 +4947,7 @@ struct VsOut {
 @vertex
 fn vs_main(v: VsIn) -> VsOut {
     var out : VsOut;
-    out.clip_pos = globals.view_proj * vec4<f32>(v.position, 1.0);
+    out.clip_pos = globals.view_proj * globals.model * vec4<f32>(v.position, 1.0);
     out.color = v.color;
     return out;
 }

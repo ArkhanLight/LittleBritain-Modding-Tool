@@ -3267,15 +3267,6 @@ impl ModToolApp {
         Self::collect_files_by_category(&self.tree, AssetCategory::Texture, &mut texture_nodes);
         Self::collect_files_by_category(&self.tree, AssetCategory::Model, &mut model_nodes);
 
-        let mut textures_by_name = std::collections::HashMap::<String, PathBuf>::new();
-        for node in texture_nodes {
-            if let Some(name) = node.path.file_name().and_then(|s| s.to_str()) {
-                textures_by_name
-                    .entry(name.to_ascii_lowercase())
-                    .or_insert_with(|| node.path.clone());
-            }
-        }
-
         let scn_parent = path.parent().map(|parent| parent.to_path_buf());
 
         let is_in_scn_folder = |candidate: &Path| {
@@ -3288,6 +3279,18 @@ impl ModToolApp {
                 })
                 .unwrap_or(false)
         };
+
+        let mut textures_by_name = std::collections::HashMap::<String, PathBuf>::new();
+
+        for node in texture_nodes {
+            if !is_in_scn_folder(&node.path) {
+                continue;
+            }
+
+            if let Some(name) = node.path.file_name().and_then(|s| s.to_str()) {
+                textures_by_name.insert(name.to_ascii_lowercase(), node.path.clone());
+            }
+        }
 
         let mut geo_by_stem = std::collections::HashMap::<String, PathBuf>::new();
 
@@ -6590,6 +6593,13 @@ impl eframe::App for ModToolApp {
                             let scn_view_height = ui.available_height().max(180.0);
                             self.scn_view_height = scn_view_height;
 
+                            let scene_marker_kinds = scn
+                                .nodes
+                                .iter()
+                                .filter(|node| node.is_marker())
+                                .map(|node| (node.index, Self::scn_marker_kind(&node.name)))
+                                .collect::<std::collections::BTreeMap<usize, &'static str>>();
+
                             if let Some(picked_item) = draw_scene_viewer(
                                 ui,
                                 scn,
@@ -6601,6 +6611,7 @@ impl eframe::App for ModToolApp {
                                 &self.hidden_scn_nodes,
                                 &self.hidden_scn_chunks,
                                 &self.scn_marker_geo_overrides,
+                                &scene_marker_kinds,
                             ) {
                                 Self::apply_scn_selection(
                                     &mut self.selected_scn_node,

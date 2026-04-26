@@ -15,3 +15,4 @@ egui-wgpu = "0.34"
 image_dds = { version = "0.7", default-features = false, features = ["ddsfile", "image"] }
 rodio = { version = "0.22.2", features = ["playback", "vorbis"] }
 ffmpeg-next = { version = "8.1.0", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling", "static"] }
+image = "0.25"
