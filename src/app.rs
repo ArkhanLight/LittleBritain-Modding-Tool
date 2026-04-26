@@ -62,6 +62,7 @@ struct GameCodeMap {
     character_names: Vec<String>,
     resource_names: Vec<String>,
     asset_refs: Vec<String>,
+    raw_tokens: Vec<String>,
     code_refs: Vec<String>,
     script_tokens: Vec<String>,
     modloader_tokens: Vec<String>,
@@ -151,11 +152,21 @@ enum AudioWindowKey {
 
 #[derive(Debug)]
 enum AudioWindowCommand {
-    PlayFile { path: PathBuf, source: AudioWindowKey },
-    PlayData { label: String, wav_bytes: Vec<u8>, source: AudioWindowKey },
+    PlayFile {
+        path: PathBuf,
+        source: AudioWindowKey,
+    },
+    PlayData {
+        label: String,
+        wav_bytes: Vec<u8>,
+        source: AudioWindowKey,
+    },
     PauseResume(AudioWindowKey),
     Stop(AudioWindowKey),
-    Seek { seconds: f32, source: AudioWindowKey },
+    Seek {
+        seconds: f32,
+        source: AudioWindowKey,
+    },
     SetVolume(f32),
 }
 
@@ -217,6 +228,7 @@ pub struct ModToolApp {
     scn_scene_models: Vec<SceneGeoModel>,
     scn_scene_models_path: Option<PathBuf>,
     scn_scene_unresolved: Vec<String>,
+    scn_marker_geo_overrides: std::collections::HashMap<usize, String>,
     scn_scene_error: Option<String>,
     selected_scn_node: Option<usize>,
     selected_scn_chunk: Option<usize>,
@@ -356,6 +368,7 @@ impl ModToolApp {
             scn_scene_models: Vec::new(),
             scn_scene_models_path: None,
             scn_scene_unresolved: Vec::new(),
+            scn_marker_geo_overrides: std::collections::HashMap::new(),
             scn_scene_error: None,
             selected_scn_node: None,
             selected_scn_chunk: None,
@@ -434,6 +447,7 @@ impl ModToolApp {
                     self.scn_scene_models.clear();
                     self.scn_scene_models_path = None;
                     self.scn_scene_unresolved.clear();
+                    self.scn_marker_geo_overrides.clear();
                     self.scn_scene_error = None;
                     self.selected_scn_node = None;
                     self.selected_scn_chunk = None;
@@ -513,6 +527,7 @@ impl ModToolApp {
                     self.scn_scene_models.clear();
                     self.scn_scene_models_path = None;
                     self.scn_scene_unresolved.clear();
+                    self.scn_marker_geo_overrides.clear();
                     self.scn_scene_error = None;
                     self.scn_viewer = GeoViewerState::default();
                     self.scn_view_height = 520.0;
@@ -1505,7 +1520,11 @@ impl ModToolApp {
 
         let (bnk_file, selected_entry, error) = match load_bnk(path) {
             Ok(bnk) => {
-                let selected_entry = if bnk.entries.is_empty() { None } else { Some(0) };
+                let selected_entry = if bnk.entries.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                };
                 (Some(bnk), selected_entry, None)
             }
             Err(err) => (None, None, Some(err.to_string())),
@@ -1542,9 +1561,9 @@ impl ModToolApp {
 
         let preview_len = data.len().min(MAX_PREVIEW_BYTES);
         let sample = &data[..preview_len];
-        let looks_text = sample.iter().all(|byte| {
-            matches!(*byte, b'\n' | b'\r' | b'\t') || (*byte >= 0x20 && *byte < 0x7F)
-        });
+        let looks_text = sample
+            .iter()
+            .all(|byte| matches!(*byte, b'\n' | b'\r' | b'\t') || (*byte >= 0x20 && *byte < 0x7F));
 
         if looks_text {
             let mut text = String::from_utf8_lossy(sample).to_string();
@@ -1685,7 +1704,9 @@ impl ModToolApp {
                 reset_geo_viewer(&mut viewer, &geo);
 
                 for texture_name in &geo.texture_names {
-                    let preview = if let Some(tex_path) = Self::guess_geo_texture_path(path, texture_name) {
+                    let preview = if let Some(tex_path) =
+                        Self::guess_geo_texture_path(path, texture_name)
+                    {
                         match load_dds_preview(ctx, &tex_path) {
                             Ok(preview) => Some(preview),
                             Err(err) => {
@@ -1704,7 +1725,10 @@ impl ModToolApp {
                 texture_refs = self.model_texture_refs_for_geo(path, &geo);
 
                 if geo.skeleton.is_some()
-                    && matches!(geo.asset_type, GeoAssetType::SkinnedMesh | GeoAssetType::RigidProp)
+                    && matches!(
+                        geo.asset_type,
+                        GeoAssetType::SkinnedMesh | GeoAssetType::RigidProp
+                    )
                 {
                     animation_groups = self.animations_for_geo_grouped(path);
                 }
@@ -1745,6 +1769,30 @@ impl ModToolApp {
         self.status = format!("Opened GEO preview: {}", path.display());
     }
 
+    fn scn_preview_geo_path_for_stem(&self, stem: &str) -> Option<PathBuf> {
+        let key = stem
+            .trim()
+            .trim_end_matches(".geo")
+            .to_ascii_lowercase();
+
+        if key.is_empty() {
+            return None;
+        }
+
+        self.scn_scene_models
+            .iter()
+            .find(|model| {
+                model.archetype.eq_ignore_ascii_case(&key)
+                    || model
+                        .path
+                        .file_stem()
+                        .and_then(|name| name.to_str())
+                        .map(|name| name.eq_ignore_ascii_case(&key))
+                        .unwrap_or(false)
+            })
+            .map(|model| model.path.clone())
+    }
+
     fn set_geo_window_animation(window: &mut GeoPreviewWindow, path: PathBuf) {
         window.active_animation = Some(path.clone());
         window.active_animation_file = None;
@@ -1763,7 +1811,10 @@ impl ModToolApp {
         }
     }
 
-    fn update_geo_preview_window_animation_clock(ctx: &egui::Context, window: &mut GeoPreviewWindow) {
+    fn update_geo_preview_window_animation_clock(
+        ctx: &egui::Context,
+        window: &mut GeoPreviewWindow,
+    ) {
         if !window.active_animation_playing {
             return;
         }
@@ -1863,7 +1914,9 @@ impl ModToolApp {
                             if let Some(tex_name) = geo.texture_names.get(subset.material) {
                                 ui.label(" -> ");
 
-                                if let Some(tex_ref) = texture_refs.iter().find(|t| t.name == *tex_name) {
+                                if let Some(tex_ref) =
+                                    texture_refs.iter().find(|t| t.name == *tex_name)
+                                {
                                     match &tex_ref.resolved_path {
                                         Some(path) => {
                                             if ui.small_button(tex_name).clicked() {
@@ -1953,7 +2006,11 @@ impl ModToolApp {
             }
 
             ui.horizontal(|ui| {
-                let play_label = if window.active_animation_playing { "Pause" } else { "Play" };
+                let play_label = if window.active_animation_playing {
+                    "Pause"
+                } else {
+                    "Play"
+                };
                 if ui.button(play_label).clicked() {
                     window.active_animation_playing = !window.active_animation_playing;
                 }
@@ -2033,7 +2090,10 @@ impl ModToolApp {
                     ui.separator();
 
                     if let Some(err) = &window.error {
-                        ui.colored_label(egui::Color32::RED, format!("Could not read GEO: {}", err));
+                        ui.colored_label(
+                            egui::Color32::RED,
+                            format!("Could not read GEO: {}", err),
+                        );
                         return;
                     }
 
@@ -2088,7 +2148,10 @@ impl ModToolApp {
                     }
 
                     if let Some(err) = &window.material_error {
-                        ui.colored_label(egui::Color32::YELLOW, format!("Texture load warning: {}", err));
+                        ui.colored_label(
+                            egui::Color32::YELLOW,
+                            format!("Texture load warning: {}", err),
+                        );
                     }
 
                     ui.separator();
@@ -2140,7 +2203,9 @@ impl ModToolApp {
 
     fn execute_audio_window_command(&mut self, command: AudioWindowCommand) {
         match command {
-            AudioWindowCommand::PlayFile { path, source } => self.play_audio_file_path(path, source),
+            AudioWindowCommand::PlayFile { path, source } => {
+                self.play_audio_file_path(path, source)
+            }
             AudioWindowCommand::PlayData {
                 label,
                 wav_bytes,
@@ -2277,7 +2342,9 @@ impl ModToolApp {
                     }
                 }
             }
-            AudioWindowCommand::PlayData { label, wav_bytes, .. } => {
+            AudioWindowCommand::PlayData {
+                label, wav_bytes, ..
+            } => {
                 if !Self::ensure_preview_audio_player(player, audio_error) {
                     return;
                 }
@@ -2337,7 +2404,11 @@ impl ModToolApp {
         let has_active_audio = is_active && !is_empty;
 
         ui.horizontal(|ui| {
-            let pause_label = if has_active_audio && is_paused { "Resume" } else { "Pause" };
+            let pause_label = if has_active_audio && is_paused {
+                "Resume"
+            } else {
+                "Pause"
+            };
             if ui
                 .add_enabled(has_active_audio, egui::Button::new(pause_label))
                 .clicked()
@@ -2364,7 +2435,11 @@ impl ModToolApp {
         });
 
         let shown_position_secs = if has_active_audio { position_secs } else { 0.0 };
-        let shown_duration_secs = if has_active_audio { duration_secs } else { None };
+        let shown_duration_secs = if has_active_audio {
+            duration_secs
+        } else {
+            None
+        };
         let max_secs = shown_duration_secs.unwrap_or(shown_position_secs.max(1.0));
         let mut timeline_secs = shown_position_secs.min(max_secs);
 
@@ -2544,13 +2619,20 @@ impl ModToolApp {
                                         }
                                     }
                                 } else {
-                                    window.audio_error = Some("Select a BNK entry first.".to_owned());
+                                    window.audio_error =
+                                        Some("Select a BNK entry first.".to_owned());
                                 }
                             }
                         });
 
-                        let (is_paused, is_empty, volume, position_secs, duration_secs, now_playing) =
-                            Self::audio_snapshot_for(window.audio_player.as_ref());
+                        let (
+                            is_paused,
+                            is_empty,
+                            volume,
+                            position_secs,
+                            duration_secs,
+                            now_playing,
+                        ) = Self::audio_snapshot_for(window.audio_player.as_ref());
 
                         if !is_empty && !is_paused {
                             ctx.request_repaint_after(Duration::from_secs_f32(1.0 / 60.0));
@@ -2663,7 +2745,10 @@ impl ModToolApp {
                         .and_then(|ext| ext.to_str())
                         .unwrap_or("(none)");
                     let category = classify_path(&window.path);
-                    let size = fs::metadata(&window.path).ok().map(|m| m.len()).unwrap_or(0);
+                    let size = fs::metadata(&window.path)
+                        .ok()
+                        .map(|m| m.len())
+                        .unwrap_or(0);
 
                     ui.horizontal_wrapped(|ui| {
                         ui.label(format!("Extension: {ext}"));
@@ -3138,6 +3223,7 @@ impl ModToolApp {
         self.scn_scene_models.clear();
         self.scn_scene_models_path = None;
         self.scn_scene_unresolved.clear();
+        self.scn_marker_geo_overrides.clear();
         self.scn_scene_error = None;
         self.selected_scn_node = None;
         self.selected_scn_chunk = None;
@@ -3190,12 +3276,28 @@ impl ModToolApp {
             }
         }
 
+        let scn_parent = path.parent().map(|parent| parent.to_path_buf());
+
+        let is_in_scn_folder = |candidate: &Path| {
+            scn_parent
+                .as_ref()
+                .and_then(|parent| {
+                    candidate
+                        .parent()
+                        .map(|candidate_parent| candidate_parent == parent.as_path())
+                })
+                .unwrap_or(false)
+        };
+
         let mut geo_by_stem = std::collections::HashMap::<String, PathBuf>::new();
+
         for node in model_nodes {
+            if !is_in_scn_folder(&node.path) {
+                continue;
+            }
+
             if let Some(stem) = node.path.file_stem().and_then(|s| s.to_str()) {
-                geo_by_stem
-                    .entry(stem.to_ascii_lowercase())
-                    .or_insert_with(|| node.path.clone());
+                geo_by_stem.insert(stem.to_ascii_lowercase(), node.path.clone());
             }
         }
 
@@ -3207,11 +3309,18 @@ impl ModToolApp {
             }
         }
 
+        let marker_geo_overrides = Self::infer_scn_marker_geo_overrides(&scn, &geo_by_stem, &path);
+
         let mut loaded = Vec::new();
         let mut unresolved = Vec::new();
         let mut failed = Vec::new();
 
-        for archetype in archetypes {
+        let mut model_keys = archetypes.clone();
+        for stem in marker_geo_overrides.values() {
+            model_keys.insert(stem.clone());
+        }
+
+        for archetype in model_keys {
             match geo_by_stem.get(&archetype) {
                 Some(model_path) => match load_geo(model_path) {
                     Ok(geo) => {
@@ -3254,7 +3363,11 @@ impl ModToolApp {
                         failed.push(format!("{archetype}: {err}"));
                     }
                 },
-                None => unresolved.push(archetype),
+                None => {
+                    if archetypes.contains(&archetype) {
+                        unresolved.push(archetype);
+                    }
+                }
             }
         }
 
@@ -3288,6 +3401,7 @@ impl ModToolApp {
 
         self.scn_scene_models = loaded;
         self.scn_scene_unresolved = unresolved;
+        self.scn_marker_geo_overrides = marker_geo_overrides;
 
         if !failed.is_empty() {
             self.scn_scene_error = Some(format!(
@@ -3298,6 +3412,317 @@ impl ModToolApp {
         }
 
         reset_scene_viewer(&mut self.scn_viewer, &scn);
+    }
+
+    fn existing_geo_stem(
+        geo_by_stem: &std::collections::HashMap<String, PathBuf>,
+        stem: &str,
+    ) -> Option<String> {
+        let key = stem.trim().to_ascii_lowercase();
+        geo_by_stem.contains_key(&key).then_some(key)
+    }
+
+    fn trailing_number(value: &str) -> Option<usize> {
+        let digits_rev: String = value
+            .chars()
+            .rev()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect();
+
+        if digits_rev.is_empty() {
+            return None;
+        }
+
+        digits_rev.chars().rev().collect::<String>().parse().ok()
+    }
+
+    fn strip_trailing_number(value: &str) -> &str {
+        value
+            .trim_end_matches(|ch: char| ch.is_ascii_digit())
+            .trim_end_matches(|ch: char| ch == '_' || ch == '-' || ch == ' ')
+    }
+
+    fn existing_variant_by_number(
+        geo_by_stem: &std::collections::HashMap<String, PathBuf>,
+        number: usize,
+        variants: &[&str],
+        zero_based: bool,
+    ) -> Option<String> {
+        if variants.is_empty() {
+            return None;
+        }
+
+        let index = if zero_based {
+            number % variants.len()
+        } else {
+            number.saturating_sub(1) % variants.len()
+        };
+
+        Self::existing_geo_stem(geo_by_stem, variants[index])
+    }
+
+    fn existing_numbered_stem(
+        geo_by_stem: &std::collections::HashMap<String, PathBuf>,
+        prefix: &str,
+        number: usize,
+        variant_count: usize,
+        zero_based: bool,
+    ) -> Option<String> {
+        if variant_count == 0 {
+            return None;
+        }
+
+        let index = if zero_based {
+            number % variant_count
+        } else {
+            number.saturating_sub(1) % variant_count
+        };
+        let display_number = if zero_based { index } else { index + 1 };
+        let stem = format!("{prefix}{display_number:02}");
+        Self::existing_geo_stem(geo_by_stem, &stem)
+    }
+
+    fn existing_marker_prefix_alias(
+        geo_by_stem: &std::collections::HashMap<String, PathBuf>,
+        marker_name: &str,
+        aliases: &[(&str, &str)],
+    ) -> Option<String> {
+        aliases.iter().find_map(|(marker_prefix, geo_stem)| {
+            marker_name
+                .starts_with(marker_prefix)
+                .then(|| Self::existing_geo_stem(geo_by_stem, geo_stem))
+                .flatten()
+        })
+    }
+
+    fn infer_folder_marker_geo_stem(
+        folder_name: &str,
+        marker_name: &str,
+        geo_by_stem: &std::collections::HashMap<String, PathBuf>,
+    ) -> Option<String> {
+        let number = Self::trailing_number(marker_name);
+
+        match folder_name {
+            "daffyd" => {
+                if marker_name == "player_start" {
+                    return Self::existing_geo_stem(geo_by_stem, "dafydd");
+                }
+                if marker_name.starts_with("myfanwy") {
+                    return Self::existing_geo_stem(geo_by_stem, "myfanwy");
+                }
+                if marker_name.starts_with("gay") {
+                    return Self::existing_variant_by_number(
+                        geo_by_stem,
+                        number.unwrap_or(1),
+                        &["gay_a", "gay_b", "gay_c", "gay_d", "gay_e", "gay_f"],
+                        false,
+                    );
+                }
+                if marker_name.starts_with("cyclist") {
+                    return Self::existing_variant_by_number(
+                        geo_by_stem,
+                        number.unwrap_or(1),
+                        &["cyclist", "cyclist_b", "cyclist_c"],
+                        false,
+                    );
+                }
+                if marker_name.starts_with("car_movingleft") {
+                    return Self::existing_numbered_stem(
+                        geo_by_stem,
+                        "car",
+                        number.unwrap_or(1),
+                        6,
+                        false,
+                    );
+                }
+            }
+            "vicky" => {
+                if marker_name == "player_start" {
+                    return Self::existing_geo_stem(geo_by_stem, "vicky");
+                }
+            }
+            "divinggame" => {
+                if marker_name.starts_with("loustand") {
+                    return Self::existing_geo_stem(geo_by_stem, "lou");
+                }
+                if marker_name.starts_with("lifeguardstand") {
+                    return Self::existing_geo_stem(geo_by_stem, "lifeguard");
+                }
+                if marker_name == "chairnode" {
+                    return Self::existing_geo_stem(geo_by_stem, "andy");
+                }
+                if marker_name == "render_chair" {
+                    return Self::existing_geo_stem(geo_by_stem, "wheelchair");
+                }
+                if marker_name.starts_with("board") && !marker_name.starts_with("boardlocator") {
+                    return Self::existing_geo_stem(geo_by_stem, "board");
+                }
+            }
+            "footballgame" => {
+                if marker_name == "emily_start" {
+                    return Self::existing_geo_stem(geo_by_stem, "emily");
+                }
+                if marker_name == "startposition" {
+                    return Self::existing_geo_stem(geo_by_stem, "florence");
+                }
+                if marker_name == "goalcentre" {
+                    return Self::existing_geo_stem(geo_by_stem, "goalkeeper");
+                }
+                if marker_name.starts_with("defender") {
+                    return Self::existing_numbered_stem(
+                        geo_by_stem,
+                        "football_kid",
+                        number.unwrap_or(0) + 1,
+                        5,
+                        false,
+                    );
+                }
+                if marker_name.starts_with("targetzone") {
+                    return Self::existing_geo_stem(geo_by_stem, "target");
+                }
+            }
+            "froggame" | "pccharacterviewer" => {
+                if marker_name.starts_with("letty_pos") {
+                    return Self::existing_geo_stem(geo_by_stem, "letty");
+                }
+                if marker_name == "start_point" {
+                    return Self::existing_geo_stem(geo_by_stem, "frog");
+                }
+
+                return Self::existing_marker_prefix_alias(
+                    geo_by_stem,
+                    marker_name,
+                    &[
+                        ("softfrog01a", "softfrog1a"),
+                        ("softfrog01", "softfrog1"),
+                        ("softfrog02", "softfrog2"),
+                        ("beachball", "beachball"),
+                        ("ornament01", "ornament01"),
+                        ("globefrog", "globefrog"),
+                        ("cushion", "cushion"),
+                        ("prince", "prince"),
+                        ("phone", "phone"),
+                        ("clock", "clock"),
+                        ("cake", "cake"),
+                        ("bowl01a", "bowl01a"),
+                        ("bowl01", "bowl01"),
+                        ("vase02a", "vase02a"),
+                        ("vase02", "vase02"),
+                        ("vase01a", "vase01a"),
+                        ("vase01", "vase01"),
+                    ],
+                );
+            }
+            "maggieandjudy" => {
+                if marker_name.ends_with("_teacup") {
+                    return Self::existing_geo_stem(geo_by_stem, "teacup");
+                }
+                if marker_name.ends_with("_plate") || marker_name == "plate_position" {
+                    return Self::existing_geo_stem(geo_by_stem, "plate");
+                }
+
+                return Self::existing_marker_prefix_alias(
+                    geo_by_stem,
+                    marker_name,
+                    &[
+                        ("brownie", "brownie"),
+                        ("maggie", "maggie"),
+                        ("judy", "judy"),
+                        ("vicar", "vicar"),
+                        ("mp", "mp"),
+                    ],
+                );
+            }
+            "pirategame" => {
+                if marker_name == "board" {
+                    return Self::existing_geo_stem(geo_by_stem, "board");
+                }
+                if marker_name.starts_with("pirate") {
+                    return Self::existing_numbered_stem(
+                        geo_by_stem,
+                        "pirate",
+                        number.unwrap_or(0),
+                        10,
+                        true,
+                    );
+                }
+                if marker_name.starts_with("line_pos") {
+                    return Self::existing_numbered_stem(
+                        geo_by_stem,
+                        "line",
+                        number.unwrap_or(0),
+                        10,
+                        true,
+                    );
+                }
+            }
+            _ => {}
+        }
+
+        None
+    }
+
+    fn infer_marker_geo_stem(
+        marker_name: &str,
+        folder_name: &str,
+        geo_by_stem: &std::collections::HashMap<String, PathBuf>,
+    ) -> Option<String> {
+        let marker_name = marker_name.trim().to_ascii_lowercase();
+        if marker_name.is_empty() {
+            return None;
+        }
+
+        if marker_name.starts_with("camera")
+            || marker_name.starts_with("cameratarget")
+            || marker_name.starts_with("checkpoint")
+            || marker_name.starts_with("path")
+            || marker_name.starts_with("lane")
+            || marker_name.starts_with("return")
+            || marker_name.starts_with("tochair")
+        {
+            return None;
+        }
+
+        if let Some(stem) =
+            Self::infer_folder_marker_geo_stem(folder_name, &marker_name, geo_by_stem)
+        {
+            return Some(stem);
+        }
+
+        if let Some(stem) = Self::existing_geo_stem(geo_by_stem, &marker_name) {
+            return Some(stem);
+        }
+
+        let stripped = Self::strip_trailing_number(&marker_name);
+        if stripped != marker_name {
+            if let Some(stem) = Self::existing_geo_stem(geo_by_stem, stripped) {
+                return Some(stem);
+            }
+        }
+
+        None
+    }
+
+    fn infer_scn_marker_geo_overrides(
+        scn: &ScnFile,
+        geo_by_stem: &std::collections::HashMap<String, PathBuf>,
+        scn_path: &Path,
+    ) -> std::collections::HashMap<usize, String> {
+        let folder_name = scn_path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .map(|name| name.to_ascii_lowercase())
+            .unwrap_or_default();
+
+        let mut out = std::collections::HashMap::new();
+        for node in scn.nodes.iter().filter(|node| node.is_marker()) {
+            if let Some(stem) = Self::infer_marker_geo_stem(&node.name, &folder_name, geo_by_stem) {
+                out.insert(node.index, stem);
+            }
+        }
+
+        out
     }
 
     fn find_file_case_insensitive(folder: &Path, filename: &str) -> Option<PathBuf> {
@@ -3770,10 +4195,20 @@ impl ModToolApp {
         ui.label(format!("Nodes: {}", scn.nodes.len()));
         ui.label(format!("Renderable nodes: {}", scn.renderable_count()));
         ui.label(format!("Marker nodes: {}", scn.marker_count()));
-        ui.label(format!("Embedded chunks: {}", scn.embedded_mesh_chunk_count()));
+        ui.label(format!(
+            "Embedded chunks: {}",
+            scn.embedded_mesh_chunk_count()
+        ));
         ui.label(format!("Embedded tris: {}", scn.embedded_triangle_count()));
         ui.label(format!("Resolved GEOs: {}", self.scn_scene_models.len()));
-        ui.label(format!("Missing archetypes: {}", self.scn_scene_unresolved.len()));
+        ui.label(format!(
+            "Marker GEO previews: {}",
+            self.scn_marker_geo_overrides.len()
+        ));
+        ui.label(format!(
+            "Missing archetypes: {}",
+            self.scn_scene_unresolved.len()
+        ));
         ui.label(format!("Hidden nodes: {}", self.hidden_scn_nodes.len()));
         ui.label(format!("Hidden chunks: {}", self.hidden_scn_chunks.len()));
 
@@ -3975,6 +4410,8 @@ impl ModToolApp {
 
         let lower = cleaned.to_ascii_lowercase();
 
+        Self::push_unique_limited(&mut map.raw_tokens, cleaned, 12000);
+
         if Self::looks_like_asset_ref(cleaned) {
             Self::push_unique_limited(&mut map.asset_refs, cleaned, 2500);
         }
@@ -4100,7 +4537,17 @@ impl ModToolApp {
     fn scan_game_code_map(game_root: &Path) -> GameCodeMap {
         let mut map = GameCodeMap::default();
 
-        let exe_path = game_root.join("LittleBritain.exe");
+        let code_root = if game_root.join("LittleBritain.exe").is_file() {
+            game_root.to_path_buf()
+        } else {
+            game_root
+                .parent()
+                .filter(|parent| parent.join("LittleBritain.exe").is_file())
+                .map(|parent| parent.to_path_buf())
+                .unwrap_or_else(|| game_root.to_path_buf())
+        };
+
+        let exe_path = code_root.join("LittleBritain.exe");
         if exe_path.is_file() {
             map.exe_path = Some(exe_path.clone());
         } else {
@@ -4110,7 +4557,7 @@ impl ModToolApp {
             ));
         }
 
-        let symbol_dump_path = game_root.join("COMPLETE_symbol_dump.h");
+        let symbol_dump_path = code_root.join("COMPLETE_symbol_dump.h");
         if symbol_dump_path.is_file() {
             if let Err(err) = Self::ingest_symbol_dump(&mut map, &symbol_dump_path) {
                 map.error = Some(format!(
@@ -4121,7 +4568,7 @@ impl ModToolApp {
             }
         }
 
-        let strings_path = game_root.join("strings.txt");
+        let strings_path = code_root.join("strings.txt");
         if strings_path.is_file() {
             match fs::read(&strings_path) {
                 Ok(bytes) => {
@@ -4141,10 +4588,15 @@ impl ModToolApp {
                     map.error = Some(format!("Could not read strings.txt: {err}"));
                 }
             }
-        } else if exe_path.is_file() {
+        }
+
+        if exe_path.is_file() {
             match fs::read(&exe_path) {
                 Ok(bytes) => {
-                    for token in Self::extract_ascii_strings(&bytes, 4) {
+                    for token in Self::extract_ascii_strings(&bytes, 4)
+                        .into_iter()
+                        .chain(Self::extract_utf16le_strings(&bytes, 4))
+                    {
                         Self::ingest_game_code_token(&mut map, &token);
                     }
                 }
@@ -4154,7 +4606,7 @@ impl ModToolApp {
             }
         }
 
-        Self::scan_modloader_bridge(&mut map, game_root);
+        Self::scan_modloader_bridge(&mut map, &code_root);
 
         map
     }
@@ -4169,7 +4621,7 @@ impl ModToolApp {
         }
     }
 
-    fn hardcoded_refs_for_selected_path(path: &Path, map: &GameCodeMap) -> Vec<String> {
+    fn code_refs_for_selected_path(path: &Path, map: &GameCodeMap) -> Vec<String> {
         let mut sibling_names = std::collections::BTreeSet::new();
 
         if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
@@ -4267,7 +4719,7 @@ impl ModToolApp {
                 }
 
                 if let Some(path) = selected_path {
-                    let refs = Self::hardcoded_refs_for_selected_path(path, map);
+                    let refs = Self::code_refs_for_selected_path(path, map);
                     egui::CollapsingHeader::new(format!(
                         "Hardcoded refs matching this folder ({})",
                         refs.len()
@@ -4652,7 +5104,9 @@ impl ModToolApp {
         hidden_scn_chunks: &mut std::collections::BTreeSet<usize>,
         scn_viewer: &mut GeoViewerState,
         embedded_texture_previews: &std::collections::HashMap<String, DdsPreview>,
+        marker_geo_overrides: &std::collections::HashMap<usize, String>,
         pending_embedded_texture_preview: &mut Option<(String, DdsPreview)>,
+        pending_marker_geo_preview: &mut Option<String>,
     ) {
         if !scn_scene_unresolved.is_empty() {
             egui::CollapsingHeader::new("Missing archetypes")
@@ -4685,7 +5139,7 @@ impl ModToolApp {
 
         let mut grouped_markers: std::collections::BTreeMap<
             String,
-            Vec<(usize, String, [f32; 3], u32, u16)>,
+            Vec<(usize, String, [f32; 3], u32, u16, Option<String>)>,
         > = std::collections::BTreeMap::new();
 
         for node in scn.nodes.iter().filter(|node| node.is_marker()) {
@@ -4698,6 +5152,7 @@ impl ModToolApp {
                     node.translation,
                     node.record_offset,
                     node.flags,
+                    marker_geo_overrides.get(&node.index).cloned(),
                 ));
         }
 
@@ -4723,17 +5178,32 @@ impl ModToolApp {
                             egui::CollapsingHeader::new(format!("{} ({})", kind, markers.len()))
                                 .default_open(false)
                                 .show(ui, |ui| {
-                                    for (index, name, translation, record_offset, flags) in markers
+                                    for (
+                                        index,
+                                        name,
+                                        translation,
+                                        record_offset,
+                                        flags,
+                                        preview_geo,
+                                    ) in markers
                                     {
                                         let display_name = if name.trim().is_empty() {
                                             "(unnamed)"
                                         } else {
                                             name.as_str()
                                         };
-                                        let label = format!("#{:04} {}", index, display_name);
+                                        let label = preview_geo
+                                            .as_ref()
+                                            .map(|stem| {
+                                                format!("#{:04} {}  [geo: {}]", index, display_name, stem)
+                                            })
+                                            .unwrap_or_else(|| {
+                                                format!("#{:04} {}", index, display_name)
+                                            });
                                         let hover_text = format!(
-                                            "kind={}\npos=({:.2}, {:.2}, {:.2})\nrec=0x{:08X}\nflags=0x{:04X}",
+                                            "kind={}\npreview_geo={}\npos=({:.2}, {:.2}, {:.2})\nrec=0x{:08X}\nflags=0x{:04X}",
                                             kind,
+                                            preview_geo.as_deref().unwrap_or("(none)"),
                                             translation[0],
                                             translation[1],
                                             translation[2],
@@ -5065,6 +5535,14 @@ impl ModToolApp {
                                 "Marker kind: {}",
                                 Self::scn_marker_kind(&node.name)
                             ));
+                            if let Some(preview_geo) = marker_geo_overrides.get(&node.index) {
+                                ui.horizontal(|ui| {
+                                    ui.label("Preview GEO:");
+                                    if ui.button(preview_geo).clicked() {
+                                        *pending_marker_geo_preview = Some(preview_geo.clone());
+                                    }
+                                });
+                            }
                         }
 
                         ui.separator();
@@ -5269,6 +5747,7 @@ impl eframe::App for ModToolApp {
         let mut pending_jump: Option<PathBuf> = None;
         let mut pending_texture_preview_path: Option<PathBuf> = None;
         let mut pending_embedded_texture_preview: Option<(String, DdsPreview)> = None;
+        let mut pending_marker_geo_preview: Option<String> = None;
         if let Some(player) = self.audio_player.as_ref() {
             if !player.is_empty() {
                 ui.ctx().request_repaint();
@@ -5349,7 +5828,9 @@ impl eframe::App for ModToolApp {
                                     &mut self.hidden_scn_chunks,
                                     &mut self.scn_viewer,
                                     &self.scn_embedded_texture_previews,
+                                    &self.scn_marker_geo_overrides,
                                     &mut pending_embedded_texture_preview,
+                                    &mut pending_marker_geo_preview,
                                 );
 
                                 ui.separator();
@@ -6119,6 +6600,7 @@ impl eframe::App for ModToolApp {
                                 selected_scene_item,
                                 &self.hidden_scn_nodes,
                                 &self.hidden_scn_chunks,
+                                &self.scn_marker_geo_overrides,
                             ) {
                                 Self::apply_scn_selection(
                                     &mut self.selected_scn_node,
@@ -6650,6 +7132,17 @@ impl eframe::App for ModToolApp {
 
         if let Some((title, preview)) = pending_embedded_texture_preview {
             self.open_texture_preview_window(title, preview);
+        }
+
+        if let Some(preview_geo) = pending_marker_geo_preview {
+            if let Some(path) = self.scn_preview_geo_path_for_stem(&preview_geo) {
+                self.open_geo_preview_window(ui.ctx(), &path);
+            } else {
+                self.status = format!(
+                    "Could not find GEO preview file for marker preview: {}",
+                    preview_geo
+                );
+            }
         }
 
         if let Some(path) = pending_texture_preview_path {

@@ -291,10 +291,7 @@ pub fn draw_geo_viewer(
         ui.checkbox(&mut state.cull_backfaces, "Cull");
 
         ui.separator();
-        ui.add(
-            egui::Slider::new(&mut state.move_speed, 0.1..=20.0)
-                .text("Fly speed"),
-        );
+        ui.add(egui::Slider::new(&mut state.move_speed, 0.1..=20.0).text("Fly speed"));
 
         ui.separator();
         ui.small("GPU viewport: RMB look | MMB orbit model | wheel zoom | WASD fly | Q/E up/down");
@@ -402,6 +399,7 @@ pub fn draw_scene_viewer(
     selected: Option<SceneSelection>,
     hidden_nodes: &BTreeSet<usize>,
     hidden_chunks: &BTreeSet<usize>,
+    marker_geo_overrides: &HashMap<usize, String>,
 ) -> Option<SceneSelection> {
     ui.horizontal(|ui| {
         if ui.button("Reset view").clicked() {
@@ -444,7 +442,7 @@ pub fn draw_scene_viewer(
         .sum();
 
     let scene_key = format!(
-        "scn:{}#nodes:{}#models:{}#embtex:{}#mdltex:{}#hidden_nodes:{:016x}#hidden_chunks:{:016x}#selection:{}#edit:{}",
+        "scn:{}#nodes:{}#models:{}#embtex:{}#mdltex:{}#hidden_nodes:{:016x}#hidden_chunks:{:016x}#marker_geos:{}#selection:{}#edit:{}",
         scn.path.display(),
         scn.nodes.len(),
         models.len(),
@@ -452,6 +450,7 @@ pub fn draw_scene_viewer(
         model_texture_state,
         visibility_set_hash(hidden_nodes),
         visibility_set_hash(hidden_chunks),
+        marker_geo_overrides.len(),
         scene_selection_cache_tag(selected),
         state.scene_edit_revision,
     );
@@ -465,6 +464,7 @@ pub fn draw_scene_viewer(
             hidden_chunks,
             selected,
             scene_key.clone(),
+            marker_geo_overrides,
         ));
         state.scene_key = Some(scene_key);
     }
@@ -1878,6 +1878,7 @@ fn build_cpu_scene_from_scn(
     hidden_chunks: &BTreeSet<usize>,
     selected: Option<SceneSelection>,
     key: String,
+    marker_geo_overrides: &HashMap<usize, String>,
 ) -> Arc<CpuScene> {
     let geo_by_archetype: HashMap<String, &SceneGeoModel> = models
         .iter()
@@ -1937,7 +1938,13 @@ fn build_cpu_scene_from_scn(
         let marker_pos = to_view_space(node.translation);
         update_bounds(marker_pos);
 
-        if node.is_marker() {
+        let marker_geo_key = node
+            .is_marker()
+            .then(|| marker_geo_overrides.get(&node.index))
+            .flatten()
+            .map(|stem| stem.trim().to_ascii_lowercase());
+
+        if node.is_marker() && marker_geo_key.is_none() {
             let (marker_color, marker_size) = scene_marker_style(&node.name);
             let marker_color = if selected == Some(SceneSelection::Node(node.index)) {
                 selected_scene_tint_color()
@@ -1945,6 +1952,7 @@ fn build_cpu_scene_from_scn(
                 marker_color
             };
             append_scene_marker_lines(&mut marker_lines, marker_pos, marker_size, marker_color);
+
             pick_targets.push(ScenePickTarget {
                 selection: SceneSelection::Node(node.index),
                 center: marker_pos,
@@ -1953,8 +1961,24 @@ fn build_cpu_scene_from_scn(
             continue;
         }
 
-        let archetype_key = node.archetype.trim().to_ascii_lowercase();
+        let archetype_key =
+            marker_geo_key.unwrap_or_else(|| node.archetype.trim().to_ascii_lowercase());
         let Some(model) = geo_by_archetype.get(&archetype_key) else {
+            if node.is_marker() {
+                let (marker_color, marker_size) = scene_marker_style(&node.name);
+                let marker_color = if selected == Some(SceneSelection::Node(node.index)) {
+                    selected_scene_tint_color()
+                } else {
+                    marker_color
+                };
+                append_scene_marker_lines(&mut marker_lines, marker_pos, marker_size, marker_color);
+
+                pick_targets.push(ScenePickTarget {
+                    selection: SceneSelection::Node(node.index),
+                    center: marker_pos,
+                    radius: marker_size,
+                });
+            }
             continue;
         };
 
@@ -3622,7 +3646,7 @@ fn orbit_eye_around_target(state: &mut GeoViewerState, target: [f32; 3], delta: 
         .max(NEAR_PLANE + 0.01);
 
     state.distance = current_distance;
-    state.yaw -= delta.x * 0.01;
+    state.yaw -= delta.x * 0.005;
     state.pitch = (state.pitch - delta.y * 0.01).clamp(-1.10, 1.10);
     state.eye = eye_from_target(state.yaw, state.pitch, state.distance, target);
 }
@@ -3642,14 +3666,14 @@ fn apply_viewer_input(
         if let Some(center) = orbit_center {
             orbit_eye_around_target(state, center, delta);
         } else {
-            state.yaw -= delta.x * 0.01;
+            state.yaw -= delta.x * 0.005;
             state.pitch = (state.pitch - delta.y * 0.01).clamp(-1.10, 1.10);
         }
 
         ui.ctx().request_repaint();
     } else if response.dragged_by(egui::PointerButton::Secondary) {
         let delta = ui.input(|i| i.pointer.delta());
-        state.yaw -= delta.x * 0.01;
+        state.yaw -= delta.x * 0.005;
         state.pitch = (state.pitch - delta.y * 0.01).clamp(-1.10, 1.10);
         ui.ctx().request_repaint();
     }
