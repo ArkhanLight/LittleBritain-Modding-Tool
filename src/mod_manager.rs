@@ -10,6 +10,7 @@ pub struct ModInfo {
     pub description: String,
     pub game_version: String,
     pub dependencies: Vec<String>,
+    pub enabled: bool,
 }
 
 impl Default for ModInfo {
@@ -21,6 +22,7 @@ impl Default for ModInfo {
             description: "My awesome mod".to_string(),
             game_version: "1.0".to_string(),
             dependencies: Vec::new(),
+            enabled: false,
         }
     }
 }
@@ -75,7 +77,7 @@ print("Mod initialization complete")
         Ok(())
     }
     
-    pub fn load_from_path(path: &Path) -> Result<Self, String> {
+pub fn load_from_path(path: &Path) -> Result<Self, String> {
         let config_path = path.join("mod.json");
         if !config_path.exists() {
             return Err("mod.json not found".to_string());
@@ -86,14 +88,14 @@ print("Mod initialization complete")
         let info: ModInfo = serde_json::from_str(&json)
             .map_err(|e| e.to_string())?;
         
-        let mut mod_obj = Mod {
-            info,
-            path: path.to_path_buf(),
-            scripts: Vec::new(),
-            patches: Vec::new(),
-            assets: Vec::new(),
-            enabled: false,
-        };
+    let mut mod_obj = Mod {
+        info,
+        path: path.to_path_buf(),
+        scripts: Vec::new(),
+        patches: Vec::new(),
+        assets: Vec::new(),
+        enabled: info.enabled,
+    };
         
         // Find scripts
         if let Ok(entries) = fs::read_dir(path.join("scripts")) {

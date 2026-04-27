@@ -569,13 +569,21 @@ fn parse_scn_texture_names(data: &[u8], material_ptr: usize) -> Vec<String> {
             break;
         }
 
-        if !trimmed.to_ascii_lowercase().ends_with(".dds") {
-            break;
-        }
-
-        if !out.iter().any(|existing: &String| existing.eq_ignore_ascii_case(trimmed)) {
+        // Important:
+        // SCN texture spans refer to material *slot indices*.
+        // Some slots are not DDS textures, for example "park0_white_3116"
+        // or "level1_white_1582". Do not break or compact the list here,
+        // otherwise later DDS slots shift and render with the wrong texture.
+        if trimmed.to_ascii_lowercase().ends_with(".dds") {
             out.push(trimmed.to_string());
+        } else {
+            out.push(String::new());
         }
+    }
+
+    // Keep internal empty slots, but remove useless trailing placeholders.
+    while out.last().map(|name| name.trim().is_empty()).unwrap_or(false) {
+        out.pop();
     }
 
     out

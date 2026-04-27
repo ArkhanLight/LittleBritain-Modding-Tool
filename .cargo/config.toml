@@ -1,4 +1,4 @@
 [env]
 FFMPEG_DIR = { value = "third_party/ffmpeg-8.1-dist", relative = true }
-PKG_CONFIG = "C:/msys64/usr/bin/pkgconf.exe"
 PKG_CONFIG_PATH = { value = "third_party/ffmpeg-8.1-dist/lib/pkgconfig", relative = true }
+# If pkgconf/pkg-config is not on PATH, set PKG_CONFIG in your shell or user-level Cargo config.

@@ -17,7 +17,7 @@ V0.4
 The full SCN implementation will be finished in the upcoming V0.4B release.
 One of the most important things that is currently missing is the implementation of skeletal meshes. (mainly characters)
 The Supermarket levels in DawesGame only load the geometry but do not display any scene nodes or markers yet.
-Expect some flickering on larger levels because no anti-aliasing method has been implemented yet in the 3D viewer.
+The GEO/SCN viewport now renders through WGPU and uses a 4x MSAA offscreen render target before blitting into egui.
 
 **3D viewport controls**
 Right mouse button -> look around in the viewport

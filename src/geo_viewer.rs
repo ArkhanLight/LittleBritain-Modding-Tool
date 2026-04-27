@@ -21,6 +21,7 @@ use wgpu::util::DeviceExt;
 const NEAR_PLANE: f32 = 0.05;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+const VIEWER_SAMPLE_COUNT: u32 = 4;
 
 const CAMERA_ICON_BYTES: &[u8] = include_bytes!("Icons/Camera.png");
 const CAMERA_TARGET_ICON_BYTES: &[u8] = include_bytes!("Icons/CameraTarget.png");
@@ -63,7 +64,7 @@ pub struct GeoViewerState {
     scene_key: Option<String>,
     cpu_scene: Option<Arc<CpuScene>>,
     scene_preview_cache: BTreeMap<SceneSelection, CachedScenePreview>,
-    scene_gpu_dirty_selections: BTreeSet<SceneSelection>,
+    target_format: Option<wgpu::TextureFormat>,
     frame_targets: Arc<Mutex<Option<FrameTargets>>>,
 
     camera_icon_texture: Option<egui::TextureHandle>,
@@ -97,7 +98,7 @@ impl Default for GeoViewerState {
             scene_key: None,
             cpu_scene: None,
             scene_preview_cache: BTreeMap::new(),
-            scene_gpu_dirty_selections: BTreeSet::new(),
+            target_format: None,
             frame_targets: Arc::new(Mutex::new(None)),
             camera_icon_texture: None,
             camera_target_icon_texture: None,
@@ -106,6 +107,23 @@ impl Default for GeoViewerState {
             generic_icon_texture: None,
             actor_icon_texture: None,
         }
+    }
+}
+
+impl GeoViewerState {
+    pub fn with_target_format(target_format: Option<wgpu::TextureFormat>) -> Self {
+        Self {
+            target_format,
+            ..Self::default()
+        }
+    }
+
+    pub fn gpu_target_format(&self) -> Option<wgpu::TextureFormat> {
+        self.target_format
+    }
+
+    pub fn reset_with_target_format(&mut self, target_format: Option<wgpu::TextureFormat>) {
+        *self = Self::with_target_format(target_format);
     }
 }
 
@@ -298,6 +316,8 @@ struct FrameTargets {
     height: u32,
     _color_texture: wgpu::Texture,
     color_view: wgpu::TextureView,
+    _color_msaa_texture: wgpu::Texture,
+    color_msaa_view: wgpu::TextureView,
     _depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
     blit_bind_group: wgpu::BindGroup,
@@ -336,6 +356,7 @@ struct GeoGpuCallback {
     show_bones: bool,
     show_helpers: bool,
     cull_backfaces: bool,
+    target_format: Option<wgpu::TextureFormat>,
     frame_targets: Arc<Mutex<Option<FrameTargets>>>,
 }
 
@@ -445,6 +466,7 @@ pub fn draw_geo_viewer(
             show_bones: state.show_bones,
             show_helpers: state.show_helpers,
             cull_backfaces: state.cull_backfaces,
+            target_format: state.gpu_target_format(),
             frame_targets: state.frame_targets.clone(),
         },
     );
@@ -470,7 +492,6 @@ pub fn reset_scene_viewer(state: &mut GeoViewerState, scn: &ScnFile) {
     state.scene_key = None;
     state.cpu_scene = None;
     state.scene_preview_cache.clear();
-    state.scene_gpu_dirty_selections.clear();
 }
 
 pub fn focus_scene_viewer_on_point(state: &mut GeoViewerState, world_pos: [f32; 3]) {
@@ -535,7 +556,7 @@ pub fn draw_scene_viewer(
     // matrix instead of rebaking CPU world-space vertex buffers.
 
     let static_scene_key = format!(
-        "scn:{}#nodes:{}#chunks:{}#models:{}#embtex:{}#mdltex:{}#hidden_nodes:{:016x}#hidden_chunks:{:016x}#marker_geos:{}#wire:{}#static_instanced_gpu_v1",
+        "scn:{}#nodes:{}#chunks:{}#models:{}#embtex:{}#mdltex:{}#hidden_nodes:{:016x}#hidden_chunks:{:016x}#marker_geos:{}#wire:{}#static_instanced_gpu_v3",
         scn.path.display(),
         scn.nodes.len(),
         scn.mesh_chunks.len(),
@@ -571,7 +592,6 @@ pub fn draw_scene_viewer(
         // overlay entries are no longer needed except for the current selection.
         state.scene_static_dirty = false;
         state.scene_static_dirty_selection = None;
-        state.scene_gpu_dirty_selections.clear();
         state.scene_preview_cache.clear();
         state.scene_key = Some(static_scene_key);
     }
@@ -685,6 +705,7 @@ pub fn draw_scene_viewer(
             show_bones: state.show_bones,
             show_helpers: state.show_helpers,
             cull_backfaces: state.cull_backfaces,
+            target_format: state.gpu_target_format(),
             frame_targets: state.frame_targets.clone(),
         },
     );
@@ -738,9 +759,13 @@ impl egui_wgpu::CallbackTrait for GeoGpuCallback {
         egui_encoder: &mut wgpu::CommandEncoder,
         callback_resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
-        let surface_format = callback_resources
-            .get::<egui_wgpu::RenderState>()
-            .map(|rs| rs.target_format)
+        let surface_format = self
+            .target_format
+            .or_else(|| {
+                callback_resources
+                    .get::<egui_wgpu::RenderState>()
+                    .map(|rs| rs.target_format)
+            })
             .unwrap_or(wgpu::TextureFormat::Bgra8Unorm);
 
         if !callback_resources.contains::<GpuShared>() {
@@ -753,12 +778,14 @@ impl egui_wgpu::CallbackTrait for GeoGpuCallback {
 
         let gpu_scene = get_or_upload_gpu_scene(device, queue, shared, &self.scene);
         update_gpu_scene_instances(queue, gpu_scene.as_ref(), self.scene.as_ref());
+        update_gpu_scene_dynamic_lines(queue, gpu_scene.as_ref(), self.scene.as_ref());
         let overlay_gpu_scenes: Vec<(&SceneOverlayDraw, Arc<GpuScene>)> = self
             .overlays
             .iter()
             .map(|overlay| {
                 let uploaded = get_or_upload_gpu_scene(device, queue, shared, &overlay.scene);
                 update_gpu_scene_instances(queue, uploaded.as_ref(), overlay.scene.as_ref());
+                update_gpu_scene_dynamic_lines(queue, uploaded.as_ref(), overlay.scene.as_ref());
                 (overlay, uploaded)
             })
             .collect();
@@ -823,9 +850,9 @@ impl egui_wgpu::CallbackTrait for GeoGpuCallback {
             let mut pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("geo_viewer_offscreen_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &frame.color_view,
+                    view: &frame.color_msaa_view,
                     depth_slice: None,
-                    resolve_target: None,
+                    resolve_target: Some(&frame.color_view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 52.0 / 255.0,
@@ -833,7 +860,7 @@ impl egui_wgpu::CallbackTrait for GeoGpuCallback {
                             b: 58.0 / 255.0,
                             a: 1.0,
                         }),
-                        store: wgpu::StoreOp::Store,
+                        store: wgpu::StoreOp::Discard,
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -918,6 +945,27 @@ fn get_or_upload_gpu_scene(
         return uploaded.clone();
     }
 
+    // SCN maps can be very large and their GPU uploads include all map buffers
+    // and texture views. Keeping old maps alive across selection changes is not
+    // useful for interactive editing and can leave stale/incompatible resources
+    // around when reopening a map. Evict previous SCN scene uploads only on a
+    // scene-cache miss, so normal gizmo movement still just updates instance
+    // buffers and never rebuilds geometry.
+    if is_scn_gpu_scene_key(&scene.key) {
+        let stale_scn_keys: Vec<String> = shared
+            .scene_lru
+            .iter()
+            .filter(|key| is_scn_gpu_scene_key(key))
+            .cloned()
+            .collect();
+        for key in &stale_scn_keys {
+            shared.scenes.remove(key);
+        }
+        shared
+            .scene_lru
+            .retain(|key| !stale_scn_keys.iter().any(|stale| stale == key));
+    }
+
     while shared.scenes.len() >= MAX_CACHED_GPU_SCENES {
         let Some(evicted) = shared.scene_lru.pop_front() else {
             break;
@@ -931,6 +979,10 @@ fn get_or_upload_gpu_scene(
     uploaded
 }
 
+fn is_scn_gpu_scene_key(key: &str) -> bool {
+    key.starts_with("scn:")
+}
+
 fn update_gpu_scene_instances(queue: &wgpu::Queue, gpu_scene: &GpuScene, scene: &CpuScene) {
     for (gpu_part, cpu_part) in gpu_scene.parts.iter().zip(scene.parts.iter()) {
         if cpu_part.instances.is_empty() || gpu_part.instance_count == 0 {
@@ -942,6 +994,20 @@ fn update_gpu_scene_instances(queue: &wgpu::Queue, gpu_scene: &GpuScene, scene: 
             bytemuck::cast_slice(&cpu_part.instances),
         );
     }
+}
+
+fn update_gpu_scene_dynamic_lines(queue: &wgpu::Queue, gpu_scene: &GpuScene, scene: &CpuScene) {
+    update_gpu_line_buffer(queue, gpu_scene.ground_lines.as_ref(), &scene.ground_lines);
+}
+
+fn update_gpu_line_buffer(queue: &wgpu::Queue, gpu_lines: Option<&GpuLines>, vertices: &[LineVertex]) {
+    let Some(gpu_lines) = gpu_lines else {
+        return;
+    };
+    if gpu_lines.vertex_count as usize != vertices.len() || vertices.is_empty() {
+        return;
+    }
+    queue.write_buffer(&gpu_lines.buffer, 0, bytemuck::cast_slice(vertices));
 }
 
 fn write_hidden_object_ids(queue: &wgpu::Queue, gpu_scene: &GpuScene, object_ids: &[f32]) {
@@ -970,6 +1036,7 @@ fn draw_gpu_scene<'a>(
             (false, true) => &shared.face_pipeline_cull,
             (false, false) => &shared.face_pipeline_no_cull,
         };
+
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &gpu_scene.globals_bind_group, &[]);
         pass.set_vertex_buffer(0, gpu_scene.vertex_buffer.slice(..));
@@ -1186,7 +1253,7 @@ impl GpuShared {
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -1262,7 +1329,7 @@ fn create_face_pipeline(
             entry_point: Some("fs_main"),
             targets: &[Some(wgpu::ColorTargetState {
                 format: OFFSCREEN_FORMAT,
-                blend: None,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
             compilation_options: Default::default(),
@@ -1284,7 +1351,10 @@ fn create_face_pipeline(
             stencil: Default::default(),
             bias: Default::default(),
         }),
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState {
+            count: VIEWER_SAMPLE_COUNT,
+            ..Default::default()
+        },
         multiview_mask: None,
         cache: None,
     })
@@ -1332,7 +1402,10 @@ fn create_line_pipeline(
             stencil: Default::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState {
+            count: VIEWER_SAMPLE_COUNT,
+            ..Default::default()
+        },
         multiview_mask: None,
         cache: None,
     })
@@ -1380,7 +1453,10 @@ fn create_bone_pipeline(
             stencil: Default::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState {
+            count: VIEWER_SAMPLE_COUNT,
+            ..Default::default()
+        },
         multiview_mask: None,
         cache: None,
     })
@@ -1399,7 +1475,7 @@ fn create_frame_targets(
     };
 
     let color_texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("geo_viewer_offscreen_color"),
+        label: Some("geo_viewer_offscreen_color_resolve"),
         size,
         mip_level_count: 1,
         sample_count: 1,
@@ -1410,11 +1486,23 @@ fn create_frame_targets(
     });
     let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+    let color_msaa_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("geo_viewer_offscreen_color_msaa"),
+        size,
+        mip_level_count: 1,
+        sample_count: VIEWER_SAMPLE_COUNT,
+        dimension: wgpu::TextureDimension::D2,
+        format: OFFSCREEN_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let color_msaa_view = color_msaa_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
     let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("geo_viewer_offscreen_depth"),
         size,
         mip_level_count: 1,
-        sample_count: 1,
+        sample_count: VIEWER_SAMPLE_COUNT,
         dimension: wgpu::TextureDimension::D2,
         format: DEPTH_FORMAT,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -1442,6 +1530,8 @@ fn create_frame_targets(
         height,
         _color_texture: color_texture,
         color_view,
+        _color_msaa_texture: color_msaa_texture,
+        color_msaa_view,
         _depth_texture: depth_texture,
         depth_view,
         blit_bind_group,
@@ -1666,7 +1756,7 @@ fn upload_lines(device: &wgpu::Device, vertices: &[LineVertex], label: &str) -> 
     let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some(label),
         contents: bytemuck::cast_slice(vertices),
-        usage: wgpu::BufferUsages::VERTEX,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
     });
 
     Some(GpuLines {
@@ -2672,6 +2762,38 @@ fn sync_instanced_scene_from_scn(scene: &mut CpuScene, scn: &ScnFile, selected: 
             }
         }
     }
+    refresh_scene_dynamic_bounds(scene);
+}
+
+fn refresh_scene_dynamic_bounds(scene: &mut CpuScene) {
+    if scene.pick_targets.is_empty() {
+        return;
+    }
+
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for target in &scene.pick_targets {
+        for axis in 0..3 {
+            min[axis] = min[axis].min(target.center[axis] - target.radius);
+            max[axis] = max[axis].max(target.center[axis] + target.radius);
+        }
+    }
+
+    if !min.iter().all(|v| v.is_finite()) || !max.iter().all(|v| v.is_finite()) {
+        return;
+    }
+
+    let center = [
+        (min[0] + max[0]) * 0.5,
+        (min[1] + max[1]) * 0.5,
+        (min[2] + max[2]) * 0.5,
+    ];
+    let radius = length3(sub3(max, center)).max(100.0);
+    let ground_y = min[1] - 0.02;
+
+    scene.center = center;
+    scene.radius = radius;
+    scene.ground_lines = build_ground_lines_for_bounds(center, radius, ground_y);
 }
 
 fn local_points_sphere(points: &[[f32; 3]]) -> Option<([f32; 3], f32)> {
@@ -3590,11 +3712,13 @@ fn scene_chunk_center(chunk: &ScnMeshChunk) -> Option<Vec3> {
 }
 
 fn scene_chunk_transform(chunk: &ScnMeshChunk) -> Option<(Vec3, Quat, Vec3)> {
-    let matrix = if let Some(transform) = chunk.transform {
-        mat4_from_arr(transform)
-    } else {
-        Mat4::from_translation(scene_chunk_center(chunk)?)
-    };
+    // Only chunks with an existing secondary transform can be edited safely.
+    // Chunks without transform_index cannot currently be serialized by save_scn
+    // without rebuilding vertex data or expanding the secondary transform table.
+    if chunk.transform_index.is_none() {
+        return None;
+    }
+    let matrix = mat4_from_arr(chunk.transform?);
 
     let (scale, rotation, translation) = matrix.to_scale_rotation_translation();
     let sanitized_scale = Vec3::new(
@@ -3682,12 +3806,34 @@ fn write_selected_scene_transform(
             let Some(chunk) = scn.mesh_chunks.get_mut(index) else {
                 return false;
             };
-            if ensure_scene_chunk_transform(chunk).is_none() {
+            if chunk.transform_index.is_none() || chunk.transform.is_none() {
                 return false;
             }
             write_scene_chunk_transform(chunk, translation, rotation, scale);
             true
         }
+    }
+}
+
+fn mark_scene_transform_preview_edited(state: &mut GeoViewerState) {
+    // Keep gizmo movement on the fast path.  The SCN viewer is instanced, so
+    // dragging only needs per-instance buffer updates in the WGPU scene.  Do not
+    // invalidate scene_key here, or every mouse move rebuilds all static mesh,
+    // material, texture, and line buffers.
+    state.scene_edit_revision = state.scene_edit_revision.wrapping_add(1);
+}
+
+fn mark_scene_transform_committed(state: &mut GeoViewerState, selected: SceneSelection) {
+    state.scene_edit_revision = state.scene_edit_revision.wrapping_add(1);
+    state.scene_preview_cache.clear();
+
+    // Wireframe lines are still static world-space line vertices. Rebuild them
+    // once after the drag ends so the optional wire overlay catches up, never
+    // continuously during dragging.
+    if state.show_wireframe {
+        state.scene_key = None;
+        state.scene_static_dirty = true;
+        state.scene_static_dirty_selection = Some(selected);
     }
 }
 
@@ -4004,9 +4150,7 @@ fn handle_scene_gizmo_interaction(
     if let Some(drag) = state.scene_gizmo_drag {
         if !ui.input(|i| i.pointer.primary_down()) {
             state.scene_gizmo_drag = None;
-            state.scene_gpu_dirty_selections.insert(selected_item);
-            state.scene_static_dirty = false;
-            state.scene_static_dirty_selection = None;
+            mark_scene_transform_committed(state, selected_item);
             ui.ctx().request_repaint();
             return false;
         }
@@ -4070,7 +4214,7 @@ fn handle_scene_gizmo_interaction(
             return false;
         }
 
-        state.scene_gpu_dirty_selections.insert(selected_item);
+        mark_scene_transform_preview_edited(state);
         ui.ctx().request_repaint();
         return true;
     }
@@ -4103,21 +4247,16 @@ fn handle_scene_gizmo_interaction(
     };
 
     if let SceneSelection::MeshChunk(index) = selected_item {
-        let Some(chunk) = scn.mesh_chunks.get_mut(index) else {
+        let Some(chunk) = scn.mesh_chunks.get(index) else {
             return false;
         };
-        if chunk.transform.is_none() {
-            if ensure_scene_chunk_transform(chunk).is_none() {
-                return false;
-            }
-            state.scene_preview_cache.clear();
-            state.scene_key = None;
-            state.cpu_scene = None;
+        if chunk.transform_index.is_none() || chunk.transform.is_none() {
+            return false;
         }
     }
 
     drag.start_scale = scale;
-    state.scene_gpu_dirty_selections.insert(selected_item);
+    mark_scene_transform_preview_edited(state);
     state.scene_gizmo_drag = Some(drag);
     ui.ctx().request_repaint();
     true

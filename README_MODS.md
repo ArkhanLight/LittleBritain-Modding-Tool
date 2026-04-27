@@ -1,101 +1,53 @@
-# LittleBritain Mod Tool - Complete Package
+# Little Britain Mod Tool - Mod Workspace Notes
 
-## What's Included
+This archive contains the Rust desktop modding tool. It does **not** include the C++ runtime modloader DLL source or a ready-made example mod package.
 
-### 1. ModLoader DLL (`src/modloader/`)
-- C++ DLL that injects into the game
-- Loads and manages mods at startup
-- Provides API for mod scripts to call game functions
-- Hook system for patching game code
+## What is included
 
-**Build:**
-```batch
-cd src/modloader
-g++ -shared -o modloader.dll modloader.cpp -O2
-copy modloader.dll ..\..\dist\
+- Rust/egui desktop tool for browsing Little Britain game assets.
+- GEO, SCN, DDS, BNK, BIK, ANM inspection paths.
+- GPU-backed GEO/SCN viewport via `eframe`/`egui-wgpu`/WGPU.
+- A Lua mod workspace under the selected game folder's `Mods/` directory.
+- Basic mod creation and script editing through `src/mod_workspace.rs`.
+
+## External dependencies expected by the project
+
+The project expects a local FFmpeg distribution at:
+
+```text
+third_party/ffmpeg-8.1-dist/
 ```
 
-### 2. Code Editor (`src/code_editor.rs`)
-- Built-in script editor with syntax highlighting
-- Support for Lua and C++
-- File operations (New, Open, Save, Save As)
-- Line numbers and status bar
+The committed `.cargo/config.toml` points `FFMPEG_DIR` and `PKG_CONFIG_PATH` at that folder. If `pkgconf`/`pkg-config` is not on your `PATH`, set `PKG_CONFIG` in your shell or in a user-level Cargo config rather than hard-coding a machine-specific path in the project.
 
-### 3. Mod Manager (`src/mod_manager.rs`)
-- Create, load, and manage mods
-- Mod metadata (mod.json)
-- Organize scripts, patches, assets
+## Runtime modloader status
 
-### 4. Example Mod (`mods/ExampleMod/`)
-- Ready-to-use mod structure
-- Example Lua script
-- Metadata template
+The GUI scans the game folder for these runtime loader files when present:
 
-## Quick Start
-
-1. **Build modloader.dll**
-   ```batch
-   cd "Mod Tool\little_britain_mod_tool\src\modloader"
-   g++ -shared -o modloader.dll modloader.cpp
-   ```
-
-2. **Run the Mod Tool**
-   ```batch
-   cd "Mod Tool\little_britain_mod_tool"
-   cargo run
-   ```
-
-3. **Create a mod**
-   - Go to "Mods" tab
-   - Click "New Mod"
-   - Fill in details and click "Create"
-
-4. **Write a script**
-   - Use the built-in code editor
-   - Save to `mods/YourMod/scripts/`
-
-5. **Install modloader**
-   - Copy `modloader.dll` to game folder
-   - Rename original exe or create launcher
-
-## Mod Structure
-
+```text
+modloader.dll
+binkw32.dll
+binkw32_real.dll
 ```
-mods/
+
+Those files are **not built by this archive**. If you add a C++/DLL modloader later, document its source folder, build command, and install flow here.
+
+## Mod structure used by the GUI
+
+```text
+Mods/
 └── YourMod/
-    ├── mod.json          # Mod metadata
-    ├── scripts/          # Lua scripts
-    │   └── main.lua      # Entry point
-    ├── patches/          # Binary patches
-    │   └── example.patch
-    └── assets/           # New files
-        └── textures/
+    ├── mod.json
+    └── scripts/
+        └── main.lua
 ```
 
-## Mod API (for scripts)
+The current manifest reader/writer is intentionally simple and is intended for manifests produced by the tool. If the runtime loader will consume user-edited manifests directly, switch the manifest code to `serde`/`serde_json` and use typed fields such as a boolean `enabled`.
 
-```lua
--- Game functions
-Mod_Log("Hello")              -- Log to console
-Mod_ShowMessage("Hello!")    -- Show in-game message
-Mod_SetHealth(100)           -- Set player health
-Mod_UnlockLevel(3)          -- Unlock level
-Mod_AddItem("coin")         -- Add item to inventory
+## Build
 
--- Get game state
-health = GetHealth()
-current_level = GetCurrentLevel()
+```batch
+cargo run
 ```
 
-## Next Steps
-
-1. **Decompile the game** - Need actual game function addresses
-2. **Build modloader** - Get the DLL working
-3. **Test mods** - Create and run a simple mod
-4. **Add more features** - Asset importing, patch editor, etc.
-
----
-
-For help, check the logs:
-- `modloader.log` - DLL debug output
-- ModTool console - Rust app debug output
+On Windows, keep your FFmpeg bundle in `third_party/ffmpeg-8.1-dist` and ensure `pkgconf.exe` or `pkg-config` is available on `PATH`, or set `PKG_CONFIG` externally.

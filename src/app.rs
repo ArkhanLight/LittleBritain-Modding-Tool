@@ -5,7 +5,7 @@ use crate::{
         BikPreview, BikWorkerEvent, extract_bik_audio_wav, load_bik_preview, spawn_bik_decoder,
     },
     bnk::{BnkFile, format_name, load_bnk},
-    dds_preview::{DdsPreview, load_dds_preview},
+    dds_preview::{DdsPreview, DdsRawPreview, dds_preview_from_raw, load_dds_preview, load_dds_raw_preview},
     fs_tree::{AssetCategory, FileNode, NodeKind, category_name, classify_path, scan_game_data},
     geo::{GeoAssetType, GeoFile, load_geo},
     geo_viewer::{
@@ -15,6 +15,7 @@ use crate::{
     mod_workspace::{
         ModPackage, create_lua_mod, create_lua_script, read_text_file, scan_mods, write_text_file,
     },
+    loading::{self, LoadingTask},
     scn::{ScnFile, ScnMeshChunk, load_scn},
 };
 use eframe::egui;
@@ -22,7 +23,8 @@ use std::{
     collections::VecDeque,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{mpsc, Arc},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -43,6 +45,90 @@ struct AnmGeoCandidate {
 struct AssetLinks {
     model_to_textures: std::collections::BTreeMap<PathBuf, Vec<ModelTextureRef>>,
     texture_to_models: std::collections::BTreeMap<PathBuf, Vec<PathBuf>>,
+}
+
+#[derive(Clone, Debug)]
+struct LoadedDdsPreview {
+    path: PathBuf,
+    raw: DdsRawPreview,
+}
+
+#[derive(Clone, Debug)]
+struct LoadedSceneGeoModel {
+    archetype: String,
+    path: PathBuf,
+    geo: GeoFile,
+    textures: Vec<Option<LoadedDdsPreview>>,
+}
+
+#[derive(Clone, Debug)]
+struct LoadedSceneData {
+    path: PathBuf,
+    scn: ScnFile,
+    models: Vec<LoadedSceneGeoModel>,
+    embedded_textures: std::collections::HashMap<String, LoadedDdsPreview>,
+    unresolved: Vec<String>,
+    marker_geo_overrides: std::collections::HashMap<usize, String>,
+    failed: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FolderLoadMode {
+    Open,
+    Rescan,
+}
+
+#[derive(Clone, Debug)]
+enum LoadingJobKind {
+    OpenGameFolder,
+    RescanGameFolder,
+    OpenScene(PathBuf),
+    OpenBikPreview(PathBuf),
+    LoadBikAudio(PathBuf),
+}
+
+enum LoadingJobResult {
+    FolderLoaded {
+        mode: FolderLoadMode,
+        root: PathBuf,
+        tree: Vec<FileNode>,
+        game_code_map: GameCodeMap,
+        mods: Result<Vec<ModPackage>, String>,
+        asset_links: AssetLinks,
+    },
+    SceneLoaded(LoadedSceneData),
+    BikPreviewLoaded {
+        path: PathBuf,
+        preview: BikPreview,
+    },
+    BikAudioLoaded {
+        path: PathBuf,
+        wav_bytes: Option<Vec<u8>>,
+    },
+    Error(String),
+}
+
+enum LoadingJobMessage {
+    Progress {
+        id: u64,
+        detail: String,
+        fraction: Option<f32>,
+    },
+    Finished {
+        id: u64,
+        result: LoadingJobResult,
+    },
+}
+
+struct ActiveLoadingJob {
+    kind: LoadingJobKind,
+    task: LoadingTask,
+    rx: mpsc::Receiver<LoadingJobMessage>,
+
+    // When a job finishes after the overlay was already visible,
+    // keep the overlay alive briefly at 100% so users actually see completion.
+    pending_result: Option<LoadingJobResult>,
+    finished_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -176,6 +262,7 @@ pub struct ModToolApp {
     selected_file: Option<PathBuf>,
     status: String,
     dark_mode: bool,
+    gpu_target_format: Option<eframe::egui_wgpu::wgpu::TextureFormat>,
 
     dds_preview: Option<DdsPreview>,
     dds_preview_path: Option<PathBuf>,
@@ -270,6 +357,7 @@ pub struct ModToolApp {
     bik_audio_wav: Option<Arc<[u8]>>,
     bik_audio_path: Option<PathBuf>,
     bik_audio_active: bool,
+    pending_bik_audio_start_seconds: Option<f32>,
     bik_zoom: f32,
     bik_view_height: f32,
     bik_current_frame: usize,
@@ -281,17 +369,22 @@ pub struct ModToolApp {
     bik_clock_started_at: Option<Instant>,
     bik_clock_start_secs: f32,
     bik_decoder_finished: bool,
+
+    next_loading_job_id: u64,
+    active_loading_job: Option<ActiveLoadingJob>,
 }
 
 impl ModToolApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        let gpu_target_format = cc.wgpu_render_state.as_ref().map(|rs| rs.target_format);
         Self {
             game_root: None,
             tree: Vec::new(),
             selected_file: None,
             status: "Choose your Little Britain install folder.".to_owned(),
             dark_mode: true,
+            gpu_target_format,
 
             dds_preview: None,
             dds_preview_path: None,
@@ -361,7 +454,7 @@ impl ModToolApp {
             geo_animation_groups_path: None,
             geo_animation_groups: Vec::new(),
 
-            geo_viewer: GeoViewerState::default(),
+            geo_viewer: GeoViewerState::with_target_format(gpu_target_format),
             geo_viewer_path: None,
             geo_view_height: 520.0,
 
@@ -374,7 +467,7 @@ impl ModToolApp {
             selected_scn_chunk: None,
             hidden_scn_nodes: std::collections::BTreeSet::new(),
             hidden_scn_chunks: std::collections::BTreeSet::new(),
-            scn_viewer: GeoViewerState::default(),
+            scn_viewer: GeoViewerState::with_target_format(gpu_target_format),
             scn_view_height: 520.0,
             scn_embedded_texture_previews: std::collections::HashMap::new(),
 
@@ -386,6 +479,7 @@ impl ModToolApp {
             bik_audio_wav: None,
             bik_audio_path: None,
             bik_audio_active: false,
+            pending_bik_audio_start_seconds: None,
             bik_zoom: 1.0,
             bik_view_height: 420.0,
             bik_current_frame: 0,
@@ -397,148 +491,364 @@ impl ModToolApp {
             bik_clock_started_at: None,
             bik_clock_start_secs: 0.0,
             bik_decoder_finished: false,
+
+            next_loading_job_id: 1,
+            active_loading_job: None,
         }
     }
 
-    fn open_game_folder(&mut self) {
+    fn open_game_folder(&mut self, ctx: &egui::Context) {
         if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-            match scan_game_data(&folder) {
-                Ok(tree) => {
-                    self.game_code_map = Self::scan_game_code_map(&folder);
-                    self.game_root = Some(folder);
-                    self.tree = tree;
-                    self.refresh_mod_workspace();
-                    self.asset_links = self.build_asset_links();
-                    self.geo_animation_groups_path = None;
-                    self.geo_animation_groups.clear();
-                    self.selected_file = None;
-                    self.content_browser_folder = None;
-                    self.dds_preview = None;
-                    self.dds_preview_path = None;
-                    self.dds_error = None;
-                    self.dds_view_height = 420.0;
-                    self.bnk_file = None;
-                    self.bnk_loaded_path = None;
-                    self.bnk_error = None;
-                    self.selected_bnk_entry = None;
-                    self.active_audio_window = None;
-                    self.anm_file = None;
-                    self.anm_loaded_path = None;
-                    self.anm_error = None;
-                    self.anm_geo_overrides.clear();
-                    self.active_geo_animation = None;
-                    self.geo_file = None;
-                    self.geo_loaded_path = None;
-                    self.geo_error = None;
-                    self.geo_viewer = GeoViewerState::default();
-                    self.geo_view_height = 520.0;
-                    self.geo_viewer_path = None;
-                    self.geo_material_previews.clear();
-                    self.geo_materials_loaded_path = None;
-                    self.geo_material_error = None;
-                    self.active_geo_animation_file = None;
-                    self.active_geo_animation_loaded_path = None;
-                    self.active_geo_animation_error = None;
-                    self.active_geo_animation_playing = false;
-                    self.active_geo_animation_time = 0.0;
-                    self.scn_file = None;
-                    self.scn_loaded_path = None;
-                    self.scn_error = None;
-                    self.scn_scene_models.clear();
-                    self.scn_scene_models_path = None;
-                    self.scn_scene_unresolved.clear();
-                    self.scn_marker_geo_overrides.clear();
-                    self.scn_scene_error = None;
-                    self.selected_scn_node = None;
-                    self.selected_scn_chunk = None;
-                    self.hidden_scn_nodes.clear();
-                    self.hidden_scn_chunks.clear();
-                    self.scn_viewer = GeoViewerState::default();
-                    self.scn_view_height = 520.0;
-                    self.scn_embedded_texture_previews.clear();
-                    self.reset_bik_state();
-                    self.status = "Loaded Data folder.".to_owned();
+            self.start_folder_load_job(ctx, folder, FolderLoadMode::Open);
+        }
+    }
+
+    fn rescan(&mut self, ctx: &egui::Context) {
+        if let Some(root) = self.game_root.clone() {
+            self.start_folder_load_job(ctx, root, FolderLoadMode::Rescan);
+        }
+    }
+
+
+    fn start_loading_job<F>(
+        &mut self,
+        ctx: &egui::Context,
+        kind: LoadingJobKind,
+        title: String,
+        work: F,
+    ) where
+        F: FnOnce(u64, mpsc::Sender<LoadingJobMessage>) + Send + 'static,
+    {
+        let id = self.next_loading_job_id;
+        self.next_loading_job_id = self.next_loading_job_id.wrapping_add(1).max(1);
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || work(id, tx));
+
+        self.active_loading_job = Some(ActiveLoadingJob {
+            kind,
+            task: LoadingTask::new(id, title),
+            rx,
+            pending_result: None,
+            finished_at: None,
+        });
+        ctx.request_repaint();
+    }
+
+    fn send_loading_progress(
+        tx: &mpsc::Sender<LoadingJobMessage>,
+        id: u64,
+        detail: impl Into<String>,
+        fraction: Option<f32>,
+    ) {
+        let _ = tx.send(LoadingJobMessage::Progress {
+            id,
+            detail: detail.into(),
+            fraction,
+        });
+    }
+
+    fn send_loading_finished(
+        tx: mpsc::Sender<LoadingJobMessage>,
+        id: u64,
+        result: LoadingJobResult,
+    ) {
+        let _ = tx.send(LoadingJobMessage::Finished { id, result });
+    }
+
+    fn is_loading_scene_path(&self, path: &Path) -> bool {
+        matches!(
+            self.active_loading_job.as_ref().map(|job| &job.kind),
+            Some(LoadingJobKind::OpenScene(active_path)) if active_path.as_path() == path
+        )
+    }
+
+    fn is_loading_bik_preview_path(&self, path: &Path) -> bool {
+        matches!(
+            self.active_loading_job.as_ref().map(|job| &job.kind),
+            Some(LoadingJobKind::OpenBikPreview(active_path)) if active_path.as_path() == path
+        )
+    }
+
+    fn is_loading_bik_audio_path(&self, path: &Path) -> bool {
+        matches!(
+            self.active_loading_job.as_ref().map(|job| &job.kind),
+            Some(LoadingJobKind::LoadBikAudio(active_path)) if active_path.as_path() == path
+        )
+    }
+
+    fn loading_title(action: &str, path: &Path) -> String {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+        format!("{action} {name}...")
+    }
+
+    fn start_folder_load_job(&mut self, ctx: &egui::Context, root: PathBuf, mode: FolderLoadMode) {
+        let title = match mode {
+            FolderLoadMode::Open => "Opening game folder...".to_owned(),
+            FolderLoadMode::Rescan => "Rescanning game folder...".to_owned(),
+        };
+        let kind = match mode {
+            FolderLoadMode::Open => LoadingJobKind::OpenGameFolder,
+            FolderLoadMode::Rescan => LoadingJobKind::RescanGameFolder,
+        };
+
+        self.start_loading_job(ctx, kind, title, move |id, tx| {
+            let result = (|| -> Result<LoadingJobResult, String> {
+                Self::send_loading_progress(&tx, id, "Scanning Data folder", Some(0.08));
+                let tree = scan_game_data(&root).map_err(|err| err.to_string())?;
+
+                Self::send_loading_progress(&tx, id, "Scanning EXE strings and mod-loader files", Some(0.32));
+                let game_code_map = Self::scan_game_code_map(&root);
+
+                Self::send_loading_progress(&tx, id, "Scanning Mods folder", Some(0.48));
+                let mods = scan_mods(&root).map_err(|err| err.to_string());
+
+                Self::send_loading_progress(&tx, id, "Building model texture links", Some(0.62));
+                let asset_links = Self::build_asset_links_from_tree(&tree);
+
+                Self::send_loading_progress(&tx, id, "Finalizing", Some(0.95));
+                Ok(LoadingJobResult::FolderLoaded {
+                    mode,
+                    root,
+                    tree,
+                    game_code_map,
+                    mods,
+                    asset_links,
+                })
+            })();
+
+            let result = match result {
+                Ok(result) => result,
+                Err(err) => LoadingJobResult::Error(err),
+            };
+            Self::send_loading_finished(tx, id, result);
+        });
+    }
+
+    fn reset_loaded_asset_state(&mut self, clear_selection: bool) {
+        if clear_selection {
+            self.selected_file = None;
+            self.content_browser_folder = None;
+        } else if self
+            .content_browser_folder
+            .as_ref()
+            .map(|path| !path.is_dir())
+            .unwrap_or(false)
+        {
+            self.content_browser_folder = None;
+        }
+
+        self.dds_preview = None;
+        self.dds_preview_path = None;
+        self.dds_error = None;
+        self.texture_zoom = 1.0;
+        self.dds_view_height = 420.0;
+
+        self.bnk_file = None;
+        self.bnk_loaded_path = None;
+        self.bnk_error = None;
+        self.selected_bnk_entry = None;
+        self.active_audio_window = None;
+
+        self.anm_file = None;
+        self.anm_loaded_path = None;
+        self.anm_error = None;
+        self.anm_geo_overrides.clear();
+        self.active_geo_animation = None;
+
+        self.geo_file = None;
+        self.geo_loaded_path = None;
+        self.geo_error = None;
+        self.geo_viewer.reset_with_target_format(self.gpu_target_format);
+        self.geo_view_height = 520.0;
+        self.geo_viewer_path = None;
+        self.geo_material_previews.clear();
+        self.geo_materials_loaded_path = None;
+        self.geo_material_error = None;
+
+        self.active_geo_animation_file = None;
+        self.active_geo_animation_loaded_path = None;
+        self.active_geo_animation_error = None;
+        self.active_geo_animation_playing = false;
+        self.active_geo_animation_time = 0.0;
+
+        self.scn_file = None;
+        self.scn_loaded_path = None;
+        self.scn_error = None;
+        self.reset_scn_scene_state();
+
+        self.reset_bik_state();
+    }
+
+    fn apply_folder_loaded(
+        &mut self,
+        mode: FolderLoadMode,
+        root: PathBuf,
+        tree: Vec<FileNode>,
+        game_code_map: GameCodeMap,
+        mods: Result<Vec<ModPackage>, String>,
+        asset_links: AssetLinks,
+    ) {
+        self.game_root = Some(root);
+        self.tree = tree;
+        self.game_code_map = game_code_map;
+        match mods {
+            Ok(mods) => {
+                self.mods = mods;
+                self.mods_error = None;
+                if self
+                    .selected_mod_index
+                    .map(|index| index >= self.mods.len())
+                    .unwrap_or(false)
+                {
+                    self.selected_mod_index = None;
                 }
-                Err(err) => {
-                    self.status = err.to_string();
+            }
+            Err(err) => {
+                self.mods.clear();
+                self.mods_error = Some(err);
+                self.selected_mod_index = None;
+            }
+        }
+        self.asset_links = asset_links;
+        self.geo_animation_groups_path = None;
+        self.geo_animation_groups.clear();
+        self.reset_loaded_asset_state(mode == FolderLoadMode::Open);
+        self.status = match mode {
+            FolderLoadMode::Open => "Loaded Data folder.".to_owned(),
+            FolderLoadMode::Rescan => "Rescanned Data folder.".to_owned(),
+        };
+    }
+
+    fn poll_loading_jobs(&mut self, ctx: &egui::Context) {
+        const READY_HOLD: Duration = Duration::from_millis(180);
+
+        let mut result_to_apply: Option<LoadingJobResult> = None;
+        let mut clear_job = false;
+        let mut request_repaint = false;
+
+        if let Some(job) = self.active_loading_job.as_mut() {
+            // If the worker already finished and we are just showing "Ready" briefly,
+            // wait a tiny moment before applying the result and hiding the overlay.
+            if job.pending_result.is_some() {
+                if let Some(finished_at) = job.finished_at {
+                    if finished_at.elapsed() >= READY_HOLD {
+                        result_to_apply = job.pending_result.take();
+                        clear_job = true;
+                    } else {
+                        request_repaint = true;
+                    }
+                } else {
+                    result_to_apply = job.pending_result.take();
+                    clear_job = true;
+                }
+            } else {
+                while let Ok(message) = job.rx.try_recv() {
+                    match message {
+                        LoadingJobMessage::Progress { id, detail, fraction } => {
+                            if id == job.task.id {
+                                job.task.set_progress(fraction, Some(detail));
+                            }
+                        }
+                        LoadingJobMessage::Finished { id, result } => {
+                            if id == job.task.id {
+                                // If the overlay was visible, briefly show 100%.
+                                // If the job finished before the overlay delay, apply instantly
+                                // so fast actions still feel instant.
+                                if job.task.should_show_overlay() {
+                                    let done_label = match &result {
+                                        LoadingJobResult::Error(_) => "Failed",
+                                        _ => "Ready",
+                                    };
+
+                                    job.task.set_progress(Some(1.0), Some(done_label.to_owned()));
+                                    job.finished_at = Some(Instant::now());
+                                    job.pending_result = Some(result);
+                                    request_repaint = true;
+                                } else {
+                                    result_to_apply = Some(result);
+                                    clear_job = true;
+                                }
+
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if !clear_job && job.pending_result.is_none() {
+                    request_repaint = true;
                 }
             }
         }
+
+        if clear_job {
+            self.active_loading_job = None;
+        }
+
+        if let Some(result) = result_to_apply {
+            self.apply_loading_result(ctx, result);
+        }
+
+        if request_repaint {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
     }
 
-    fn rescan(&mut self) {
-        if let Some(root) = self.game_root.clone() {
-            match scan_game_data(&root) {
-                Ok(tree) => {
-                    self.tree = tree;
-                    self.game_code_map = Self::scan_game_code_map(&root);
-                    self.refresh_mod_workspace();
-
-                    self.asset_links = self.build_asset_links();
-                    self.geo_animation_groups_path = None;
-                    self.geo_animation_groups.clear();
-                    if self
-                        .content_browser_folder
-                        .as_ref()
-                        .map(|path| !path.is_dir())
-                        .unwrap_or(false)
-                    {
-                        self.content_browser_folder = None;
-                    }
-
-                    self.dds_preview = None;
-                    self.dds_preview_path = None;
-                    self.dds_error = None;
-                    self.texture_zoom = 1.0;
-                    self.dds_view_height = 420.0;
-
-                    self.bnk_file = None;
-                    self.bnk_loaded_path = None;
-                    self.bnk_error = None;
-                    self.selected_bnk_entry = None;
-                    self.active_audio_window = None;
-
-                    self.anm_file = None;
-                    self.anm_loaded_path = None;
-                    self.anm_error = None;
-                    self.anm_geo_overrides.clear();
-                    self.active_geo_animation = None;
-
-                    self.geo_file = None;
-
-                    self.geo_viewer = GeoViewerState::default();
-                    self.geo_viewer_path = None;
-                    self.geo_view_height = 520.0;
-
-                    self.geo_material_previews.clear();
-                    self.geo_materials_loaded_path = None;
-                    self.geo_material_error = None;
-
-                    self.active_geo_animation_file = None;
-                    self.active_geo_animation_loaded_path = None;
-                    self.active_geo_animation_error = None;
-                    self.active_geo_animation_playing = false;
-                    self.active_geo_animation_time = 0.0;
-
-                    self.scn_file = None;
-                    self.scn_loaded_path = None;
-                    self.scn_error = None;
-
-                    self.scn_scene_models.clear();
-                    self.scn_scene_models_path = None;
-                    self.scn_scene_unresolved.clear();
-                    self.scn_marker_geo_overrides.clear();
-                    self.scn_scene_error = None;
-                    self.scn_viewer = GeoViewerState::default();
-                    self.scn_view_height = 520.0;
-                    self.scn_embedded_texture_previews.clear();
-
-                    self.reset_bik_state();
-
-                    self.status = "Rescanned Data folder.".to_owned();
+    fn apply_loading_result(&mut self, ctx: &egui::Context, result: LoadingJobResult) {
+        match result {
+            LoadingJobResult::FolderLoaded {
+                mode,
+                root,
+                tree,
+                game_code_map,
+                mods,
+                asset_links,
+            } => self.apply_folder_loaded(mode, root, tree, game_code_map, mods, asset_links),
+            LoadingJobResult::SceneLoaded(data) => self.apply_loaded_scene(ctx, data),
+            LoadingJobResult::BikPreviewLoaded { path, preview } => {
+                if self.selected_file.as_ref() != Some(&path) {
+                    return;
                 }
-                Err(err) => {
-                    self.status = err.to_string();
+                let first_frame = preview.first_frame.clone();
+                self.bik_preview_path = Some(path);
+                self.bik_preview = Some(preview);
+                self.set_bik_texture_from_image(ctx, first_frame);
+                self.bik_current_frame = 0;
+                self.bik_current_time_seconds = 0.0;
+                self.bik_error = None;
+                self.bik_audio_error = None;
+                ctx.request_repaint();
+            }
+            LoadingJobResult::BikAudioLoaded { path, wav_bytes } => {
+                if self
+                    .bik_preview
+                    .as_ref()
+                    .map(|preview| preview.path.as_path() != path.as_path())
+                    .unwrap_or(true)
+                {
+                    return;
+                }
+                self.bik_audio_path = Some(path);
+                self.bik_audio_wav = wav_bytes.map(Arc::<[u8]>::from);
+                self.bik_audio_error = None;
+                if self.bik_audio_wav.is_some() {
+                    if let Some(start_seconds) = self.pending_bik_audio_start_seconds.take() {
+                        self.start_bik_audio(ctx, start_seconds);
+                    }
+                } else {
+                    self.pending_bik_audio_start_seconds = None;
+                }
+            }
+            LoadingJobResult::Error(err) => {
+                self.status = err.clone();
+                match self.selected_extension().as_deref() {
+                    Some("scn") => self.scn_error = Some(err),
+                    Some("bik") => self.bik_error = Some(err),
+                    _ => {}
                 }
             }
         }
@@ -870,7 +1180,7 @@ impl ModToolApp {
             }
 
             if ui.button("Refresh").clicked() {
-                self.rescan();
+                self.rescan(ui.ctx());
             }
         });
 
@@ -1052,7 +1362,19 @@ impl ModToolApp {
         self.bik_audio_active = false;
     }
 
-    fn ensure_bik_audio_loaded(&mut self) -> bool {
+    fn start_bik_audio_load_job(&mut self, ctx: &egui::Context, path: PathBuf) {
+        let title = Self::loading_title("Loading audio for", &path);
+        self.start_loading_job(ctx, LoadingJobKind::LoadBikAudio(path.clone()), title, move |id, tx| {
+            Self::send_loading_progress(&tx, id, "Extracting BIK audio", None);
+            let result = match extract_bik_audio_wav(&path) {
+                Ok(wav_bytes) => LoadingJobResult::BikAudioLoaded { path, wav_bytes },
+                Err(err) => LoadingJobResult::Error(err.to_string()),
+            };
+            Self::send_loading_finished(tx, id, result);
+        });
+    }
+
+    fn ensure_bik_audio_loaded(&mut self, ctx: &egui::Context, start_seconds: f32) -> bool {
         let Some(preview) = self.bik_preview.as_ref() else {
             return false;
         };
@@ -1064,28 +1386,30 @@ impl ModToolApp {
         let path = preview.path.clone();
 
         if self.bik_audio_path.as_ref() == Some(&path) {
-            return self.bik_audio_wav.is_some();
+            if self.bik_audio_wav.is_some() {
+                return true;
+            }
+            self.pending_bik_audio_start_seconds = Some(start_seconds);
+            if !self.is_loading_bik_audio_path(&path) {
+                self.start_bik_audio_load_job(ctx, path);
+            }
+            return false;
         }
 
         self.bik_audio_path = Some(path.clone());
         self.bik_audio_wav = None;
         self.bik_audio_error = None;
+        self.pending_bik_audio_start_seconds = Some(start_seconds);
 
-        match extract_bik_audio_wav(&path) {
-            Ok(Some(wav_bytes)) => {
-                self.bik_audio_wav = Some(wav_bytes.into());
-                true
-            }
-            Ok(None) => false,
-            Err(err) => {
-                self.bik_audio_error = Some(err.to_string());
-                false
-            }
+        if !self.is_loading_bik_audio_path(&path) {
+            self.start_bik_audio_load_job(ctx, path);
         }
+
+        false
     }
 
-    fn start_bik_audio(&mut self, start_seconds: f32) {
-        if !self.ensure_bik_audio_loaded() {
+    fn start_bik_audio(&mut self, ctx: &egui::Context, start_seconds: f32) {
+        if !self.ensure_bik_audio_loaded(ctx, start_seconds) {
             self.bik_audio_active = false;
             return;
         }
@@ -1120,6 +1444,7 @@ impl ModToolApp {
                     self.active_audio_window = None;
                     self.bik_audio_error = None;
                     self.bik_audio_active = true;
+                    self.pending_bik_audio_start_seconds = None;
                     self.status = format!("Playing {label}");
                 }
                 Err(err) => {
@@ -1139,6 +1464,7 @@ impl ModToolApp {
         self.bik_audio_error = None;
         self.bik_audio_wav = None;
         self.bik_audio_path = None;
+        self.pending_bik_audio_start_seconds = None;
         self.bik_zoom = 1.0;
         self.bik_view_height = 420.0;
         self.bik_current_frame = 0;
@@ -1166,6 +1492,18 @@ impl ModToolApp {
         }
     }
 
+    fn start_bik_preview_job(&mut self, ctx: &egui::Context, path: PathBuf) {
+        let title = Self::loading_title("Opening", &path);
+        self.start_loading_job(ctx, LoadingJobKind::OpenBikPreview(path.clone()), title, move |id, tx| {
+            Self::send_loading_progress(&tx, id, "Reading BIK metadata and first frame", None);
+            let result = match load_bik_preview(&path) {
+                Ok(preview) => LoadingJobResult::BikPreviewLoaded { path, preview },
+                Err(err) => LoadingJobResult::Error(err.to_string()),
+            };
+            Self::send_loading_finished(tx, id, result);
+        });
+    }
+
     fn ensure_bik_preview_loaded(&mut self, ctx: &egui::Context) {
         let Some(path) = self.selected_file.clone() else {
             self.reset_bik_state();
@@ -1182,28 +1520,13 @@ impl ModToolApp {
             return;
         }
 
-        if self.bik_preview_path.as_ref() == Some(&path) {
+        if self.bik_preview_path.as_ref() == Some(&path) || self.is_loading_bik_preview_path(&path) {
             return;
         }
 
         self.reset_bik_state();
         self.bik_preview_path = Some(path.clone());
-
-        match load_bik_preview(&path) {
-            Ok(preview) => {
-                let first_frame = preview.first_frame.clone();
-                self.bik_preview = Some(preview);
-                self.set_bik_texture_from_image(ctx, first_frame);
-                self.bik_current_frame = 0;
-                self.bik_current_time_seconds = 0.0;
-                self.bik_error = None;
-                self.bik_audio_error = None;
-                ctx.request_repaint();
-            }
-            Err(err) => {
-                self.bik_error = Some(err.to_string());
-            }
-        }
+        self.start_bik_preview_job(ctx, path);
     }
 
     fn start_bik_playback(&mut self, ctx: &egui::Context) {
@@ -1235,7 +1558,7 @@ impl ModToolApp {
         self.bik_decoder_finished = false;
         self.bik_is_playing = true;
         self.bik_error = None;
-        self.start_bik_audio(self.bik_current_time_seconds);
+        self.start_bik_audio(ctx, self.bik_current_time_seconds);
         ctx.request_repaint();
     }
 
@@ -1691,7 +2014,7 @@ impl ModToolApp {
         let id = self.next_geo_preview_window_id;
         self.next_geo_preview_window_id = self.next_geo_preview_window_id.wrapping_add(1);
 
-        let mut viewer = GeoViewerState::default();
+        let mut viewer = GeoViewerState::with_target_format(self.gpu_target_format);
         let mut geo_file = None;
         let mut error = None;
         let mut material_previews = Vec::new();
@@ -3171,7 +3494,7 @@ impl ModToolApp {
         }
     }
 
-    fn ensure_scn_loaded(&mut self) {
+    fn ensure_scn_loaded(&mut self, ctx: &egui::Context) {
         let Some(path) = self.selected_file.clone() else {
             self.scn_file = None;
             self.scn_loaded_path = None;
@@ -3183,40 +3506,30 @@ impl ModToolApp {
             return;
         };
 
-        if self.scn_loaded_path.as_ref() == Some(&path) {
-            return;
-        }
-
-        self.scn_file = None;
-        self.scn_error = None;
-        self.scn_loaded_path = Some(path.clone());
-
         let is_scn = path
             .extension()
             .map(|ext| ext.to_string_lossy().eq_ignore_ascii_case("scn"))
             .unwrap_or(false);
 
         if !is_scn {
-            self.selected_scn_node = None;
-            self.selected_scn_chunk = None;
-            self.hidden_scn_nodes.clear();
-            self.hidden_scn_chunks.clear();
+            if self.scn_file.is_some() || self.scn_loaded_path.is_some() || self.scn_scene_models_path.is_some() {
+                self.scn_file = None;
+                self.scn_loaded_path = None;
+                self.scn_error = None;
+                self.reset_scn_scene_state();
+            }
             return;
         }
 
-        self.selected_scn_node = None;
-        self.selected_scn_chunk = None;
-        self.hidden_scn_nodes.clear();
-        self.hidden_scn_chunks.clear();
-
-        match load_scn(&path) {
-            Ok(scn) => {
-                self.scn_file = Some(scn);
-            }
-            Err(err) => {
-                self.scn_error = Some(err.to_string());
-            }
+        if self.scn_loaded_path.as_ref() == Some(&path) || self.is_loading_scene_path(&path) {
+            return;
         }
+
+        self.scn_file = None;
+        self.scn_error = None;
+        self.scn_loaded_path = Some(path.clone());
+        self.reset_scn_scene_state();
+        self.start_open_scene_job(ctx, path);
     }
 
     fn reset_scn_scene_state(&mut self) {
@@ -3229,46 +3542,46 @@ impl ModToolApp {
         self.selected_scn_chunk = None;
         self.hidden_scn_nodes.clear();
         self.hidden_scn_chunks.clear();
-        self.scn_viewer = GeoViewerState::default();
+        self.scn_viewer.reset_with_target_format(self.gpu_target_format);
         self.scn_view_height = 520.0;
         self.scn_embedded_texture_previews.clear();
     }
 
-    fn ensure_scn_scene_loaded(&mut self, ctx: &egui::Context) {
-        let Some(path) = self.selected_file.clone() else {
-            self.reset_scn_scene_state();
-            return;
-        };
+    fn start_open_scene_job(&mut self, ctx: &egui::Context, path: PathBuf) {
+        let tree = self.tree.clone();
+        let title = Self::loading_title("Opening", &path);
+        self.start_loading_job(ctx, LoadingJobKind::OpenScene(path.clone()), title, move |id, tx| {
+            let result = (|| -> Result<LoadingJobResult, String> {
+                Self::send_loading_progress(&tx, id, "Reading SCN", Some(0.05));
+                let scn = load_scn(&path).map_err(|err| err.to_string())?;
 
-        let is_scn = path
-            .extension()
-            .map(|ext| ext.to_string_lossy().eq_ignore_ascii_case("scn"))
-            .unwrap_or(false);
+                Self::send_loading_progress(&tx, id, "Finding map models and textures", Some(0.16));
+                let data = Self::load_scn_scene_data(path, scn, tree, id, &tx)?;
+                Ok(LoadingJobResult::SceneLoaded(data))
+            })();
 
-        if !is_scn {
-            self.reset_scn_scene_state();
-            return;
-        }
+            let result = match result {
+                Ok(result) => result,
+                Err(err) => LoadingJobResult::Error(err),
+            };
+            Self::send_loading_finished(tx, id, result);
+        });
+    }
 
-        if self.scn_scene_models_path.as_ref() == Some(&path) {
-            return;
-        }
-
-        self.reset_scn_scene_state();
-        self.scn_scene_models_path = Some(path.clone());
-
-        let Some(scn) = self.scn_file.clone() else {
-            return;
-        };
-
+    fn load_scn_scene_data(
+        path: PathBuf,
+        scn: ScnFile,
+        tree: Vec<FileNode>,
+        job_id: u64,
+        tx: &mpsc::Sender<LoadingJobMessage>,
+    ) -> Result<LoadedSceneData, String> {
         let mut texture_nodes = Vec::new();
         let mut model_nodes = Vec::new();
 
-        Self::collect_files_by_category(&self.tree, AssetCategory::Texture, &mut texture_nodes);
-        Self::collect_files_by_category(&self.tree, AssetCategory::Model, &mut model_nodes);
+        Self::collect_files_by_category(&tree, AssetCategory::Texture, &mut texture_nodes);
+        Self::collect_files_by_category(&tree, AssetCategory::Model, &mut model_nodes);
 
         let scn_parent = path.parent().map(|parent| parent.to_path_buf());
-
         let is_in_scn_folder = |candidate: &Path| {
             scn_parent
                 .as_ref()
@@ -3281,24 +3594,20 @@ impl ModToolApp {
         };
 
         let mut textures_by_name = std::collections::HashMap::<String, PathBuf>::new();
-
         for node in texture_nodes {
             if !is_in_scn_folder(&node.path) {
                 continue;
             }
-
             if let Some(name) = node.path.file_name().and_then(|s| s.to_str()) {
                 textures_by_name.insert(name.to_ascii_lowercase(), node.path.clone());
             }
         }
 
         let mut geo_by_stem = std::collections::HashMap::<String, PathBuf>::new();
-
         for node in model_nodes {
             if !is_in_scn_folder(&node.path) {
                 continue;
             }
-
             if let Some(stem) = node.path.file_stem().and_then(|s| s.to_str()) {
                 geo_by_stem.insert(stem.to_ascii_lowercase(), node.path.clone());
             }
@@ -3314,21 +3623,29 @@ impl ModToolApp {
 
         let marker_geo_overrides = Self::infer_scn_marker_geo_overrides(&scn, &geo_by_stem, &path);
 
-        let mut loaded = Vec::new();
-        let mut unresolved = Vec::new();
-        let mut failed = Vec::new();
-
         let mut model_keys = archetypes.clone();
         for stem in marker_geo_overrides.values() {
             model_keys.insert(stem.clone());
         }
 
-        for archetype in model_keys {
+        let total_models = model_keys.len().max(1);
+        let mut models = Vec::new();
+        let mut unresolved = Vec::new();
+        let mut failed = Vec::new();
+
+        for (index, archetype) in model_keys.into_iter().enumerate() {
+            let model_progress = 0.20 + 0.48 * (index as f32 / total_models as f32);
+            Self::send_loading_progress(
+                tx,
+                job_id,
+                format!("Loading GEO {}/{}", index + 1, total_models),
+                Some(model_progress),
+            );
+
             match geo_by_stem.get(&archetype) {
                 Some(model_path) => match load_geo(model_path) {
                     Ok(geo) => {
                         let mut textures = Vec::new();
-
                         for texture_name in &geo.texture_names {
                             let resolved = Self::guess_geo_texture_path(model_path, texture_name)
                                 .or_else(|| {
@@ -3338,8 +3655,8 @@ impl ModToolApp {
                                 });
 
                             let preview = match resolved {
-                                Some(tex_path) => match load_dds_preview(ctx, &tex_path) {
-                                    Ok(preview) => Some(preview),
+                                Some(tex_path) => match load_dds_raw_preview(&tex_path) {
+                                    Ok(raw) => Some(LoadedDdsPreview { path: tex_path, raw }),
                                     Err(err) => {
                                         failed.push(format!(
                                             "{archetype} texture {}: {}",
@@ -3351,20 +3668,17 @@ impl ModToolApp {
                                 },
                                 None => None,
                             };
-
                             textures.push(preview);
                         }
 
-                        loaded.push(SceneGeoModel {
+                        models.push(LoadedSceneGeoModel {
                             archetype: archetype.clone(),
                             path: model_path.clone(),
                             geo,
                             textures,
                         });
                     }
-                    Err(err) => {
-                        failed.push(format!("{archetype}: {err}"));
-                    }
+                    Err(err) => failed.push(format!("{archetype}: {err}")),
                 },
                 None => {
                     if archetypes.contains(&archetype) {
@@ -3374,47 +3688,112 @@ impl ModToolApp {
             }
         }
 
-        let mut embedded_texture_previews = std::collections::HashMap::new();
+        Self::send_loading_progress(tx, job_id, "Collecting embedded SCN textures", Some(0.75));
 
+        let mut embedded_texture_keys = std::collections::BTreeSet::<String>::new();
         for chunk in &scn.mesh_chunks {
             for name in &chunk.texture_names {
-                let key = name.to_ascii_lowercase();
-                if embedded_texture_previews.contains_key(&key) {
-                    continue;
-                }
-
-                let Some(tex_path) = textures_by_name.get(&key).cloned() else {
-                    continue;
-                };
-
-                match load_dds_preview(ctx, &tex_path) {
-                    Ok(preview) => {
-                        embedded_texture_previews.insert(key, preview);
-                    }
-                    Err(err) => {
-                        failed.push(format!("SCN texture {}: {}", tex_path.display(), err));
-                    }
-                }
+                embedded_texture_keys.insert(name.to_ascii_lowercase());
             }
         }
 
-        self.scn_embedded_texture_previews = embedded_texture_previews;
+        let total_embedded = embedded_texture_keys.len().max(1);
+        let mut embedded_textures = std::collections::HashMap::new();
 
-        loaded.sort_by_key(|m| m.archetype.clone());
+        for (index, key) in embedded_texture_keys.into_iter().enumerate() {
+            let texture_progress = 0.75 + 0.15 * (index as f32 / total_embedded as f32);
 
-        self.scn_scene_models = loaded;
-        self.scn_scene_unresolved = unresolved;
-        self.scn_marker_geo_overrides = marker_geo_overrides;
+            Self::send_loading_progress(
+                tx,
+                job_id,
+                format!("Loading map texture {}/{}", index + 1, total_embedded),
+                Some(texture_progress),
+            );
 
-        if !failed.is_empty() {
+            let Some(tex_path) = textures_by_name.get(&key).cloned() else {
+                continue;
+            };
+
+            match load_dds_raw_preview(&tex_path) {
+                Ok(raw) => {
+                    embedded_textures.insert(key, LoadedDdsPreview { path: tex_path, raw });
+                }
+                Err(err) => failed.push(format!("SCN texture {}: {}", tex_path.display(), err)),
+            }
+        }
+
+        Self::send_loading_progress(tx, job_id, "Preparing map preview", Some(0.92));
+        models.sort_by_key(|model| model.archetype.clone());
+
+        Ok(LoadedSceneData {
+            path,
+            scn,
+            models,
+            embedded_textures,
+            unresolved,
+            marker_geo_overrides,
+            failed,
+        })
+    }
+
+    fn loaded_dds_to_preview(ctx: &egui::Context, loaded: LoadedDdsPreview) -> DdsPreview {
+        dds_preview_from_raw(ctx, loaded.path.display().to_string(), loaded.raw)
+    }
+
+    fn apply_loaded_scene(&mut self, ctx: &egui::Context, data: LoadedSceneData) {
+        if self.selected_file.as_ref() != Some(&data.path) {
+            return;
+        }
+
+        self.scn_file = Some(data.scn);
+        self.scn_loaded_path = Some(data.path.clone());
+        self.reset_scn_scene_state();
+        self.scn_scene_models_path = Some(data.path.clone());
+        self.scn_scene_unresolved = data.unresolved;
+        self.scn_marker_geo_overrides = data.marker_geo_overrides;
+
+        self.scn_scene_models = data
+            .models
+            .into_iter()
+            .map(|model| SceneGeoModel {
+                archetype: model.archetype,
+                path: model.path,
+                geo: model.geo,
+                textures: model
+                    .textures
+                    .into_iter()
+                    .map(|texture| texture.map(|loaded| Self::loaded_dds_to_preview(ctx, loaded)))
+                    .collect(),
+            })
+            .collect();
+
+        self.scn_embedded_texture_previews = data
+            .embedded_textures
+            .into_iter()
+            .map(|(key, loaded)| (key, Self::loaded_dds_to_preview(ctx, loaded)))
+            .collect();
+
+        if !data.failed.is_empty() {
             self.scn_scene_error = Some(format!(
-                "Failed to load {} GEO files: {}",
-                failed.len(),
-                failed.join(" | ")
+                "Failed to load {} assets: {}",
+                data.failed.len(),
+                data.failed.join(" | ")
             ));
         }
 
-        reset_scene_viewer(&mut self.scn_viewer, &scn);
+        if let Some(scn) = self.scn_file.as_ref() {
+            reset_scene_viewer(&mut self.scn_viewer, scn);
+        }
+        self.status = format!(
+            "Opened map: {}",
+            data.path.file_name().unwrap_or_default().to_string_lossy()
+        );
+        ctx.request_repaint();
+    }
+
+    fn ensure_scn_scene_loaded(&mut self, _ctx: &egui::Context) {
+        // SCN scene loading is now handled by start_open_scene_job/apply_loaded_scene.
+        // This function remains as a compatibility hook for the central ensure_* pipeline.
     }
 
     fn existing_geo_stem(
@@ -3675,11 +4054,17 @@ impl ModToolApp {
             return None;
         }
 
-        if marker_name.starts_with("camera")
-            || marker_name.starts_with("cameratarget")
+        let is_camera_marker = marker_name.contains("camera")
+            || marker_name.contains("cameratarget")
+            || marker_name.ends_with("cam")
+            || marker_name.contains("cam_")
+            || marker_name.contains("camtarget");
+
+        if is_camera_marker
             || marker_name.starts_with("checkpoint")
             || marker_name.starts_with("path")
             || marker_name.starts_with("lane")
+            || marker_name.contains("_path")
             || marker_name.starts_with("return")
             || marker_name.starts_with("tochair")
         {
@@ -4100,6 +4485,12 @@ impl ModToolApp {
     fn scn_marker_kind(name: &str) -> &'static str {
         let lower = name.trim().to_ascii_lowercase();
 
+        let is_camera = lower.contains("camera")
+            || lower.contains("cameratarget")
+            || lower.ends_with("cam")
+            || lower.contains("cam_")
+            || lower.contains("camtarget");
+
         if lower.is_empty() {
             "Unnamed marker"
         } else if lower == "player_start" {
@@ -4108,12 +4499,23 @@ impl ModToolApp {
             "Player end"
         } else if lower.starts_with("checkpoint") {
             "Checkpoint"
-        } else if lower == "startposition" || lower.contains("spawn") {
+        } else if lower == "startposition"
+            || lower == "start_point"
+            || lower.contains("spawn")
+        {
             "Spawn marker"
-        } else if lower.contains("camera") || lower.contains("cameratarget") {
+        } else if is_camera {
             "Camera marker"
-        } else if lower.starts_with("path") || lower.starts_with("lane") {
+        } else if lower.starts_with("path")
+            || lower.starts_with("lane")
+            || lower.contains("_path")
+        {
             "Route marker"
+        } else if lower.starts_with("car_")
+            || lower.starts_with("dec_car_")
+            || lower.starts_with("car_moving")
+        {
+            "Traffic marker"
         } else if lower.starts_with("gay")
             || lower.starts_with("cyclist")
             || lower.starts_with("vicky")
@@ -4126,27 +4528,27 @@ impl ModToolApp {
             || lower.starts_with("female")
             || lower.starts_with("male")
             || lower.starts_with("letty")
-            || lower.starts_with("frog")
             || lower.starts_with("emily")
             || lower.starts_with("florence")
             || lower.starts_with("football_kid")
+            || lower.starts_with("defender")
             || lower.starts_with("pirate")
             || lower.starts_with("judy")
             || lower.starts_with("maggie")
             || lower.starts_with("brownie")
             || lower.starts_with("vicar")
+            || lower == "mp"
+            || lower == "character"
         {
             "Actor marker"
-        } else if lower.starts_with("car_") || lower.starts_with("dec_car_") {
-            "Traffic marker"
         } else if lower.starts_with("target")
+            || lower.starts_with("targetzone")
             || lower.starts_with("board")
             || lower.starts_with("stand_table")
             || lower.starts_with("node_table")
             || lower.starts_with("line_pos")
             || lower.starts_with("return")
             || lower.starts_with("tochair")
-            || lower.starts_with("defender")
             || lower.starts_with("easy")
             || lower.starts_with("medium")
             || lower.starts_with("hard")
@@ -4156,9 +4558,33 @@ impl ModToolApp {
             || lower.starts_with("ornament")
             || lower.starts_with("bowl")
             || lower.starts_with("softfrog")
+            || lower.starts_with("globefrog")
+            || lower.starts_with("prince")
+            || lower.starts_with("phone")
+            || lower.starts_with("clock")
+            || lower.starts_with("cake")
             || lower.starts_with("chairnode")
+            || lower == "render_chair"
+            || lower == "plate_position"
+            || lower.ends_with("_plate")
+            || lower.ends_with("_teacup")
+            || lower == "goalcentre"
+            || lower.contains("goalline")
+            || lower == "leftpost"
+            || lower == "rightpost"
+            || lower == "crossbar"
+            || lower == "lefttouchline"
+            || lower == "righttouchline"
+            || lower == "celebrate_position"
+            || lower == "topright"
+            || lower == "bottomright"
+            || lower == "bottomleft"
+            || lower == "topleft"
+            || lower.starts_with("frog_window")
         {
             "Gameplay target"
+        } else if lower.starts_with("frog") {
+            "Actor marker"
         } else {
             "Generic marker"
         }
@@ -5580,17 +6006,24 @@ impl ModToolApp {
                             ui.heading("Chunk textures");
                             ui.separator();
 
-                            for name in &chunk.texture_names {
-                                let key = name.to_ascii_lowercase();
+                            for (slot, name) in chunk.texture_names.iter().enumerate() {
+                                let trimmed = name.trim();
+
+                                if trimmed.is_empty() {
+                                    ui.label(format!("slot {}: solid/material color", slot));
+                                    continue;
+                                }
+
+                                let key = trimmed.to_ascii_lowercase();
                                 if let Some(preview) = embedded_texture_previews.get(&key) {
-                                    if ui.button(name).clicked() {
+                                    if ui.button(trimmed).clicked() {
                                         *pending_embedded_texture_preview =
-                                            Some((name.clone(), preview.clone()));
+                                            Some((trimmed.to_owned(), preview.clone()));
                                     }
                                 } else {
                                     ui.colored_label(
                                         egui::Color32::YELLOW,
-                                        format!("{} (not previewed)", name),
+                                        format!("slot {}: {} (not previewed)", slot, trimmed),
                                     );
                                 }
                             }
@@ -5629,13 +6062,17 @@ impl ModToolApp {
     }
 
     fn build_asset_links(&self) -> AssetLinks {
+        Self::build_asset_links_from_tree(&self.tree)
+    }
+
+    fn build_asset_links_from_tree(tree: &[FileNode]) -> AssetLinks {
         let mut links = AssetLinks::default();
 
         let mut texture_nodes = Vec::new();
         let mut model_nodes = Vec::new();
 
-        Self::collect_files_by_category(&self.tree, AssetCategory::Texture, &mut texture_nodes);
-        Self::collect_files_by_category(&self.tree, AssetCategory::Model, &mut model_nodes);
+        Self::collect_files_by_category(tree, AssetCategory::Texture, &mut texture_nodes);
+        Self::collect_files_by_category(tree, AssetCategory::Model, &mut model_nodes);
 
         let mut textures_by_name: std::collections::HashMap<String, PathBuf> =
             std::collections::HashMap::new();
@@ -5704,6 +6141,7 @@ impl ModToolApp {
 
         links
     }
+
 }
 
 impl eframe::App for ModToolApp {
@@ -5714,6 +6152,8 @@ impl eframe::App for ModToolApp {
             ui.ctx().set_visuals(egui::Visuals::light());
         }
 
+        self.poll_loading_jobs(ui.ctx());
+
         self.ensure_bnk_loaded();
         self.ensure_dds_preview_loaded(ui.ctx());
         self.ensure_bik_preview_loaded(ui.ctx());
@@ -5722,7 +6162,7 @@ impl eframe::App for ModToolApp {
         self.ensure_anm_loaded();
         self.ensure_active_geo_animation_loaded();
         self.ensure_geo_loaded();
-        self.ensure_scn_loaded();
+        self.ensure_scn_loaded(ui.ctx());
         self.ensure_scn_scene_loaded(ui.ctx());
         self.ensure_geo_materials_loaded(ui.ctx());
 
@@ -5762,14 +6202,14 @@ impl eframe::App for ModToolApp {
         egui::Panel::top("top_bar").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Open game folder").clicked() {
-                    self.open_game_folder();
+                    self.open_game_folder(ui.ctx());
                 }
 
                 if ui
                     .add_enabled(self.game_root.is_some(), egui::Button::new("Rescan"))
                     .clicked()
                 {
-                    self.rescan();
+                    self.rescan(ui.ctx());
                 }
 
                 if ui
@@ -7169,5 +7609,7 @@ impl eframe::App for ModToolApp {
         if let Some(path) = pending_jump {
             self.jump_to_file(path);
         }
+
+        loading::draw_loading_overlay(ui.ctx(), self.active_loading_job.as_ref().map(|job| &job.task));
     }
 }

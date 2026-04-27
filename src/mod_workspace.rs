@@ -278,7 +278,7 @@ fn manifest_to_json(manifest: &ModManifest) -> String {
             "  \"description\": \"{}\",\n",
             "  \"language\": \"{}\",\n",
             "  \"entry_script\": \"{}\",\n",
-            "  \"enabled\": \"true\"\n",
+            "  \"enabled\": true\n",
             "}}\n"
         ),
         escape_json(&manifest.name),
